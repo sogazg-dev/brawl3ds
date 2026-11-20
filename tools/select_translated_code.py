@@ -41,21 +41,33 @@ COVER_WORDS = ((COVER_END - COVER_BASE) >> 2) // 32
 COVER_HEADER = f'''
 // brawl3ds coverage instrumentation (tools/select_translated_code.py --instrument-coverage)
 extern "C" unsigned int g_brawl3dsCoverage[{COVER_WORDS}];
-#define BRAWL3DS_COVER(address) (g_brawl3dsCoverage[((address) - 0x{COVER_BASE:08X}u) >> 7] |= 1u << ((((address) - 0x{COVER_BASE:08X}u) >> 2) & 31u))
+extern "C" int g_brawl3dsCoverageStarted;
+extern "C" void Brawl3dsCoverageStart();
+#define BRAWL3DS_COVER(address) ((g_brawl3dsCoverageStarted ? (void)0 : Brawl3dsCoverageStart()), \\
+    g_brawl3dsCoverage[((address) - 0x{COVER_BASE:08X}u) >> 7] |= 1u << ((((address) - 0x{COVER_BASE:08X}u) >> 2) & 31u))
 '''
-# Defined once, in the first shard: the bitmap and a static object that writes it beside the executable at exit.
+# Defined once, in the first shard. The runtime ends the process without running static destructors, so the bitmap
+# is written every 5 seconds by a thread the first instrumented call starts (not from a static constructor: that
+# would run while Windows is still loading the engine DLL).
 COVER_STORAGE = f'''
+#include <chrono>
 #include <cstdio>
+#include <thread>
 extern "C" unsigned int g_brawl3dsCoverage[{COVER_WORDS}] = {{}};
-namespace {{
-struct Brawl3dsCoverageDump {{
-    ~Brawl3dsCoverageDump() {{
-        if (std::FILE* file = std::fopen("brawl3ds_coverage.bin", "wb")) {{
-            std::fwrite(g_brawl3dsCoverage, sizeof(g_brawl3dsCoverage), 1, file);
-            std::fclose(file);
+extern "C" int g_brawl3dsCoverageStarted = 0;
+extern "C" void Brawl3dsCoverageStart() {{
+    g_brawl3dsCoverageStarted = 1;
+    std::thread([] {{
+        for (;;) {{
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            if (std::FILE* file = std::fopen("brawl3ds_coverage.tmp", "wb")) {{
+                std::fwrite(g_brawl3dsCoverage, sizeof(g_brawl3dsCoverage), 1, file);
+                std::fclose(file);
+                std::remove("brawl3ds_coverage.bin");
+                std::rename("brawl3ds_coverage.tmp", "brawl3ds_coverage.bin");
+            }}
         }}
-    }}
-}} g_brawl3dsCoverageDump;
+    }}).detach();
 }}
 '''
 FUNCTION_OPEN = re.compile(r'(extern "C" void func_([0-9A-F]{8})\(CpuContext\* MKW_RESTRICT ctx\)\n\{\n)')

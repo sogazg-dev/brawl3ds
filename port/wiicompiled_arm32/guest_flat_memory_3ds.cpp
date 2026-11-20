@@ -11,6 +11,7 @@
 // Any other region (Kamek overlay, locked cache) gets its own.
 //
 // Allocation: the regular heap first, then the GPU-visible linear heap (in the 178 MB system mode the
+#if defined(__3DS__)  // the PC build globs runtime/src; this file is 3DS-only
 // app's memory is split between them; main() sizes both).
 #include "guest_flat_memory.h"
 
@@ -205,3 +206,4 @@ void LogFaultSummary() noexcept {}
 bool HandleAccessViolation(void*, bool) noexcept { return false; }
 
 } // namespace GuestFlat
+#endif // defined(__3DS__)

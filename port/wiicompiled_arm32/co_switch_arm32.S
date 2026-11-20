@@ -14,6 +14,7 @@
 //   [sp +100]         lr      (popped into pc)
 // FPSCR is not switched, matching the AArch64 backends (the runtime sets the guest FP mode itself).
 
+#if defined(__3DS__) || (defined(__arm__) && !defined(__aarch64__))
     .syntax unified
     .arm
     .fpu vfp
@@ -58,3 +59,4 @@ mkw_co_entry_trampoline:
     .size mkw_co_entry_trampoline, . - mkw_co_entry_trampoline
 
     .section .note.GNU-stack, "", %progbits
+#endif

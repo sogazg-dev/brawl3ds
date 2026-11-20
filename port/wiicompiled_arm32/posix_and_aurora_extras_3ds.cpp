@@ -7,6 +7,7 @@
 //  * Two Aurora-internal GX functions the runtime declares locally (no public header to generate stubs from).
 #include <cerrno>
 #include <csignal>
+#include <sys/stat.h>
 #include <unistd.h>
 
 extern "C" {
@@ -32,6 +33,19 @@ int execv(const char*, char* const*)
 int fdatasync(int fd)
 {
     return fsync(fd);
+}
+
+// The SD card's FAT file system has no Unix permissions. newlib reports chmod/fchmod as failures, which makes
+// libstdc++'s std::filesystem::copy_file give up after creating an empty destination file (it sets the
+// permissions before copying): report success instead.
+int fchmod(int, mode_t)
+{
+    return 0;
+}
+
+int chmod(const char*, mode_t)
+{
+    return 0;
 }
 
 // Aurora command_processor's SPM bring-up diagnostics (all off).

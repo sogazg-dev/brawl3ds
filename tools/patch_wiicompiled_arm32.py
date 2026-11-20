@@ -64,6 +64,10 @@ def main(wiicompiled: Path):
                        ("host_context_3ds.inc", src / "host_context_3ds.inc"),
                        ("co_switch_arm32.S", src / "platform" / "3ds" / "co_switch.S"),
                        ("guest_flat_memory_3ds.cpp", src / "platform" / "3ds" / "guest_flat_memory_3ds.cpp")]:
+        # Only when the content changed: rewriting an unchanged header would make every object depending on it
+        # rebuild (the NEON shim is included by everything).
+        if dest.exists() and dest.read_bytes() == (port / name).read_bytes():
+            continue
         shutil.copyfile(port / name, dest)
         print(f"  copied: {name}")
 
@@ -147,6 +151,15 @@ def main(wiicompiled: Path):
         ("#else\nint main(int argc, char** argv) {\n    return RuntimeMain(argc, argv);\n}\n#endif",
          "#elif defined(__3DS__)\n// brawl3ds: port/wiicompiled_arm32/main_3ds.cpp owns main() (3DS setup) and calls RuntimeMain.\n"
          "#else\nint main(int argc, char** argv) {\n    return RuntimeMain(argc, argv);\n}\n#endif", 1),
+        # A fatal error shows on the 3DS's screen and in sdmc:/3ds/brawl3ds/crash.txt (main_3ds.cpp), and stops there:
+        # returning into the runtime's shutdown can wait forever on threads that never started properly.
+        ("#else\n        // The shipped product is Windows-first. Keep non-Windows builds safe\n",
+         "#elif defined(__3DS__)\n        RT_LOGF(RT_TAG_RUNTIME, \"fatal dialog: %s\\n\", message.c_str());\n"
+         "        Brawl3dsFatal(message.c_str());\n"
+         "#else\n        // The shipped product is Windows-first. Keep non-Windows builds safe\n", 1),
+        ("void ShowRuntimeFatalPopup(std::string_view category, std::string_view details) noexcept {\n",
+         "#if defined(__3DS__)\nextern \"C\" void Brawl3dsFatal(const char* what);  // port/wiicompiled_arm32/main_3ds.cpp\n#endif\n"
+         "void ShowRuntimeFatalPopup(std::string_view category, std::string_view details) noexcept {\n", 1),
         ("        siglongjmp(*g_sehJumpTarget, 1);",
          "#if defined(__3DS__)\n        longjmp(*g_sehJumpTarget, 1);  // MkwJmpBuf is a plain jmp_buf on the 3DS\n#else\n"
          "        siglongjmp(*g_sehJumpTarget, 1);\n#endif", 1),
@@ -210,6 +223,11 @@ def main(wiicompiled: Path):
     ])
 
     edit(inc / "runtime_config.h", [
+        # Its own ExecutableDirectory() falls back to Linux's /proc/self/exe; the 3DS answers through
+        # RuntimePlatform (host_platform.cpp), so portable.txt and UserData live in sdmc:/3ds/brawl3ds.
+        ("#elif defined(__APPLE__) || defined(__ANDROID__)\n    return RuntimePlatform::ExecutableDirectory();",
+         "#elif defined(__APPLE__) || defined(__ANDROID__) || defined(__3DS__)\n"
+         "    return RuntimePlatform::ExecutableDirectory();", 1),
         ('#elif defined(_WIN32)\n    static constexpr std::array<std::string_view, 3> values{"auto", "d3d12", "vulkan"};\n#endif',
          '#elif defined(_WIN32)\n    static constexpr std::array<std::string_view, 3> values{"auto", "d3d12", "vulkan"};\n'
          '#elif defined(__3DS__)\n    static constexpr std::array<std::string_view, 1> values{"auto"};  // PICA200 only\n#endif', 1),
@@ -219,8 +237,16 @@ def main(wiicompiled: Path):
     # portable.txt) in one SD card folder.
     edit(src / "platform" / "host_platform.cpp", [
         ("#elif defined(__ANDROID__)\n    // The game is a library inside an APK",
-         "#elif defined(__3DS__)\n    return std::filesystem::path(\"sdmc:/3ds/brawl3ds\");\n"
+         "#elif defined(__3DS__)\n    return std::filesystem::path(\"/3ds/brawl3ds\");  // no sdmc: prefix: newlib std::filesystem treats it as relative\n"
          "#elif defined(__ANDROID__)\n    // The game is a library inside an APK", 1),
+    ])
+
+    # Finding the extracted disc in a "game" folder beside the program is Windows-only upstream; the 3DS uses the
+    # same rule (sdmc:/3ds/brawl3ds/game), so no Config.toml editing is needed on the console.
+    edit(src / "game_folder.cpp", [
+        ("bool EnsureConfigured() {\n#if defined(_WIN32)",
+         "#if defined(__3DS__)\nfs::path ProgramDirectory() { return fs::path(\"/3ds/brawl3ds\"); }\n#endif\n\n"
+         "bool EnsureConfigured() {\n#if defined(_WIN32) || defined(__3DS__)", 1),
     ])
 
     edit(inc / "system_bridge.h", [
