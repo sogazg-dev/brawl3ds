@@ -13,6 +13,13 @@ What it changes (all guarded by __arm__ && !__aarch64__, so x86-64 and AArch64 b
   * memory_access.h             FlatLoad/FlatStore (used directly by the translator's proven-RAM
                                 writes) go through that page table too
   * runtime_config.h            the graphics-API list gets a 3DS entry ("auto")
+  * host_context.cpp            3DS fiber backend (port/wiicompiled_arm32/host_context_3ds.inc + co_switch_arm32.S)
+  * memory.h                    MEM2 backs 76 MiB on the 3DS (game MEM2 + module homes) instead of 128 MiB
+  * wii_es_crypto.h             tick-seeded RNG for NAND file signatures (no OS entropy source)
+  * hle/network_poll_contract.h poll-flag fallbacks for newlib
+  * main.cpp                    POSIX fault handler compiled out (newlib has no si_addr)
+  Also copies port/wiicompiled_arm32/guest_flat_memory_3ds.cpp into runtime/src/platform/3ds/ (the 3DS build uses
+  it instead of guest_flat_memory.cpp).
   * system_bridge.h             newlib has no sigjmp_buf: use jmp_buf on the 3DS
 
 Idempotent: a file already patched is left alone. Fails loudly if an expected upstream snippet moved.
@@ -49,9 +56,79 @@ def main(wiicompiled: Path):
     if not (isa / "ppc_isa_config.h").is_file():
         sys.exit(f"{wiicompiled} does not look like a WiiCompiled tree")
 
-    shim = Path(__file__).resolve().parent.parent / "port" / "wiicompiled_arm32" / "brawl3ds_neon_shim.h"
-    shutil.copyfile(shim, inc / shim.name)
-    print(f"  copied: {shim.name}")
+    port = Path(__file__).resolve().parent.parent / "port" / "wiicompiled_arm32"
+    src = wiicompiled / "runtime" / "src"
+    (src / "platform" / "3ds").mkdir(parents=True, exist_ok=True)
+    for name, dest in [("brawl3ds_neon_shim.h", inc / "brawl3ds_neon_shim.h"),
+                       ("host_context_3ds.inc", src / "host_context_3ds.inc"),
+                       ("co_switch_arm32.S", src / "platform" / "3ds" / "co_switch.S"),
+                       ("guest_flat_memory_3ds.cpp", src / "platform" / "3ds" / "guest_flat_memory_3ds.cpp")]:
+        shutil.copyfile(port / name, dest)
+        print(f"  copied: {name}")
+
+    # Fibers: the 3DS backend (stack-swap, like the AArch64 one) in host_context_3ds.inc + co_switch.S.
+    edit(src / "host_context.cpp", [
+        ("#else\n#error \"HostContext needs a supported cooperative-context backend\"",
+         "#elif defined(__3DS__)\n#include <cstdlib>\n\n"
+         "extern \"C\" void mkw_co_switch(void** targetSp, void** sourceSp);\n"
+         "extern \"C\" void* mkw_co_init(void* stackTop, void (*entry)(void*), void* argument);\n"
+         "#else\n#error \"HostContext needs a supported cooperative-context backend\"", 1),
+        ("\n#endif\n\n} // namespace HostContext",
+         "\n#elif defined(__3DS__)\n\n#include \"host_context_3ds.inc\"\n\n#endif\n\n} // namespace HostContext", 1),
+    ])
+
+    # MEM2: the game sees 64 MiB; Brawl's pre-linked module homes end at 0x94BA3300. Backing the PC's 128 MiB
+    # would waste ~52 MiB of the 3DS's ~170, so the 3DS maps 76 MiB (0x90000000-0x94C00000).
+    edit(inc / "memory.h", [
+        ("    static constexpr size_t kMem2Size = 128u * 1024u * 1024u;",
+         "#if defined(__3DS__)\n    static constexpr size_t kMem2Size = 0x04C00000u;  // 76 MiB: game MEM2 + module homes\n"
+         "#else\n    static constexpr size_t kMem2Size = 128u * 1024u * 1024u;\n#endif", 1),
+    ])
+
+    # Crypto++'s AutoSeededRandomPool needs an OS entropy source the 3DS lacks. It only signs the virtual NAND's
+    # own files (the game never verifies those signatures), so a tick-seeded xorshift generator is enough.
+    edit(inc / "wii_es_crypto.h", [
+        ("inline EcSignature SignMessage(",
+         "#if defined(__3DS__)\nclass Brawl3dsTickRng : public CryptoPP::RandomNumberGenerator {\npublic:\n"
+         "    void GenerateBlock(CryptoPP::byte* output, size_t size) override {\n"
+         "        for (size_t i = 0; i < size; ++i) {\n"
+         "            m_state ^= m_state << 13; m_state ^= m_state >> 7; m_state ^= m_state << 17;\n"
+         "            output[i] = static_cast<CryptoPP::byte>(m_state >> 56);\n        }\n    }\n"
+         "private:\n    uint64_t m_state = static_cast<uint64_t>(\n"
+         "        std::chrono::steady_clock::now().time_since_epoch().count()) | 1u;\n};\n#endif\n\n"
+         "inline EcSignature SignMessage(", 1),
+        ("    thread_local CryptoPP::AutoSeededRandomPool random;",
+         "#if defined(__3DS__)\n    thread_local Brawl3dsTickRng random;\n#else\n"
+         "    thread_local CryptoPP::AutoSeededRandomPool random;\n#endif", 1),
+    ])
+
+    # newlib's <poll.h> only has the basic flags; online play is not part of the VS port.
+    edit(inc / "hle" / "network_poll_contract.h", [
+        ("inline short WiiEventsToNative(uint32_t events) {",
+         "#if defined(__3DS__)\n#ifndef POLLRDNORM\n#define POLLRDNORM POLLIN\n#endif\n#ifndef POLLRDBAND\n#define POLLRDBAND 0\n#endif\n"
+         "#ifndef POLLWRNORM\n#define POLLWRNORM POLLOUT\n#endif\n#ifndef POLLWRBAND\n#define POLLWRBAND 0\n#endif\n#endif\n\n"
+         "inline short WiiEventsToNative(uint32_t events) {", 1),
+    ])
+
+    # newlib's siginfo_t has no si_addr, and the 3DS reports CPU faults through libctru's exception handler
+    # instead of signals: compile the POSIX fault path to a report-only stub there.
+    edit(src / "main.cpp", [
+        ("    void* faultAddress = info != nullptr ? info->si_addr : nullptr;",
+         "#if defined(__3DS__)\n    (void)info;\n    void* faultAddress = nullptr;\n#else\n"
+         "    void* faultAddress = info != nullptr ? info->si_addr : nullptr;\n#endif", 1),
+        ("            {\"auto\", BACKEND_AUTO}, {\"d3d12\", BACKEND_D3D12}, {\"vulkan\", BACKEND_VULKAN},\n        }};\n\n#endif",
+         "            {\"auto\", BACKEND_AUTO}, {\"d3d12\", BACKEND_D3D12}, {\"vulkan\", BACKEND_VULKAN},\n        }};\n"
+         "#elif defined(__3DS__)\n        static constexpr std::array<GraphicsBackendEntry, 1> kGraphicsBackends{{\n"
+         "            {\"auto\", BACKEND_AUTO},  // the 3DS renderer replaces Aurora's backends\n        }};\n\n#endif", 1),
+        ("        siglongjmp(*g_sehJumpTarget, 1);",
+         "#if defined(__3DS__)\n        longjmp(*g_sehJumpTarget, 1);  // MkwJmpBuf is a plain jmp_buf on the 3DS\n#else\n"
+         "        siglongjmp(*g_sehJumpTarget, 1);\n#endif", 1),
+        ("void InstallPosixMemoryFaultHandler() {\n    struct sigaction action {};",
+         "void InstallPosixMemoryFaultHandler() {\n#if !defined(__3DS__)  // the 3DS uses libctru's exception handler\n"
+         "    struct sigaction action {};", 1),
+        ("    sigaction(SIGBUS, &action, nullptr);\n}",
+         "    sigaction(SIGBUS, &action, nullptr);\n#endif\n}", 1),
+    ])
 
     edit(isa / "ppc_isa_config.h", [(
         "#elif defined(__aarch64__)\n#include <arm_neon.h>\n",

@@ -135,10 +135,20 @@ Hardware results (user's New 3DS, Luma, 2026-11-19):
   affordable but worth avoiding in hot paths.
 
 **Runtime on ARM11.** With SDL3 3.4.4 built for the 3DS (its N3DS audio/joystick/thread/timer backends, via
-`cmake/3ds-toolchain.cmake`), `-std=gnu++20 -DTARGET_PC` and the ARM32 patch, **94 of the 110 runtime sources
-compile**. The 16 left are platform spots: fibers (`host_context.cpp`), guest memory reservation
-(`guest_flat_memory.cpp`), FatFs include path, CryptoPP's OS RNG (4 NAND files), `POLLRDNORM` (5 network files),
-the POSIX fault handler in `main.cpp`, and PC-only files (Discord, netplay socket, Windows loader).
+`cmake/3ds-toolchain.cmake`), `-std=gnu++20 -DTARGET_PC` and the ARM32 patch, **every runtime source the 3DS needs compiles (106 files)**:
+- Fibers: `port/wiicompiled_arm32/host_context_3ds.inc` + `co_switch_arm32.S` (stack swap saving r4-r12, lr and
+  d8-d15, 104-byte 8-aligned frame, like the AArch64 backend).
+- Guest memory: `guest_flat_memory_3ds.cpp` allocates each mirrored backing once (regular heap, falling back to
+  linear) behind the page table. MEM2 backs **76 MiB** on the 3DS (game's 64 MiB + module homes up to 0x94C00000)
+  instead of 128 MiB, saving 52 MiB: Wii RAM costs 24 + 76 = 100 MiB.
+- NAND save signatures use a tick-seeded RNG (no OS entropy source); newlib `poll` flag fallbacks; the POSIX fault
+  handler is compiled out (libctru's exception handler replaces it).
+- Left out on purpose: Windows loader, `network_ssl.cpp` (mbedtls, online HTTPS), PC `guest_flat_memory.cpp`,
+  Discord, netplay socket.
+
+Revised 178 MB budget: ~170 MiB usable − 100 MiB Wii RAM = ~70 MiB for code + runtime + GPU. The full game at -Oz
+(~95 MiB) does not fit as one static binary, so the headless build links the VS code set (~54 MiB at -Oz) and
+routes calls into any function left out to a "not linked" fatal report.
 
 ## Plan
 
