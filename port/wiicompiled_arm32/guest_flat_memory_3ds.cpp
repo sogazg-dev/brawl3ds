@@ -14,9 +14,12 @@
 // app's memory is split between them; main() sizes both).
 #include "guest_flat_memory.h"
 
+#include "memory.h"
+#include "memory_access.h"
 #include "runtime_log.h"
 
 #include <3ds.h>
+#include <malloc.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -45,14 +48,50 @@ std::vector<Mapping> g_mappings;
 std::vector<Store> g_stores;
 bool g_initialized = false;
 
+// The regular heap also serves every runtime allocation (newlib malloc), while linear memory is only used by audio
+// and GPU buffers. So a guest region goes to linear memory whenever it fits with this much left over for those, and
+// to the regular heap otherwise.
+constexpr size_t kLinearReserve = 4u * 1024u * 1024u;
+
+// Blocks set aside by Brawl3dsReserveGuestMemory() before the runtime starts, so the big guest regions get their
+// memory before the runtime's own allocations fragment the regular heap.
+struct Reserved {
+    uint8_t* host = nullptr;
+    size_t size = 0;
+    bool linear = false;
+};
+Reserved g_reserved[8];
+
+uint8_t* AllocateFresh(size_t rounded, bool& linear);
+
 uint8_t* Allocate(uint64_t size, bool& linear)
 {
     const auto bytes = static_cast<size_t>(size);
-    if (void* p = std::aligned_alloc(0x1000, (bytes + 0xFFF) & ~static_cast<size_t>(0xFFF))) {
+    const auto rounded = (bytes + 0xFFF) & ~static_cast<size_t>(0xFFF);
+    for (auto& block : g_reserved) {
+        if (block.host && block.size == rounded) {
+            uint8_t* host = block.host;
+            linear = block.linear;
+            block = {};
+            return host;
+        }
+    }
+    return AllocateFresh(rounded, linear);
+}
+
+uint8_t* AllocateFresh(size_t rounded, bool& linear)
+{
+    if (linearSpaceFree() >= rounded + kLinearReserve) {
+        if (void* p = linearMemAlign(rounded, 0x1000)) {
+            linear = true;
+            return static_cast<uint8_t*>(p);
+        }
+    }
+    if (void* p = std::aligned_alloc(0x1000, rounded)) {
         linear = false;
         return static_cast<uint8_t*>(p);
     }
-    if (void* p = linearMemAlign(bytes, 0x1000)) {
+    if (void* p = linearMemAlign(rounded, 0x1000)) {  // last resort: dip into the reserve
         linear = true;
         return static_cast<uint8_t*>(p);
     }
@@ -69,11 +108,36 @@ Store* FindShared(Backing backing)
 
 } // namespace
 
+// Called from main() before RuntimeMain: allocate the guest regions Memory::Config::WiiDefaults() will ask for, in
+// the order that packs best (the largest first into the regular heap, MEM1 into the linear heap).
+extern "C" void Brawl3dsReserveGuestMemory()
+{
+    const size_t sizes[] = {
+        Memory::kMem1Size,                          // MEM1 and its mirrors (fits the linear heap)
+        Memory::kMem2Size,                          // MEM2 and its mirrors
+        Memory::kModuleHomesSize,                   // Brawl's pre-linked module homes
+        MemoryInline::kPageSize + 4096u,            // the locked cache (memory.cpp backs a page and a bit)
+    };
+    size_t n = 0;
+    for (const size_t size : sizes) {
+        const size_t rounded = (size + 0xFFF) & ~static_cast<size_t>(0xFFF);
+        bool linear = false;
+        if (uint8_t* host = AllocateFresh(rounded, linear)) {
+            g_reserved[n++] = Reserved{host, rounded, linear};
+            std::printf("[guest] reserved %zu KiB (%s heap)\n", rounded >> 10, linear ? "linear" : "regular");
+        } else {
+            std::printf("[guest] could not reserve %zu KiB\n", rounded >> 10);
+        }
+    }
+}
+
 bool IsActive() { return false; }
 
 void Initialize(const std::vector<RegionRequest>& regions)
 {
     if (g_initialized) return;  // once per process, as on the other hosts
+    std::printf("[guest] Initialize: runtime malloc in use %d KiB, linear free %lu KiB\n", mallinfo().uordblks >> 10,
+                static_cast<unsigned long>(linearSpaceFree() >> 10));
 
     // One shared store per mirrored backing, sized for its largest view.
     for (const auto& region : regions) {
@@ -105,6 +169,8 @@ void Initialize(const std::vector<RegionRequest>& regions)
                 throw std::runtime_error("3DS: could not allocate guest region at 0x" + std::to_string(region.base));
             }
             std::memset(mapping.host, 0, static_cast<size_t>(region.size));
+            std::printf("[guest] region 0x%08lX: %llu KiB (%s heap)\n", static_cast<unsigned long>(region.base),
+                        static_cast<unsigned long long>(region.size >> 10), linear ? "linear" : "regular");
         } else {
             mapping.host = FindShared(region.backing)->host;
         }

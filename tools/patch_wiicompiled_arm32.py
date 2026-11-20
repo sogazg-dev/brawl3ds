@@ -14,7 +14,8 @@ What it changes (all guarded by __arm__ && !__aarch64__, so x86-64 and AArch64 b
                                 writes) go through that page table too
   * runtime_config.h            the graphics-API list gets a 3DS entry ("auto")
   * host_context.cpp            3DS fiber backend (port/wiicompiled_arm32/host_context_3ds.inc + co_switch_arm32.S)
-  * memory.h                    MEM2 backs 76 MiB on the 3DS (game MEM2 + module homes) instead of 128 MiB
+  * memory.h, memory.cpp        on the 3DS MEM2 covers 54 MiB (game + IOS area) plus a separate 12 MiB module-homes
+                                region, instead of the PC's 128 MiB; ax_memory.cpp keeps the PC's EXRAM mask
   * wii_es_crypto.h             tick-seeded RNG for NAND file signatures (no OS entropy source)
   * hle/network_poll_contract.h poll-flag fallbacks for newlib
   * main.cpp                    POSIX fault handler compiled out (newlib has no si_addr)
@@ -77,12 +78,35 @@ def main(wiicompiled: Path):
          "\n#elif defined(__3DS__)\n\n#include \"host_context_3ds.inc\"\n\n#endif\n\n} // namespace HostContext", 1),
     ])
 
-    # MEM2: the game sees 64 MiB; Brawl's pre-linked module homes end at 0x94BA3300. Backing the PC's 128 MiB
-    # would waste ~52 MiB of the 3DS's ~170, so the 3DS maps 76 MiB (0x90000000-0x94C00000).
+    # MEM2: the PC backs 128 MiB (the game's 64 MiB plus Brawl's pre-linked module homes from 0x94000000). The game's
+    # arena and the IOS IPC area end at 0x93600000 (system_bridge.cpp kIosMem2End) and the homes end at 0x94BA3300,
+    # so on the 3DS MEM2 and its mirrors cover 54 MiB and the homes are a separate 12 MiB region: 66 MiB, not 128.
     edit(inc / "memory.h", [
         ("    static constexpr size_t kMem2Size = 128u * 1024u * 1024u;",
-         "#if defined(__3DS__)\n    static constexpr size_t kMem2Size = 0x04C00000u;  // 76 MiB: game MEM2 + module homes\n"
+         "#if defined(__3DS__)\n    static constexpr size_t kMem2Size = 0x03600000u;  // 54 MiB: game MEM2 + IOS IPC area\n"
+         "    static constexpr uint32_t kModuleHomesBase = 0x94000000u;  // Brawl's pre-linked module homes\n"
+         "    static constexpr size_t kModuleHomesSize = 0x00C00000u;\n"
          "#else\n    static constexpr size_t kMem2Size = 128u * 1024u * 1024u;\n#endif", 1),
+    ])
+    edit(src / "memory.cpp", [
+        ("        .name = \"MEM2_UNCACHED\",\n        .baseAddress = Memory::kMem2UncachedBase,\n"
+         "        .sizeBytes = Memory::kMem2Size,\n    });\n",
+         "        .name = \"MEM2_UNCACHED\",\n        .baseAddress = Memory::kMem2UncachedBase,\n"
+         "        .sizeBytes = Memory::kMem2Size,\n    });\n"
+         "#if defined(__3DS__)\n    config.regions.push_back(RegionConfig{\n        .name = \"MODULE_HOMES\",\n"
+         "        .baseAddress = Memory::kModuleHomesBase,\n        .sizeBytes = Memory::kModuleHomesSize,\n    });\n#endif\n", 1),
+        # The Kamek module overlay (2 MiB above MEM1) is for Mario Kart Wii's Kamek mods; Brawl never uses it.
+        ("    config.regions.push_back(RegionConfig{\n        .name = \"MEM1_KAMEK_OVERLAY\",",
+         "#if !defined(__3DS__)  // Mario Kart Wii mods only: saves 2 MiB on the 3DS\n"
+         "    config.regions.push_back(RegionConfig{\n        .name = \"MEM1_KAMEK_OVERLAY\",", 1),
+        ("        .baseAddress = 0x81800000,\n        .sizeBytes = 0x200000,\n    });\n",
+         "        .baseAddress = 0x81800000,\n        .sizeBytes = 0x200000,\n    });\n#endif\n", 1),
+    ])
+    # The DSP's EXRAM alias decode masks with kMem2Size - 1, which assumed a power-of-two size: keep the PC mask.
+    edit(src / "hle" / "audio" / "ax_memory.cpp", [
+        ("        const uint32_t exramOffset = addr & static_cast<uint32_t>(Memory::kMem2Size - 1u);",
+         "#if defined(__3DS__)\n        const uint32_t exramOffset = addr & 0x07FFFFFFu;  // PC's 128 MiB mask (kMem2Size is not a power of 2)\n"
+         "#else\n        const uint32_t exramOffset = addr & static_cast<uint32_t>(Memory::kMem2Size - 1u);\n#endif", 1),
     ])
 
     # Crypto++'s AutoSeededRandomPool needs an OS entropy source the 3DS lacks. It only signs the virtual NAND's
@@ -120,6 +144,9 @@ def main(wiicompiled: Path):
          "            {\"auto\", BACKEND_AUTO}, {\"d3d12\", BACKEND_D3D12}, {\"vulkan\", BACKEND_VULKAN},\n        }};\n"
          "#elif defined(__3DS__)\n        static constexpr std::array<GraphicsBackendEntry, 1> kGraphicsBackends{{\n"
          "            {\"auto\", BACKEND_AUTO},  // the 3DS renderer replaces Aurora's backends\n        }};\n\n#endif", 1),
+        ("#else\nint main(int argc, char** argv) {\n    return RuntimeMain(argc, argv);\n}\n#endif",
+         "#elif defined(__3DS__)\n// brawl3ds: port/wiicompiled_arm32/main_3ds.cpp owns main() (3DS setup) and calls RuntimeMain.\n"
+         "#else\nint main(int argc, char** argv) {\n    return RuntimeMain(argc, argv);\n}\n#endif", 1),
         ("        siglongjmp(*g_sehJumpTarget, 1);",
          "#if defined(__3DS__)\n        longjmp(*g_sehJumpTarget, 1);  // MkwJmpBuf is a plain jmp_buf on the 3DS\n#else\n"
          "        siglongjmp(*g_sehJumpTarget, 1);\n#endif", 1),
@@ -186,6 +213,14 @@ def main(wiicompiled: Path):
         ('#elif defined(_WIN32)\n    static constexpr std::array<std::string_view, 3> values{"auto", "d3d12", "vulkan"};\n#endif',
          '#elif defined(_WIN32)\n    static constexpr std::array<std::string_view, 3> values{"auto", "d3d12", "vulkan"};\n'
          '#elif defined(__3DS__)\n    static constexpr std::array<std::string_view, 1> values{"auto"};  // PICA200 only\n#endif', 1),
+    ])
+
+    # The 3DS build keeps everything a desktop build has beside its executable (UserData, game, wii_bootstrap,
+    # portable.txt) in one SD card folder.
+    edit(src / "platform" / "host_platform.cpp", [
+        ("#elif defined(__ANDROID__)\n    // The game is a library inside an APK",
+         "#elif defined(__3DS__)\n    return std::filesystem::path(\"sdmc:/3ds/brawl3ds\");\n"
+         "#elif defined(__ANDROID__)\n    // The game is a library inside an APK", 1),
     ])
 
     edit(inc / "system_bridge.h", [
