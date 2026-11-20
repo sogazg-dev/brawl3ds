@@ -119,9 +119,11 @@ void Log(const char* fmt, ...)
 }
 
 // ---- Steps of a run, shown on the bottom screen and logged ------------------------------------------------------
-// The waits in steps 5 and 7 are Brawl's own idle timers (the safety screen times out after ~24 s, the title screen
-// starts the attract demo after ~131 s of no input), counted in frames: at a lower frame rate they last longer in
-// real time. A player pressing A skips both; only this unattended test sits through them.
+// The waits in steps 5 and 7 are Brawl's own idle timers, counted in frames, so at a lower frame rate they last
+// longer in real time. input_script.txt (written by package_headless.py) presses A once on the title screen: that
+// skips the opening movie (decoded in software, ~1 s per video frame in Azahar) and the demo match starts after
+// ~1,186 title frames instead of ~7,855, with the same fighters. The safety screen is left to time out: skipping it
+// too changes which demo match plays, and the build only holds the code the PC coverage run of this match used.
 struct Step {
     const char* name;
     const char* detail;
@@ -134,7 +136,7 @@ constexpr Step kSteps[] = {
     {"Starting the runtime", "game code, modules, virtual NAND", 0},
     {"Safety screen (scStrap)", "Brawl's own ~24 s timeout", 1435},
     {"Loading boot data + save", "scBoot: menus, fonts, save files", 44},
-    {"Title screen idle (scTitle)", "waits ~131 s, then starts the demo", 7855},
+    {"Title screen idle (scTitle)", "A skips the movie; demo starts after", 1186},
     {"Measuring the VS demo match", "scMelee: 30 s of match frames", kMatchFramesToMeasure},
     {"Writing results", "headless.log", 0},
 };

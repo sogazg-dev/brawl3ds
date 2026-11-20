@@ -152,6 +152,8 @@ def main():
     ap.add_argument("--blobs", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--save", type=Path, help="your Brawl save folder (.../52534245/data), copied into the SD folder")
+    ap.add_argument("--input-script", default="scTitle@60f:A:120f",
+                    help="scripted pad input for the run (default: skip the title movie)")
     ap.add_argument("--devkitpro", type=Path, default=Path("C:/devkitPro"))
     ap.add_argument("--makerom", type=Path, default=Path.home() / "brawl3ds-work/tools/makerom/makerom.exe")
     args = ap.parse_args()
@@ -187,6 +189,11 @@ def main():
         if not (args.save / "autosv0.bin").exists():
             sys.exit(f"--save: no autosv0.bin in {args.save}")
         shutil.copytree(args.save, sd / "UserData/NAND/title/00010000/52534245/data", dirs_exist_ok=True)
+    # Scripted input (the runtime reads the first line of input_script.txt beside the program): A held from 60 frames
+    # into the title screen for 120 pad polls skips the opening movie (a 6-poll tap was missed on the 3DS, where the
+    # movie makes game frames slow), and the attract demo then starts the same VS match ~6,700 frames
+    # sooner. Frame-based and deterministic, so every run is the same.
+    (sd / "input_script.txt").write_text(args.input_script + "\n")
     (sd / "portable.txt").write_text("brawl3ds: settings, saves and logs stay in the UserData folder here.\n")
     print(f"\nCIA: {cia} ({cia.stat().st_size / 2**20:.1f} MiB)\nSD folder: {sd}  (add game/ = the extracted disc)")
 

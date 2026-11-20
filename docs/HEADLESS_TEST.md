@@ -6,9 +6,15 @@ screen until Brawl starts its CPU demo match (Bowser, Olimar, Zelda and Mario on
 bottom screen shows which step is running.
 
 **This is a diagnostic tool, not the game.** Most of its running time is Brawl's own idle timers, counted in
-frames: the safety screen (~1,435 frames, about 24 s at 60 fps) and the title screen before the attract demo
-(~7,855 frames, about 131 s). A player pressing A skips both. Nothing is compiled or converted on the
-console. The code is already ARM machine code, and the game files are read as they are.
+frames: the safety screen (~1,435 frames, about 24 s at 60 fps) and the title screen before the attract demo.
+A player pressing A skips both. Nothing is compiled or converted on the console. The code is already ARM
+machine code, and the game files are read as they are.
+
+`input_script.txt` (written by `package_headless.py`) holds A from 60 frames into the title screen (for 120 pad polls). That
+skips Brawl's opening movie, which the game decodes in software (about 1 s per video frame in Azahar), and the
+demo match starts after ~1,186 title frames instead of ~7,855. The fighters are the same: Bowser,
+Mario, Olimar and Zelda. The safety screen is left to time out, because skipping it too changes which demo match
+plays, and this build only holds the code that the PC coverage run of this match used.
 
 ## Steps (bottom screen: "Step N of 9")
 
@@ -20,7 +26,7 @@ console. The code is already ARM machine code, and the game files are read as th
 | 4 | Starting the runtime | game code, modules, virtual NAND | a few seconds |
 | 5 | Safety screen (scStrap) | Brawl's idle timeout | 1,435 frames |
 | 6 | Loading boot data + save | scBoot | 44 frames |
-| 7 | Title screen idle (scTitle) | waits for the attract demo, then loads it | 7,855 frames |
+| 7 | Title screen idle (scTitle) | A skips the movie; waits for the attract demo, then loads it | ~1,186 frames |
 | 8 | Measuring the VS demo match | scMelee | 1,800 frames |
 | 9 | Writing results | headless.log | instant |
 
@@ -39,6 +45,7 @@ SD:/3ds/brawl3ds/
     wii_bootstrap/   from release-headless/sd/3ds/brawl3ds
     dsp_coef.bin     from release-headless/sd/3ds/brawl3ds
     portable.txt     from release-headless/sd/3ds/brawl3ds
+    input_script.txt from release-headless/sd/3ds/brawl3ds (the title-screen A press)
     UserData/NAND/title/00010000/52534245/data/   your Brawl save (from release-headless, see below)
 SD:/cias/brawl3ds-headless.cia
 ```

@@ -292,10 +292,14 @@ def main(wiicompiled: Path):
     # The PC overlay is ImGui, whose frames Aurora begins and renders. With no Aurora on the 3DS nothing ever ends an
     # ImGui frame, so every overlay draw call only piles up draw commands (~256 KiB per frame, found with
     # alloc_tracker_3ds.cpp). Keep the overlay's non-drawing work and skip its drawing.
+    # The PC's startup cover ("press A to start") blocks all game input until it is lifted; the 3DS never shows it,
+    # and its automatic lift for scripted runs looks for input_script.txt in the current directory, which on the 3DS
+    # is not the program folder. Lift it at once, or every pad reads as idle forever.
     edit(src / "settings_overlay.cpp", [
         ("    UpdateBootShaderState();\n    UpdateStartupPress();\n",
          "    UpdateBootShaderState();\n    UpdateStartupPress();\n"
-         "#if defined(__3DS__)\n    UpdateGameSpeed();\n    ApplyInputBlockState();\n"
+         "#if defined(__3DS__)\n    NotifyStrapInputAccepted();  // no startup cover on the 3DS\n"
+         "    UpdateGameSpeed();\n    ApplyInputBlockState();\n"
          "    return;  // no ImGui frame is ever rendered on the 3DS: drawing would only pile up draw lists\n#endif\n", 1),
     ])
 
