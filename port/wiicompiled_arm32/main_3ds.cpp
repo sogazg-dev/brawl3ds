@@ -9,7 +9,7 @@
 //    time is measured here and summarised once a second to sdmc:/3ds/brawl3ds/headless.log, with the current scene.
 //    Deterministic mode (guest clocks on a virtual timeline) makes the attract demo reach the same VS match
 //    (Bowser, Olimar, Zelda, Mario on Smashville) however slowly frames run.
-//  * Stops by itself after kMatchFramesToMeasure frames of scMelee, or when START is pressed.
+//  * Stops by itself when the demo match ends (~1,141 frames of scMelee, capped at kMatchFramesToMeasure), or on START.
 //  * Failures (a guest call into code the build left out, a fatal runtime error, a CPU exception) are written to
 //    sdmc:/3ds/brawl3ds/crash.txt and shown on screen.
 #include <3ds.h>
@@ -91,7 +91,7 @@ void __system_allocateHeaps(void)
 namespace {
 
 constexpr const char* kRoot = "sdmc:/3ds/brawl3ds";
-constexpr uint32_t kMatchFramesToMeasure = 1800;  // 30 seconds of the demo match at 60 frames per second
+constexpr uint32_t kMatchFramesToMeasure = 1800;  // cap; the attract demo match itself ends after ~1,141 frames
 
 std::FILE* g_log = nullptr;
 std::atomic<bool> g_exitRequested{false};
@@ -137,7 +137,7 @@ constexpr Step kSteps[] = {
     {"Safety screen (scStrap)", "Brawl's own ~24 s timeout", 1435},
     {"Loading boot data + save", "scBoot: menus, fonts, save files", 44},
     {"Title screen idle (scTitle)", "A skips the movie; demo starts after", 1186},
-    {"Measuring the VS demo match", "scMelee: 30 s of match frames", kMatchFramesToMeasure},
+    {"Measuring the VS demo match", "scMelee: the whole ~19 s demo match", 1141},
     {"Writing results", "headless.log", 0},
 };
 constexpr int kStepCount = sizeof(kSteps) / sizeof(kSteps[0]);
@@ -450,8 +450,16 @@ extern "C" void Brawl3dsFrameEnd()
     if (scene != g_scene) {
         WriteWindow();
         Log("-- scene %s -> %s at frame %u\n", g_scene.empty() ? "(none)" : g_scene.c_str(), scene.c_str(), g_frames);
+        // The demo match is ~1,141 frames (it ends before the 1,800-frame cap): leaving scMelee ends the measurement.
+        const bool matchEnded = g_scene == "scMelee" && g_matchFrames > 0 && g_step == kStepMatch;
         g_scene = scene;
-        EnterStep(StepForScene(scene));
+        if (matchEnded) {
+            WriteMatchSummary();
+            EnterStep(kStepResults);
+            g_exitRequested = true;
+        } else {
+            EnterStep(StepForScene(scene));
+        }
     }
     {
         const double ms = TicksToMs(total);

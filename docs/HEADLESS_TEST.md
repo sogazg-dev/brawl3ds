@@ -2,7 +2,7 @@
 
 A build of Brawl with **no graphics or sound output**. It boots the real game code, sits on the title
 screen until Brawl starts its CPU demo match (Bowser, Olimar, Zelda and Mario on Smashville), measures
-30 seconds of that match, and writes how long every frame took. The top screen shows instructions; the
+the whole match (~1,141 frames, about 19 s at 60 fps), and writes how long every frame took. The top screen shows instructions; the
 bottom screen shows which step is running.
 
 **This is a diagnostic tool, not the game.** Most of its running time is Brawl's own idle timers, counted in
@@ -27,7 +27,7 @@ plays, and this build only holds the code that the PC coverage run of this match
 | 5 | Safety screen (scStrap) | Brawl's idle timeout | 1,435 frames |
 | 6 | Loading boot data + save | scBoot | 44 frames |
 | 7 | Title screen idle (scTitle) | A skips the movie; waits for the attract demo, then loads it | ~1,186 frames |
-| 8 | Measuring the VS demo match | scMelee | 1,800 frames |
+| 8 | Measuring the VS demo match | scMelee, the whole match | ~1,141 frames |
 | 9 | Writing results | headless.log | instant |
 
 The screen shows the frame count against the PC build's count for that step, time in the step, total time,
@@ -65,7 +65,7 @@ SD:/cias/brawl3ds-headless.cia
 2. Launch **Brawl3DS headless** from the HOME Menu. (Not from the Homebrew Launcher: a .3dsx only gets the
    launcher's memory, and this needs the 178 MB mode.)
 3. Leave it alone and watch the bottom screen for the step and the estimate of time left. It closes
-   itself after 30 seconds of the match, or press START to stop early.
+   itself when the demo match ends, or press START to stop early.
 4. Send back these files from `SD:/3ds/brawl3ds/`:
    - `headless.log` (the timing results)
    - `crash.txt` if it exists
