@@ -72,3 +72,20 @@ unsigned char* aurora_load_png_rgba(const char*, unsigned* width, unsigned* heig
 }
 
 } // extern "C"
+
+// rename() over an existing file: POSIX and std::filesystem::rename replace the destination, the 3DS SD driver
+// (FSUSER_RenameFile) refuses. The runtime saves NAND files, settings and the SD image by writing a temp file and
+// renaming it over the old one, so without this every save after the first silently failed (and Brawl took error
+// paths the PC never runs). Linked with -Wl,--wrap=rename, which also covers libstdc++'s filesystem code.
+extern "C" int __real_rename(const char* from, const char* to);
+extern "C" int __wrap_rename(const char* from, const char* to)
+{
+    if (__real_rename(from, to) == 0) return 0;
+    const int saved = errno;
+    struct stat source {}, target {};
+    if (stat(from, &source) == 0 && stat(to, &target) == 0 && !S_ISDIR(target.st_mode) && unlink(to) == 0) {
+        return __real_rename(from, to);
+    }
+    errno = saved;
+    return -1;
+}

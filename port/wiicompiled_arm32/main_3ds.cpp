@@ -118,25 +118,206 @@ void Log(const char* fmt, ...)
     std::fflush(g_log);
 }
 
-// Bottom screen, no text renderer needed: a bar that grows with frames (white while booting, green in the match).
-void DrawProgress()
+// ---- Steps of a run, shown on the bottom screen and logged ------------------------------------------------------
+// The waits in steps 5 and 7 are Brawl's own idle timers (the safety screen times out after ~24 s, the title screen
+// starts the attract demo after ~131 s of no input), counted in frames: at a lower frame rate they last longer in
+// real time. A player pressing A skips both; only this unattended test sits through them.
+struct Step {
+    const char* name;
+    const char* detail;
+    uint32_t pcFrames;  // frames the PC build spends in this step (0: not frame-based)
+};
+constexpr Step kSteps[] = {
+    {"Checking game files", "sdmc:/3ds/brawl3ds/game and the save", 0},
+    {"Indexing the game folder", "5314 files on the SD card", 0},
+    {"Reserving Wii memory", "MEM1 + MEM2 + module homes", 0},
+    {"Starting the runtime", "game code, modules, virtual NAND", 0},
+    {"Safety screen (scStrap)", "Brawl's own ~24 s timeout", 1435},
+    {"Loading boot data + save", "scBoot: menus, fonts, save files", 44},
+    {"Title screen idle (scTitle)", "waits ~131 s, then starts the demo", 7855},
+    {"Measuring the VS demo match", "scMelee: 30 s of match frames", kMatchFramesToMeasure},
+    {"Writing results", "headless.log", 0},
+};
+constexpr int kStepCount = sizeof(kSteps) / sizeof(kSteps[0]);
+constexpr int kStepStrap = 4, kStepBoot = 5, kStepTitle = 6, kStepMatch = 7, kStepResults = 8;  // indices
+
+int g_step = 0;
+uint64_t g_runStart = 0, g_stepStart = 0;
+uint32_t g_stepFrameStart = 0;
+uint64_t g_stepTicks[kStepCount] = {};
+uint32_t g_stepFrames[kStepCount] = {};
+double g_recentFrameMs = 0;  // smoothed frame time, for the time estimates
+
+// Bottom screen text: libctru's 8x8 console font drawn straight into the framebuffer (40 x 30 characters).
+extern "C" const u8 default_font_bin[];
+
+void PutText(u8* fb, int col, int row, const char* text, u32 rgb)
 {
-    u16 width = 0, height = 0;  // the framebuffer is rotated: "width" is the 240 px axis
-    auto* fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &width, &height);
-    if (!fb) return;
-    const bool inMatch = g_scene == "scMelee";
-    const uint32_t progress = inMatch ? (g_matchFrames * 320u) / kMatchFramesToMeasure : (g_frames / 30u) % 320u;
-    for (uint32_t x = 0; x < 320; ++x) {
-        const bool lit = x <= progress;
-        for (uint32_t y = 100; y < 140; ++y) {
-            u8* px = fb + (x * 240 + (239 - y)) * 3;
-            px[0] = lit ? (inMatch ? 0x40 : 0xC0) : 0x20;  // B
-            px[1] = lit ? (inMatch ? 0xD0 : 0xC0) : 0x20;  // G
-            px[2] = lit ? (inMatch ? 0x40 : 0xC0) : 0x20;  // R
+    for (; *text && col < 40; ++text, ++col) {
+        const u8* glyph = default_font_bin + static_cast<u8>(*text) * 8;
+        for (int gy = 0; gy < 8; ++gy) {
+            for (int gx = 0; gx < 8; ++gx) {
+                if (!(glyph[gy] & (0x80 >> gx))) continue;
+                const int x = col * 8 + gx, y = row * 8 + gy;  // the framebuffer is rotated: columns of 240 px
+                u8* px = fb + (x * 240 + (239 - y)) * 3;
+                px[0] = rgb & 0xFF;
+                px[1] = (rgb >> 8) & 0xFF;
+                px[2] = (rgb >> 16) & 0xFF;
+            }
         }
     }
+}
+
+void PrintAt(u8* fb, int col, int row, u32 rgb, const char* fmt, ...)
+{
+    char text[48];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(text, sizeof(text), fmt, args);
+    va_end(args);
+    PutText(fb, col, row, text, rgb);
+}
+
+void Bar(u8* fb, int row, double fraction, u32 rgb)
+{
+    fraction = fraction < 0 ? 0 : (fraction > 1 ? 1 : fraction);
+    const int lit = static_cast<int>(fraction * 304);
+    for (int x = 8; x < 312; ++x) {
+        const u32 c = x - 8 < lit ? rgb : 0x303030;
+        for (int y = row * 8 + 1; y < row * 8 + 7; ++y) {
+            u8* px = fb + (x * 240 + (239 - y)) * 3;
+            px[0] = c & 0xFF;
+            px[1] = (c >> 8) & 0xFF;
+            px[2] = (c >> 16) & 0xFF;
+        }
+    }
+}
+
+void FormatDuration(char* out, size_t size, double seconds)
+{
+    if (seconds < 0) seconds = 0;
+    const unsigned s = static_cast<unsigned>(seconds);
+    if (s >= 3600) std::snprintf(out, size, "%uh%02um%02us", s / 3600, s / 60 % 60, s % 60);
+    else std::snprintf(out, size, "%um%02us", s / 60, s % 60);
+}
+
+double SecondsSince(uint64_t tick) { return TicksToMs(svcGetSystemTick() - tick) / 1000.0; }
+
+// Frames still to run, from the PC timeline: the rest of this step plus every later frame-based step.
+uint32_t RemainingFrames()
+{
+    uint32_t remaining = 0;
+    for (int i = g_step; i < kStepCount; ++i) {
+        const uint32_t done = i == g_step ? g_frames - g_stepFrameStart : 0;
+        remaining += kSteps[i].pcFrames > done ? kSteps[i].pcFrames - done : 0;
+    }
+    return remaining;
+}
+
+void DrawStatus(const char* warning = nullptr)
+{
+    u8* fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
+    if (!fb) return;
+    std::memset(fb, 0, 320 * 240 * 3);
+    constexpr u32 kWhite = 0xFFFFFF, kGrey = 0xA0A0A0, kGreen = 0x40D040, kYellow = 0xFFD040, kRed = 0xFF5050;
+    char a[24], b[24];
+
+    PutText(fb, 1, 1, "brawl3ds headless test (diagnostic)", kGrey);
+    PrintAt(fb, 1, 3, kWhite, "Step %d of %d:", g_step + 1, kStepCount);
+    PutText(fb, 1, 4, kSteps[g_step].name, g_step == kStepMatch ? kGreen : kYellow);
+    PutText(fb, 1, 5, kSteps[g_step].detail, kGrey);
+
+    const uint32_t stepFrames = g_frames - g_stepFrameStart;
+    FormatDuration(a, sizeof(a), SecondsSince(g_stepStart));
+    if (kSteps[g_step].pcFrames) {
+        PrintAt(fb, 1, 7, kWhite, "frame %u of ~%u in this step", stepFrames, kSteps[g_step].pcFrames);
+        Bar(fb, 8, static_cast<double>(stepFrames) / kSteps[g_step].pcFrames, g_step == kStepMatch ? kGreen : kWhite);
+    } else {
+        PutText(fb, 1, 7, "(not frame based)", kGrey);
+    }
+    PrintAt(fb, 1, 9, kWhite, "time in this step   %s", a);
+
+    // Overall: one segment per step.
+    PutText(fb, 1, 11, "All steps:", kWhite);
+    for (int i = 0; i < kStepCount; ++i) {
+        const u32 c = i < g_step ? kGreen : (i == g_step ? kYellow : 0x404040);
+        for (int x = 8 + i * 34; x < 8 + i * 34 + 30; ++x) {
+            for (int y = 12 * 8 + 1; y < 12 * 8 + 7; ++y) {
+                u8* px = fb + (x * 240 + (239 - y)) * 3;
+                px[0] = c & 0xFF;
+                px[1] = (c >> 8) & 0xFF;
+                px[2] = (c >> 16) & 0xFF;
+            }
+        }
+    }
+    FormatDuration(a, sizeof(a), g_runStart ? SecondsSince(g_runStart) : 0);
+    PrintAt(fb, 1, 14, kWhite, "total time          %s", a);
+    if (g_recentFrameMs > 0) {
+        const uint32_t remaining = RemainingFrames();
+        FormatDuration(b, sizeof(b), remaining * g_recentFrameMs / 1000.0);
+        PrintAt(fb, 1, 15, kWhite, "estimated left      ~%s", b);
+        PrintAt(fb, 1, 16, kGrey, "(%u frames at the current speed)", remaining);
+        PrintAt(fb, 1, 18, kWhite, "speed %5.1f fps  (%.1f ms/frame)", 1000.0 / g_recentFrameMs, g_recentFrameMs);
+    }
+    PrintAt(fb, 1, 19, kWhite, "frame %u   memory %.1f MB", g_frames, (mallinfo().uordblks >> 10) / 1024.0);
+    if (!g_scene.empty()) PrintAt(fb, 1, 20, kGrey, "scene %s", g_scene.c_str());
+
+    if (warning) {
+        PutText(fb, 1, 23, warning, kRed);
+    } else {
+        PutText(fb, 1, 23, "Waits in steps 5 and 7 are the game's", kGrey);
+        PutText(fb, 1, 24, "own idle timers (no input in this test).", kGrey);
+    }
+    PutText(fb, 1, 27, "START: stop early (results are kept)", kGrey);
     gfxFlushBuffers();
     gfxSwapBuffers();
+}
+
+void EnterStep(int step)
+{
+    if (step <= g_step && g_runStart) return;  // steps only move forward
+    const uint64_t now = svcGetSystemTick();
+    if (g_runStart) {
+        g_stepTicks[g_step] = now - g_stepStart;
+        g_stepFrames[g_step] = g_frames - g_stepFrameStart;
+        char d[24];
+        FormatDuration(d, sizeof(d), TicksToMs(g_stepTicks[g_step]) / 1000.0);
+        Log("== step %d of %d done: %s, %s, %u frames\n", g_step + 1, kStepCount, kSteps[g_step].name, d,
+            g_stepFrames[g_step]);
+    } else {
+        g_runStart = now;
+    }
+    g_step = step;
+    g_stepStart = now;
+    g_stepFrameStart = g_frames;
+    Log("== step %d of %d: %s (%s)\n", step + 1, kStepCount, kSteps[step].name, kSteps[step].detail);
+    DrawStatus();
+}
+
+void LogStepSummary()
+{
+    Log("\n== time per step ==\n");
+    for (int i = 0; i < kStepCount; ++i) {
+        if (i > g_step) break;
+        const uint64_t ticks = i == g_step ? svcGetSystemTick() - g_stepStart : g_stepTicks[i];
+        const uint32_t frames = i == g_step ? g_frames - g_stepFrameStart : g_stepFrames[i];
+        char d[24];
+        FormatDuration(d, sizeof(d), TicksToMs(ticks) / 1000.0);
+        Log("  %d. %-30s %10s  %6u frames%s\n", i + 1, kSteps[i].name, d, frames, i == g_step ? "  (last)" : "");
+    }
+    char d[24];
+    FormatDuration(d, sizeof(d), g_runStart ? SecondsSince(g_runStart) : 0);
+    Log("  total %s\n", d);
+}
+
+// Scene -> step. Scenes between the named ones (scMemoryChange, sq*) stay in the step they follow.
+int StepForScene(const std::string& scene)
+{
+    if (scene == "scStrap") return g_step < kStepStrap ? kStepStrap : g_step;
+    if (scene == "scBoot" || scene == "sqPrizeCheck") return g_step < kStepBoot ? kStepBoot : g_step;
+    if (scene == "scTitle" || scene == "sqTitle") return g_step < kStepTitle ? kStepTitle : g_step;
+    if (scene == "scMelee") return kStepMatch;
+    return g_step;
 }
 
 [[noreturn]] void StopWithMessage(const char* title, const char* detail)
@@ -150,7 +331,9 @@ void DrawProgress()
         std::fclose(crash);
     }
     Brawl3dsAllocTrackDump("sdmc:/3ds/brawl3ds/leaks.txt", g_frames);
-    Log("STOP: %s: %s\n", title, detail);
+    Log("STOP in step %d of %d (%s): %s: %s\n", g_step + 1, kStepCount, kSteps[g_step].name, title, detail);
+    LogStepSummary();
+    DrawStatus("Stopped - see the top screen.");
     if (g_log) std::fclose(g_log);
     g_log = nullptr;
     if (!g_consoleActive) {
@@ -266,6 +449,26 @@ extern "C" void Brawl3dsFrameEnd()
         WriteWindow();
         Log("-- scene %s -> %s at frame %u\n", g_scene.empty() ? "(none)" : g_scene.c_str(), scene.c_str(), g_frames);
         g_scene = scene;
+        EnterStep(StepForScene(scene));
+    }
+    {
+        const double ms = TicksToMs(total);
+        g_recentFrameMs = g_recentFrameMs == 0 ? ms : g_recentFrameMs * 0.97 + ms * 0.03;
+    }
+
+    // Stall watchdog: a frame-based step running far past the PC build's frame count is waiting for something that
+    // will not come (in this unattended build, usually a prompt that wants a button press).
+    if (kSteps[g_step].pcFrames && g_step != kStepMatch) {
+        const uint32_t stepFrames = g_frames - g_stepFrameStart;
+        const uint32_t limit = kSteps[g_step].pcFrames * 2 + 600;
+        if (stepFrames == limit) {
+            char detail[200];
+            std::snprintf(detail, sizeof(detail),
+                          "step %d (%s) ran %u frames; the PC build\nneeds ~%u. Brawl is probably waiting for input\n"
+                          "(e.g. a save data prompt). See headless.log.",
+                          g_step + 1, kSteps[g_step].name, stepFrames, kSteps[g_step].pcFrames);
+            StopWithMessage("Stalled", detail);
+        }
     }
 
     g_windowSum += total;
@@ -285,6 +488,7 @@ extern "C" void Brawl3dsFrameEnd()
         if (g_matchFrames == kMatchFramesToMeasure) {
             WriteWindow();
             WriteMatchSummary();
+            EnterStep(kStepResults);
             g_exitRequested = true;
         }
     }
@@ -294,7 +498,7 @@ extern "C" void Brawl3dsFrameEnd()
         if (!aptMainLoop()) g_exitRequested = true;
         hidScanInput();
         if (hidKeysDown() & KEY_START) g_exitRequested = true;
-        DrawProgress();
+        DrawStatus();
     }
 }
 
@@ -319,20 +523,35 @@ int main(int, char**)
     Log("heaps: regular %lu MiB, linear %lu MiB (linear free %lu KiB)\n",
         static_cast<unsigned long>(__ctru_heap_size >> 20), static_cast<unsigned long>(__ctru_linear_heap_size >> 20),
         static_cast<unsigned long>(linearSpaceFree() >> 10));
-    std::printf("Booting Brawl. This screen stays still while it\nruns; the bottom screen shows progress:\n"
-                "  white bar = booting / title / demo setup\n  green bar = measuring the VS demo match\n\n"
-                "It stops by itself after 30 s of the match\n(or press START). Results:\n"
-                "  sdmc:/3ds/brawl3ds/headless.log\n");
+    std::printf("This is a diagnostic build, not the game:\n"
+                "no graphics, no input. It boots Brawl,\n"
+                "lets the attract demo start a VS match\n"
+                "and measures how fast the 3DS runs it.\n\n"
+                "The bottom screen shows the step (1-%d),\n"
+                "time spent and an estimate of time left.\n"
+                "Steps 5 and 7 are Brawl's own idle\n"
+                "timers: a player pressing A skips them.\n\n"
+                "Stops by itself after 30 s of the match\n"
+                "(or press START). Results:\n"
+                "  sdmc:/3ds/brawl3ds/headless.log\n", kStepCount);
 
+    EnterStep(0);
     struct stat info {};
     if (stat("sdmc:/3ds/brawl3ds/game/sys/boot.bin", &info) != 0) {
         StopWithMessage("Game files missing", "copy the extracted disc to sdmc:/3ds/brawl3ds/game/ (sys/ and files/)");
     }
+    // A first boot (no save) stops at Brawl's "create save data?" prompt, which this build cannot answer.
+    if (stat("sdmc:/3ds/brawl3ds/UserData/NAND/title/00010000/52534245/data/autosv0.bin", &info) != 0) {
+        StopWithMessage("No Brawl save data",
+                        "Brawl would stop at its 'create save data?'\nprompt and this build has no input.\n"
+                        "Copy your save (the PC build's\nUserData/NAND/title/00010000/52534245/data)\n"
+                        "to sdmc:/3ds/brawl3ds/UserData/NAND/title/\n00010000/52534245/data");
+    }
 
     // The runtime indexes the whole disc folder at boot (5314 files for Brawl). Time the same kind of walk here so
     // the log shows how long the SD card takes, and whether directory iteration works at all.
+    EnterStep(1);
     {
-        std::printf("Indexing the game folder...\n");
         const uint64_t start = svcGetSystemTick();
         uint32_t files = 0, dirs = 0;
         uint64_t bytes = 0;
@@ -361,20 +580,23 @@ int main(int, char**)
     g_consoleActive = false;
 
     // Guest RAM first, before the runtime's own allocations fragment the regular heap.
+    EnterStep(2);
     Log("before reserving guest RAM: malloc in use %d KiB, linear free %lu KiB\n", mallinfo().uordblks >> 10,
         static_cast<unsigned long>(linearSpaceFree() >> 10));
     Brawl3dsReserveGuestMemory();
     Log("after reserving: malloc in use %d KiB, linear free %lu KiB\n", mallinfo().uordblks >> 10,
         static_cast<unsigned long>(linearSpaceFree() >> 10));
 
+    EnterStep(3);
     SDL_SetMainReady();
     char program[] = "sdmc:/3ds/brawl3ds/brawl3ds.3dsx";
     char* argv[] = {program, nullptr};
     const int result = RuntimeMain(1, argv);
 
     WriteWindow();
-    WriteMatchSummary();
+    if (g_step != kStepResults) WriteMatchSummary();  // already written when the match measurement completed
     Log("RuntimeMain returned %d after %u frames\n", result, g_frames);
+    LogStepSummary();
     if (g_log) std::fclose(g_log);
     gfxExit();
     return result;

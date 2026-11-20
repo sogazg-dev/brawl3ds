@@ -105,7 +105,7 @@ set(CMAKE_CXX_LINK_EXECUTABLE
   "\"${DKA_GXX}\" <CMAKE_CXX_LINK_FLAGS> <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
 target_link_options(brawl3ds PRIVATE "-Wl,-Map,${CMAKE_BINARY_DIR}/brawl3ds.map" -Wl,--gc-sections
   # Live-allocation tracker (alloc_tracker_3ds.cpp).
-  -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free -Wl,--wrap=_Znwj -Wl,--wrap=_Znaj)
+  -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free -Wl,--wrap=_Znwj -Wl,--wrap=_Znaj -Wl,--wrap=rename)
 # The runtime registers its HLE functions and the translator's function tables through static initializers that
 # nothing references by name, so those archives must be linked whole (the PC build links them as object libraries).
 target_link_libraries(brawl3ds PRIVATE

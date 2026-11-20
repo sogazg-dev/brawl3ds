@@ -1,7 +1,11 @@
 """Package the headless timing build: a 178 MB-mode CIA plus the SD card folder it needs.
 
 Usage: python -I tools/package_headless.py --build <headless-build dir> --wiicompiled <wiicompiled dir>
-           --blobs <staged blobs dir> --out <output dir> [--makerom PATH] [--devkitpro C:/devkitPro]
+           --blobs <staged blobs dir> --out <output dir> [--save <dir>] [--makerom PATH] [--devkitpro C:/devkitPro]
+
+--save: the folder holding your own Brawl save (the PC build's UserData/NAND/title/00010000/52534245/data). The
+headless build has no input, so a first boot would stop at Brawl's "create save data?" prompt; with a save present
+the game goes straight on to the title screen and the attract demo. The save stays in the local output folder.
 
 Output:
   <out>/brawl3ds-headless.cia          install with FBI (178 MB system mode, 804 MHz, L2 cache)
@@ -147,6 +151,7 @@ def main():
     ap.add_argument("--wiicompiled", type=Path, required=True)
     ap.add_argument("--blobs", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--save", type=Path, help="your Brawl save folder (.../52534245/data), copied into the SD folder")
     ap.add_argument("--devkitpro", type=Path, default=Path("C:/devkitPro"))
     ap.add_argument("--makerom", type=Path, default=Path.home() / "brawl3ds-work/tools/makerom/makerom.exe")
     args = ap.parse_args()
@@ -178,6 +183,10 @@ def main():
     shutil.copytree(args.blobs, sd / "blobs", dirs_exist_ok=True)
     shutil.copytree(args.wiicompiled / "native-build" / "wii_bootstrap", sd / "wii_bootstrap", dirs_exist_ok=True)
     shutil.copyfile(args.wiicompiled / "native-build" / "dsp_coef.bin", sd / "dsp_coef.bin")
+    if args.save:
+        if not (args.save / "autosv0.bin").exists():
+            sys.exit(f"--save: no autosv0.bin in {args.save}")
+        shutil.copytree(args.save, sd / "UserData/NAND/title/00010000/52534245/data", dirs_exist_ok=True)
     (sd / "portable.txt").write_text("brawl3ds: settings, saves and logs stay in the UserData folder here.\n")
     print(f"\nCIA: {cia} ({cia.stat().st_size / 2**20:.1f} MiB)\nSD folder: {sd}  (add game/ = the extracted disc)")
 
