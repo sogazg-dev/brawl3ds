@@ -241,6 +241,62 @@ def main(wiicompiled: Path):
          "#elif defined(__ANDROID__)\n    // The game is a library inside an APK", 1),
     ])
 
+    # Brawl's module loader keeps a pristine copy of all 126 pre-linked module images in host memory (12 MiB) to
+    # restore a module each time the game loads it. On the 3DS those bytes are read back from the section blobs on
+    # the SD card when a module is linked (brawl_modules.bin for the homes, text2.bin for the boot-resident ones).
+    pristine_loader = (
+        "#if defined(__3DS__)\n"
+        "// brawl3ds: no resident copies of the pristine images (12 MiB); read the one needed from the SD card blobs.\n"
+        "std::vector<uint8_t> LoadPristine3ds(size_t index) {\n"
+        "    const BrawlModule& m = kModules[index];\n"
+        "    const bool home = m.image >= 0x94000000u;\n"
+        "    const char* blob = home ? \"sdmc:/3ds/brawl3ds/blobs/brawl_modules.bin\" : \"sdmc:/3ds/brawl3ds/blobs/text2.bin\";\n"
+        "    const uint32_t base = home ? 0x94000000u : 0x80673FA0u;  // brawl_modules / text2 load addresses\n"
+        "    std::vector<uint8_t> out(m.fixSize);\n"
+        "    std::FILE* file = std::fopen(blob, \"rb\");\n"
+        "    if (!file || std::fseek(file, static_cast<long>(m.image - base), SEEK_SET) != 0 ||\n"
+        "        std::fread(out.data(), 1, out.size(), file) != out.size()) {\n"
+        "        if (file) std::fclose(file);\n"
+        "        throw std::runtime_error(std::string(\"cannot read the pristine image of \") + m.name + \" from \" + blob);\n"
+        "    }\n"
+        "    std::fclose(file);\n"
+        "    return out;\n"
+        "}\n"
+        "#define BRAWL3DS_PRISTINE(index) LoadPristine3ds(index)\n"
+        "#define BRAWL3DS_PRISTINE_MISSING(index) false\n"
+        "#else\n"
+        "#define BRAWL3DS_PRISTINE(index) g_pristine[index]\n"
+        "#define BRAWL3DS_PRISTINE_MISSING(index) g_pristine[index].empty()\n"
+        "#endif\n")
+    edit(src / "hle" / "brawl_modules.cpp", [
+        ("#include <cstring>\n#include <mutex>\n", "#include <cstdio>\n#include <cstring>\n#include <mutex>\n"
+         "#include <stdexcept>\n#include <string>\n", 1),
+        ("std::vector<uint8_t> g_pristine[sizeof(kModules) / sizeof(kModules[0])];  // each pre-linked image, from boot\n",
+         "std::vector<uint8_t> g_pristine[sizeof(kModules) / sizeof(kModules[0])];  // each pre-linked image, from boot\n"
+         + pristine_loader, 1),
+        ("    const std::vector<uint8_t>& image = g_pristine[index];",
+         "    const std::vector<uint8_t>& image = BRAWL3DS_PRISTINE(index);", 1),
+        ("if (m == nullptr || m->resident || g_pristine[index].empty()) return;",
+         "if (m == nullptr || m->resident || BRAWL3DS_PRISTINE_MISSING(index)) return;", 1),
+        ("    const auto& pristine = g_pristine[index];", "    const auto& pristine = BRAWL3DS_PRISTINE(index);", 1),
+        ("        g_pristine[i].assign(image, image + kModules[i].fixSize);",
+         "#if !defined(__3DS__)\n        g_pristine[i].assign(image, image + kModules[i].fixSize);\n#else\n"
+         "        (void)image;\n#endif", 1),
+        ("        const auto* now = static_cast<const uint8_t*>(Memory::GetPointer(m.image, m.fixSize));\n",
+         "        const auto* now = static_cast<const uint8_t*>(Memory::GetPointer(m.image, m.fixSize));\n"
+         "        const auto& pristineImage = BRAWL3DS_PRISTINE(i);\n", 1),
+        ("if (std::memcmp(now + offset, g_pristine[i].data() + offset, 4) == 0) continue;",
+         "if (std::memcmp(now + offset, pristineImage.data() + offset, 4) == 0) continue;", 1),
+    ])
+
+    # Every guest thread runs on a host fiber stack, 1 MiB each upstream. Translated functions use small host frames,
+    # so the 3DS gives each 256 KiB of its scarce regular heap.
+    edit(src / "fiber_manager.cpp", [
+        ("    constexpr size_t kHostStackSize = 1024 * 1024;",
+         "#if defined(__3DS__)\n    constexpr size_t kHostStackSize = 256 * 1024;  // regular heap is scarce on the 3DS\n"
+         "#else\n    constexpr size_t kHostStackSize = 1024 * 1024;\n#endif", 1),
+    ])
+
     # Finding the extracted disc in a "game" folder beside the program is Windows-only upstream; the 3DS uses the
     # same rule (sdmc:/3ds/brawl3ds/game), so no Config.toml editing is needed on the console.
     edit(src / "game_folder.cpp", [

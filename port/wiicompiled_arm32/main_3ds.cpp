@@ -140,8 +140,11 @@ void DrawProgress()
 [[noreturn]] void StopWithMessage(const char* title, const char* detail)
 {
     if (std::FILE* crash = std::fopen("sdmc:/3ds/brawl3ds/crash.txt", "w")) {
-        std::fprintf(crash, "%s\n%s\nframes=%u matchFrames=%u scene=%s\n", title, detail, g_frames, g_matchFrames,
-                     g_scene.c_str());
+        const struct mallinfo heap = mallinfo();
+        std::fprintf(crash, "%s\n%s\nframes=%u matchFrames=%u scene=%s\n"
+                     "heap: in use %d KiB, free inside the heap %d KiB (largest gaps fragment it), linear free %lu KiB\n",
+                     title, detail, g_frames, g_matchFrames, g_scene.c_str(), heap.uordblks >> 10, heap.fordblks >> 10,
+                     static_cast<unsigned long>(linearSpaceFree() >> 10));
         std::fclose(crash);
     }
     Log("STOP: %s: %s\n", title, detail);
@@ -263,7 +266,7 @@ extern "C" void Brawl3dsFrameEnd()
     g_windowWork += work;
     g_windowMin = total < g_windowMin ? total : g_windowMin;
     g_windowMax = total > g_windowMax ? total : g_windowMax;
-    if (++g_windowFrames >= 60) WriteWindow();
+    if (++g_windowFrames >= (g_scene == "scMelee" ? 60u : 10u)) WriteWindow();  // finer before the match: memory growth
 
     if (g_scene == "scMelee") {
         ++g_matchFrames;

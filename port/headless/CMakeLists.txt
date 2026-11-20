@@ -74,7 +74,7 @@ list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/netplay/net_socket\\.cpp$|/product/e
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/product/retro_rewind_product\\.cpp$")
 add_library(b3_runtime STATIC ${RUNTIME_SOURCES} "${RT}/src/platform/3ds/co_switch.S")
 brawl3ds_target(b3_runtime)
-target_compile_options(b3_runtime PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O2 -std=gnu++20 -include "${RT}/include/mkw_pch.h">)
+target_compile_options(b3_runtime PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-O2;-std=gnu++20;-include;${RT}/include/mkw_pch.h>")
 
 # --- generated (translator output that is not translated code) ---
 file(GLOB GENERATED_DISPATCH "${W}/generated/build_shards/base_dispatch/*.cpp"
@@ -103,7 +103,9 @@ set(DKA_GXX "${DEVKITARM}/bin/arm-none-eabi-g++.exe")
 # CMAKE_EXE_LINKER_FLAGS_INIT (in <LINK_FLAGS>) already carries the arch flags and -specs=3dsx.specs.
 set(CMAKE_CXX_LINK_EXECUTABLE
   "\"${DKA_GXX}\" <CMAKE_CXX_LINK_FLAGS> <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
-target_link_options(brawl3ds PRIVATE "-Wl,-Map,${CMAKE_BINARY_DIR}/brawl3ds.map" -Wl,--gc-sections)
+target_link_options(brawl3ds PRIVATE "-Wl,-Map,${CMAKE_BINARY_DIR}/brawl3ds.map" -Wl,--gc-sections
+  # Large-allocation log (posix_and_aurora_extras_3ds.cpp).
+  -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=_Znwj -Wl,--wrap=_Znaj)
 # The runtime registers its HLE functions and the translator's function tables through static initializers that
 # nothing references by name, so those archives must be linked whole (the PC build links them as object libraries).
 target_link_libraries(brawl3ds PRIVATE
