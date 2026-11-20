@@ -31,6 +31,8 @@
 
 int RuntimeMain(int argc, char** argv);
 extern "C" void Brawl3dsReserveGuestMemory();
+extern "C" void Brawl3dsAllocTrackStart();                            // alloc_tracker_3ds.cpp
+extern "C" void Brawl3dsAllocTrackDump(const char* path, unsigned frame);
 
 // Heap layout. libctru's default __system_allocateHeaps (weak) caps the regular heap at 96 MiB and, depending on
 // which sizes are set, either leaves memory unallocated or gives all the rest to the linear heap. This build wants
@@ -147,6 +149,7 @@ void DrawProgress()
                      static_cast<unsigned long>(linearSpaceFree() >> 10));
         std::fclose(crash);
     }
+    Brawl3dsAllocTrackDump("sdmc:/3ds/brawl3ds/leaks.txt", g_frames);
     Log("STOP: %s: %s\n", title, detail);
     if (g_log) std::fclose(g_log);
     g_log = nullptr;
@@ -254,6 +257,9 @@ extern "C" void Brawl3dsFrameEnd()
     const uint64_t total = g_lastEnd ? now - g_lastEnd : work;
     g_lastEnd = now;
     ++g_frames;
+    // Track allocations from frame 10 (past boot) and report what is still held at frame 60: per-frame leaks.
+    if (g_frames == 10) Brawl3dsAllocTrackStart();
+    if (g_frames == 60) Brawl3dsAllocTrackDump("sdmc:/3ds/brawl3ds/leaks.txt", g_frames);
 
     const std::string scene = SaveStates::SceneName();
     if (scene != g_scene) {

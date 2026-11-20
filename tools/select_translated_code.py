@@ -13,7 +13,7 @@ Usage:
   python -I tools/select_translated_code.py <build_shards/base_common> <module_layout.json> <out dir> MODE
   MODE: --keep "sora_melee sora_scene ft_mario ..."  module names (main.dol always kept)
         --keep-all
-        --keep-covered brawl3ds_coverage.bin          only functions that ran in a coverage run
+        --keep-covered a.bin [b.bin ...]               only functions that ran in any of these coverage runs
         --instrument-coverage                        keep all, and record which functions run: build the PC
                                                      version with these shards, play, and it writes
                                                      brawl3ds_coverage.bin beside the executable at exit
@@ -136,7 +136,7 @@ def main():
     group = ap.add_mutually_exclusive_group(required=True)
     group.add_argument("--keep", help="space-separated module names to keep (main.dol is always kept)")
     group.add_argument("--keep-all", action="store_true")
-    group.add_argument("--keep-covered", type=Path,
+    group.add_argument("--keep-covered", type=Path, nargs="+",
                        help="keep only functions that ran in a coverage run (brawl3ds_coverage.bin)")
     group.add_argument("--instrument-coverage", action="store_true",
                        help="keep everything and record which functions run (for a PC coverage build)")
@@ -150,7 +150,7 @@ def main():
             sys.exit("unknown module(s): " + " ".join(sorted(unknown)))
         keep_function = lambda address: module_of(address) in keep  # noqa: E731
     elif args.keep_covered:
-        covered = covered_addresses(args.keep_covered)
+        covered = set().union(*(covered_addresses(path) for path in args.keep_covered))
         print(f"coverage: {len(covered)} function entry points ran")
         keep_function = covered.__contains__
     else:

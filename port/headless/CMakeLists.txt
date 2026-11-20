@@ -93,7 +93,7 @@ target_compile_options(b3_shards PRIVATE -Oz -std=gnu++17 -include "${RT}/includ
 
 # --- the program ---
 add_executable(brawl3ds "${PORT}/main_3ds.cpp" "${PORT}/aurora_headless_3ds.cpp"
-  "${PORT}/posix_and_aurora_extras_3ds.cpp" "${GEN3DS_DIR}/link_stubs.cpp")
+  "${PORT}/posix_and_aurora_extras_3ds.cpp" "${PORT}/alloc_tracker_3ds.cpp" "${GEN3DS_DIR}/link_stubs.cpp")
 brawl3ds_target(brawl3ds)
 target_compile_options(brawl3ds PRIVATE -O2 -std=gnu++20 -include "${RT}/include/mkw_pch.h")
 set_target_properties(brawl3ds PROPERTIES SUFFIX ".elf")
@@ -104,8 +104,8 @@ set(DKA_GXX "${DEVKITARM}/bin/arm-none-eabi-g++.exe")
 set(CMAKE_CXX_LINK_EXECUTABLE
   "\"${DKA_GXX}\" <CMAKE_CXX_LINK_FLAGS> <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
 target_link_options(brawl3ds PRIVATE "-Wl,-Map,${CMAKE_BINARY_DIR}/brawl3ds.map" -Wl,--gc-sections
-  # Large-allocation log (posix_and_aurora_extras_3ds.cpp).
-  -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=_Znwj -Wl,--wrap=_Znaj)
+  # Live-allocation tracker (alloc_tracker_3ds.cpp).
+  -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free -Wl,--wrap=_Znwj -Wl,--wrap=_Znaj)
 # The runtime registers its HLE functions and the translator's function tables through static initializers that
 # nothing references by name, so those archives must be linked whole (the PC build links them as object libraries).
 target_link_libraries(brawl3ds PRIVATE

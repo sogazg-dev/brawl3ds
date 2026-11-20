@@ -289,6 +289,16 @@ def main(wiicompiled: Path):
          "if (std::memcmp(now + offset, pristineImage.data() + offset, 4) == 0) continue;", 1),
     ])
 
+    # The PC overlay is ImGui, whose frames Aurora begins and renders. With no Aurora on the 3DS nothing ever ends an
+    # ImGui frame, so every overlay draw call only piles up draw commands (~256 KiB per frame, found with
+    # alloc_tracker_3ds.cpp). Keep the overlay's non-drawing work and skip its drawing.
+    edit(src / "settings_overlay.cpp", [
+        ("    UpdateBootShaderState();\n    UpdateStartupPress();\n",
+         "    UpdateBootShaderState();\n    UpdateStartupPress();\n"
+         "#if defined(__3DS__)\n    UpdateGameSpeed();\n    ApplyInputBlockState();\n"
+         "    return;  // no ImGui frame is ever rendered on the 3DS: drawing would only pile up draw lists\n#endif\n", 1),
+    ])
+
     # Every guest thread runs on a host fiber stack, 1 MiB each upstream. Translated functions use small host frames,
     # so the 3DS gives each 256 KiB of its scarce regular heap.
     edit(src / "fiber_manager.cpp", [
