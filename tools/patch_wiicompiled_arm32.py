@@ -176,7 +176,45 @@ def main(wiicompiled: Path):
         "#elif defined(__aarch64__)\n#include <arm_neon.h>\n#elif defined(__arm__)\n#include \"brawl3ds_neon_shim.h\"\n",
         1)])
 
-    edit(isa / "ppc_isa_float.h", [("defined(__aarch64__)", "(defined(__aarch64__) || defined(__arm__))", None)])
+    # Gekko floating point on the ARM11. Two changes, both 3DS-only:
+    # - Multiply-add: std::fma / std::fmaf are newlib's unfused vmla.f64 here (VFPv2 has no fused multiply-add),
+    #   called out of line for every guest multiply-add. Brawl3dsHostFma/Fmaf (brawl3ds_neon_shim.h) compute the same
+    #   thing inline, bit for bit.
+    # - BRAWL3DS_FAST_FP (port/headless/CMakeLists.txt): drop the exact Gekko single-precision emulation, which on
+    #   the ARM11 costs integer work on the double's bits and FPU<->core transfers around every fmuls/fmadds/ps_*
+    #   (rounding operand C to 25 bits, the FPSCR.NI flush and the madd tie correction). The VFP's own flush-to-zero,
+    #   set from FPSCR.NI, still flushes. Results can differ in the last bit, so the attract demo may play out
+    #   slightly differently; the PC build keeps the exact path.
+    edit(isa / "ppc_isa_float.h", [
+        ("defined(__aarch64__)", "(defined(__aarch64__) || defined(__arm__))", None),
+        ("std::fma(", "PPC_HOST_FMA(", None),
+        ("std::fmaf(", "PPC_HOST_FMAF(", None),
+        ("inline float PpcForceSingleValueInline(double value)\n{\n",
+         f"#if {ARM32}\n"
+         "#define PPC_HOST_FMA(a, b, c) Brawl3dsHostFma((a), (b), (c))\n"
+         "#define PPC_HOST_FMAF(a, b, c) Brawl3dsHostFmaf((a), (b), (c))\n"
+         "#else\n"
+         "#define PPC_HOST_FMA(a, b, c) std::fma((a), (b), (c))\n"
+         "#define PPC_HOST_FMAF(a, b, c) std::fmaf((a), (b), (c))\n"
+         "#endif\n"
+         f"#if {ARM32} && defined(BRAWL3DS_FAST_FP)\n"
+         "#define BRAWL3DS_FAST_FP_ACTIVE 1\n"
+         "#endif\n\n"
+         "inline float PpcForceSingleValueInline(double value)\n{\n"
+         "#if defined(BRAWL3DS_FAST_FP_ACTIVE)\n"
+         "    return static_cast<float>(value);  // the VFP's FZ (set from FPSCR.NI) flushes\n"
+         "#endif\n", 1),
+        ("inline double PpcForce25BitInline(double value)\n{\n",
+         "inline double PpcForce25BitInline(double value)\n{\n"
+         "#if defined(BRAWL3DS_FAST_FP_ACTIVE)\n"
+         "    return value;\n"
+         "#endif\n", 1),
+        ("inline double PpcAccurateSingleMaddIntermediateInline(double a, double c, double b)\n{\n",
+         "inline double PpcAccurateSingleMaddIntermediateInline(double a, double c, double b)\n{\n"
+         "#if defined(BRAWL3DS_FAST_FP_ACTIVE)\n"
+         "    return Subtract ? a * c - b : a * c + b;\n"
+         "#endif\n", 1),
+    ])
     # Paired-single loads/stores (psq_l/psq_st) in the hot shards take a host pointer straight from the page-bias
     # tables, like the scalar accesses in memory_access.h below; a null pointer keeps the checked Memory::Read64/
     # Write64 path (all other shards, as before).

@@ -24,7 +24,8 @@ set(W "${WIICOMPILED_DIR}")
 set(RT "${W}/runtime")
 set(PORT "${CMAKE_CURRENT_LIST_DIR}/../wiicompiled_arm32")
 
-set(BRAWL3DS_DEFINES TARGET_PC NDEBUG CRYPTOPP_DISABLE_ASM CRYPTOPP_NO_GLOBAL_BYTE SDL_MAIN_HANDLED)
+# BRAWL3DS_FAST_FP: plain VFP single precision instead of the exact Gekko emulation (tools/patch_wiicompiled_arm32.py).
+set(BRAWL3DS_DEFINES TARGET_PC NDEBUG CRYPTOPP_DISABLE_ASM CRYPTOPP_NO_GLOBAL_BYTE SDL_MAIN_HANDLED BRAWL3DS_FAST_FP)
 set(BRAWL3DS_INCLUDES
   "${RT}/include" "${RT}/src" "${W}" "${W}/aurora-main/include"
   "${RT}/third_party/toml11" "${RT}/third_party/pugixml" "${RT}/third_party/fatfs" "${RT}/third_party"

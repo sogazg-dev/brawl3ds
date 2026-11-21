@@ -6,9 +6,10 @@
 // Only the ~35 intrinsics those headers actually use are provided. Each one is a plain
 // two-lane (or one-lane) loop; with -O2 they become a couple of VFP instructions.
 //
-// TODO(perf): vfma_f32 maps to fmaf(), which is a software routine on VFPv2 (no fused
-// multiply-add in hardware). Gekko's ps_madd is fused, so this keeps exact results but is
-// slow; profiling will tell whether an unfused a*b+c is acceptable for Brawl.
+// Multiply-add: VFPv2 has no fused multiply-add, and newlib's fma/fmaf on this target are the unfused
+// vmla.f64 (fmaf converting to double and back), so neither was ever fused here. Brawl3dsHostFma/Fmaf compute the
+// same thing inline (-ffp-contract=off keeps the multiply and the add separately rounded, exactly like vmla),
+// without a library call per guest multiply-add.
 
 #if !defined(__arm__) || defined(__aarch64__)
 #error "brawl3ds_neon_shim.h is only for 32-bit ARM hosts"
@@ -62,10 +63,16 @@ inline float32x2_t vsub_f32(float32x2_t a, float32x2_t b) { return {{a.v[0] - b.
 inline float32x2_t vmul_f32(float32x2_t a, float32x2_t b) { return {{a.v[0] * b.v[0], a.v[1] * b.v[1]}}; }
 inline float32x2_t vdiv_f32(float32x2_t a, float32x2_t b) { return {{a.v[0] / b.v[0], a.v[1] / b.v[1]}}; }
 inline float32x2_t vneg_f32(float32x2_t a) { return {{-a.v[0], -a.v[1]}}; }
-// NEON vfma_f32(a, b, c) = a + b * c, fused.
+// Bit-identical to newlib's fma / fmaf on ARM32 VFPv2 (vmla.f64: double multiply, rounded, then double add).
+inline double Brawl3dsHostFma(double a, double b, double c) { return a * b + c; }
+inline float Brawl3dsHostFmaf(float a, float b, float c)
+{
+    return static_cast<float>(static_cast<double>(a) * static_cast<double>(b) + static_cast<double>(c));
+}
+// NEON vfma_f32(a, b, c) = a + b * c.
 inline float32x2_t vfma_f32(float32x2_t a, float32x2_t b, float32x2_t c)
 {
-    return {{std::fmaf(b.v[0], c.v[0], a.v[0]), std::fmaf(b.v[1], c.v[1], a.v[1])}};
+    return {{Brawl3dsHostFmaf(b.v[0], c.v[0], a.v[0]), Brawl3dsHostFmaf(b.v[1], c.v[1], a.v[1])}};
 }
 
 // Comparisons produce all-ones / all-zeros lane masks.
