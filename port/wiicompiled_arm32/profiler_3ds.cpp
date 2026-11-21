@@ -141,7 +141,22 @@ void Brawl3dsProfilerStart(CpuContext* volatile* mainContextSlot)
     threadCreate(SamplerThread, nullptr, 16 * 1024, 0x19, -2, true);
 }
 
-void Brawl3dsProfilerSetRecording(bool on) { g_recording = on; }
+// Call counts of the hot shards' functions (abi_bridge.h's MKW_GUEST_CODE_GUARD, patched by
+// tools/patch_wiicompiled_arm32.py), indexed by the translator's function-table index (~105,500 in Brawl).
+struct Brawl3dsCallCount {
+    uint32_t count;
+    uint32_t address;
+};
+constexpr uint32_t kCallCountSlots = 1u << 17;
+Brawl3dsCallCount g_brawl3dsCallCounts[kCallCountSlots];
+
+void Brawl3dsProfilerSetRecording(bool on)
+{
+    if (on) {
+        for (auto& c : g_brawl3dsCallCounts) c.count = 0;  // count the match only
+    }
+    g_recording = on;
+}
 
 void Brawl3dsProfilerWrite(const char* path, unsigned frames, double averageFrameMs)
 {
@@ -200,6 +215,40 @@ void Brawl3dsProfilerWrite(const char* path, unsigned frames, double averageFram
         std::fprintf(f, "%6.2f  %08lX  %s+0x%lX\n", 100.0 * hot[i].second / total,
                      static_cast<unsigned long>(hot[i].first), name.c_str(),
                      static_cast<unsigned long>(hot[i].first - start));
+    }
+
+    // Call counts (hot shards only). calls/frame says how often a function runs; for the self ranking's functions,
+    // us/call = self time per call (a function whose own time is mostly call overhead shows up as a tiny us/call
+    // with a huge call count).
+    std::map<uint32_t, uint64_t> callsByAddress;
+    for (const auto& c : g_brawl3dsCallCounts) {
+        if (c.count) callsByAddress[c.address] += c.count;
+    }
+    std::vector<std::pair<uint32_t, uint64_t>> calls(callsByAddress.begin(), callsByAddress.end());
+    std::sort(calls.begin(), calls.end(), [](const auto& x, const auto& y) { return x.second > y.second; });
+    uint64_t allCalls = 0;
+    for (const auto& c : calls) allCalls += c.second;
+    std::fprintf(f, "\n== most called functions (hot shards only: %zu functions, %.0f calls per frame), top 80 ==\n"
+                    "calls/frame  self ms/frame  us/call  address   function\n",
+                 calls.size(), frames ? double(allCalls) / frames : 0.0);
+    for (size_t i = 0; i < calls.size() && i < 80; ++i) {
+        const auto it = byFunction.find(calls[i].first);
+        const double selfMs = it != byFunction.end() ? it->second.self / total * averageFrameMs : 0.0;
+        const double perFrame = frames ? double(calls[i].second) / frames : 0.0;
+        std::fprintf(f, "%11.0f  %13.2f  %7.2f  %08lX  %s\n", perFrame, selfMs,
+                     perFrame > 0 ? selfMs * 1000.0 / perFrame : 0.0, static_cast<unsigned long>(calls[i].first),
+                     FunctionOf(calls[i].first).second.c_str());
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& x, const auto& y) { return x.second->self > y.second->self; });
+    std::fprintf(f, "\n== self ranking with call counts, top 40 (0 calls = not in a hot shard) ==\n"
+                    "self ms/frame  calls/frame  us/call  address   function\n");
+    for (size_t i = 0; i < rows.size() && i < 40; ++i) {
+        const double selfMs = rows[i].second->self / total * averageFrameMs;
+        const auto it = callsByAddress.find(rows[i].first);
+        const double perFrame = it != callsByAddress.end() && frames ? double(it->second) / frames : 0.0;
+        std::fprintf(f, "%13.2f  %11.0f  %7.2f  %08lX  %s\n", selfMs, perFrame,
+                     perFrame > 0 ? selfMs * 1000.0 / perFrame : 0.0, static_cast<unsigned long>(rows[i].first),
+                     rows[i].second->name.c_str());
     }
     std::fclose(f);
 }

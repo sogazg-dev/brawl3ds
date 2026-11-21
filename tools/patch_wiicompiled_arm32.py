@@ -194,6 +194,24 @@ def main(wiicompiled: Path):
          "#endif\n", 1),
     ])
 
+    # Per-function call counts for profile.txt, in the hot shards only (they carry the profile's functions; the
+    # other shards stay as they are). Every translated function enters through MKW_GUEST_CODE_GUARD with its table
+    # index and guest address; port/wiicompiled_arm32/profiler_3ds.cpp owns the array and resets it when the match
+    # starts. Main-thread only: every guest thread is a fiber on the main host thread.
+    edit(inc / "abi_bridge.h", [
+        ("#define MKW_GUEST_CODE_GUARD(index, address)                    \\\n    do {                                                        \\\n",
+         f"#if {ARM32} && defined(BRAWL3DS_INLINE_GUEST_ACCESS)\n"
+         "struct Brawl3dsCallCount { uint32_t count; uint32_t address; };\n"
+         "extern Brawl3dsCallCount g_brawl3dsCallCounts[];\n"
+         "#define BRAWL3DS_COUNT_CALL(slot, guestAddress) \\\n"
+         "    (++g_brawl3dsCallCounts[slot].count, g_brawl3dsCallCounts[slot].address = (guestAddress))\n"
+         "#else\n"
+         "#define BRAWL3DS_COUNT_CALL(slot, guestAddress) ((void)0)\n"
+         "#endif\n"
+         "#define MKW_GUEST_CODE_GUARD(index, address)                    \\\n    do {                                                        \\\n"
+         "        BRAWL3DS_COUNT_CALL(index, address);                    \\\n", 1),
+    ])
+
     edit(isa / "ppc_isa_fpenv.h", [
         ("#else\n#error \"ppc_isa_fpenv.h has no host FP control register mapping",
          "#elif defined(__arm__)\n// VFP FPSCR: FZ is bit 24, as in AArch64 FPCR.\n"
@@ -386,19 +404,31 @@ def main(wiicompiled: Path):
     pristine_loader = (
         "#if defined(__3DS__)\n"
         "// brawl3ds: no resident copies of the pristine images (12 MiB); read the one needed from the SD card blobs.\n"
-        "std::vector<uint8_t> LoadPristine3ds(size_t index) {\n"
+        "// Bytes [offset, offset + size) of module `index`'s pristine image, read straight into `dest`.\n"
+        "void ReadPristine3ds(size_t index, uint32_t offset, void* dest, uint32_t size) {\n"
         "    const BrawlModule& m = kModules[index];\n"
         "    const bool home = m.image >= 0x94000000u;\n"
         "    const char* blob = home ? \"sdmc:/3ds/brawl3ds/blobs/brawl_modules.bin\" : \"sdmc:/3ds/brawl3ds/blobs/text2.bin\";\n"
         "    const uint32_t base = home ? 0x94000000u : 0x80673FA0u;  // brawl_modules / text2 load addresses\n"
-        "    std::vector<uint8_t> out(m.fixSize);\n"
         "    std::FILE* file = std::fopen(blob, \"rb\");\n"
-        "    if (!file || std::fseek(file, static_cast<long>(m.image - base), SEEK_SET) != 0 ||\n"
-        "        std::fread(out.data(), 1, out.size(), file) != out.size()) {\n"
+        "    if (!file || std::fseek(file, static_cast<long>(m.image - base + offset), SEEK_SET) != 0 ||\n"
+        "        std::fread(dest, 1, size, file) != size) {\n"
         "        if (file) std::fclose(file);\n"
         "        throw std::runtime_error(std::string(\"cannot read the pristine image of \") + m.name + \" from \" + blob);\n"
         "    }\n"
         "    std::fclose(file);\n"
+        "}\n"
+        "std::vector<uint8_t> LoadPristine3ds(size_t index) {\n"
+        "    std::vector<uint8_t> out(kModules[index].fixSize);\n"
+        "    ReadPristine3ds(index, 0, out.data(), static_cast<uint32_t>(out.size()));\n"
+        "    return out;\n"
+        "}\n"
+        "// The start of the image, where the header and its section table are: HomeCodeSections reads nothing else, and\n"
+        "// loading a whole image (4.7 MB for sora_melee) on every link was the largest allocation of a run, the one that\n"
+        "// failed first in a fragmented heap.\n"
+        "std::vector<uint8_t> LoadPristineHead3ds(size_t index) {\n"
+        "    std::vector<uint8_t> out(std::min<uint32_t>(kModules[index].fixSize, 64u * 1024u));\n"
+        "    ReadPristine3ds(index, 0, out.data(), static_cast<uint32_t>(out.size()));\n"
         "    return out;\n"
         "}\n"
         "#define BRAWL3DS_PRISTINE(index) LoadPristine3ds(index)\n"
@@ -408,16 +438,28 @@ def main(wiicompiled: Path):
         "#define BRAWL3DS_PRISTINE_MISSING(index) g_pristine[index].empty()\n"
         "#endif\n")
     edit(src / "hle" / "brawl_modules.cpp", [
-        ("#include <cstring>\n#include <mutex>\n", "#include <cstdio>\n#include <cstring>\n#include <mutex>\n"
-         "#include <stdexcept>\n#include <string>\n", 1),
+        ("#include <cstring>\n#include <mutex>\n", "#include <algorithm>\n#include <cstdio>\n#include <cstring>\n"
+         "#include <mutex>\n#include <stdexcept>\n#include <string>\n", 1),
         ("std::vector<uint8_t> g_pristine[sizeof(kModules) / sizeof(kModules[0])];  // each pre-linked image, from boot\n",
          "std::vector<uint8_t> g_pristine[sizeof(kModules) / sizeof(kModules[0])];  // each pre-linked image, from boot\n"
          + pristine_loader, 1),
         ("    const std::vector<uint8_t>& image = g_pristine[index];",
-         "    const std::vector<uint8_t>& image = BRAWL3DS_PRISTINE(index);", 1),
+         "#if defined(__3DS__)\n"
+         "    const std::vector<uint8_t> image = LoadPristineHead3ds(index);  // header + section table only\n"
+         "#else\n"
+         "    const std::vector<uint8_t>& image = g_pristine[index];\n"
+         "#endif", 1),
         ("if (m == nullptr || m->resident || g_pristine[index].empty()) return;",
          "if (m == nullptr || m->resident || BRAWL3DS_PRISTINE_MISSING(index)) return;", 1),
-        ("    const auto& pristine = g_pristine[index];", "    const auto& pristine = BRAWL3DS_PRISTINE(index);", 1),
+        # The link itself: on the 3DS the pristine bytes go from the SD card blob straight into the module's home.
+        ("    const auto& pristine = g_pristine[index];\n", "", 1),
+        ("    std::memcpy(Memory::GetPointer(m->image + keep, m->fixSize - keep), pristine.data() + keep, m->fixSize - keep);\n",
+         "#if defined(__3DS__)\n"
+         "    ReadPristine3ds(index, keep, Memory::GetPointer(m->image + keep, m->fixSize - keep), m->fixSize - keep);\n"
+         "#else\n"
+         "    const auto& pristine = g_pristine[index];\n"
+         "    std::memcpy(Memory::GetPointer(m->image + keep, m->fixSize - keep), pristine.data() + keep, m->fixSize - keep);\n"
+         "#endif\n", 1),
         ("        g_pristine[i].assign(image, image + kModules[i].fixSize);",
          "#if !defined(__3DS__)\n        g_pristine[i].assign(image, image + kModules[i].fixSize);\n#else\n"
          "        (void)image;\n#endif", 1),
