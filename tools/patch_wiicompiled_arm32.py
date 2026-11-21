@@ -176,8 +176,23 @@ def main(wiicompiled: Path):
         "#elif defined(__aarch64__)\n#include <arm_neon.h>\n#elif defined(__arm__)\n#include \"brawl3ds_neon_shim.h\"\n",
         1)])
 
-    for name in ("ppc_isa_float.h", "ppc_isa_quantized.h"):
-        edit(isa / name, [("defined(__aarch64__)", "(defined(__aarch64__) || defined(__arm__))", None)])
+    edit(isa / "ppc_isa_float.h", [("defined(__aarch64__)", "(defined(__aarch64__) || defined(__arm__))", None)])
+    # Paired-single loads/stores (psq_l/psq_st) in the hot shards take a host pointer straight from the page-bias
+    # tables, like the scalar accesses in memory_access.h below; a null pointer keeps the checked Memory::Read64/
+    # Write64 path (all other shards, as before).
+    edit(isa / "ppc_isa_quantized.h", [
+        ("defined(__aarch64__)", "(defined(__aarch64__) || defined(__arm__))", None),
+        ("MKW_PPC_FORCE_INLINE const uint8_t* PpcTryGetPsqReadableHostInline(uint32_t addr)\n{\n",
+         "MKW_PPC_FORCE_INLINE const uint8_t* PpcTryGetPsqReadableHostInline(uint32_t addr)\n{\n"
+         f"#if {ARM32} && defined(BRAWL3DS_INLINE_GUEST_ACCESS)\n"
+         "    return MemoryInline::Brawl3dsReadableHost(addr, 8);\n"
+         "#endif\n", 1),
+        ("MKW_PPC_FORCE_INLINE uint8_t* PpcTryGetPsqWritableHostInline(uint32_t addr)\n{\n",
+         "MKW_PPC_FORCE_INLINE uint8_t* PpcTryGetPsqWritableHostInline(uint32_t addr)\n{\n"
+         f"#if {ARM32} && defined(BRAWL3DS_INLINE_GUEST_ACCESS)\n"
+         "    return MemoryInline::Brawl3dsWritableHost(addr, 8);\n"
+         "#endif\n", 1),
+    ])
 
     edit(isa / "ppc_isa_fpenv.h", [
         ("#else\n#error \"ppc_isa_fpenv.h has no host FP control register mapping",
@@ -203,24 +218,147 @@ def main(wiicompiled: Path):
          "#elif defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)\ninline constexpr bool RequiresCheckedAccess() noexcept { return false; }", 1),
     ])
 
+    # Guest loads and stores in translated code. The first ARM32 bring-up sent every one of them through the
+    # out-of-line Memory::Read*/Write* (a call and about 20 instructions each; the first real-hardware profile found
+    # the game's hottest functions made of little else). On ARM32 they now use the runtime's own 1 MiB page-bias
+    # tables, the tables MemoryInline::TryReadGuestScalar/TryWriteGuestScalar read: one table load, an add and the
+    # access. A zero entry (MMIO, pages with deferred reads, pages shared with executable code, unmapped memory)
+    # keeps the checked Memory::* path, which applies those policies.
+    # Inline at every access site the code grows from 38 to 55 MB and the regular heap gets too small to boot, so
+    # only the hot shards (tools/hot_shards.py, built with BRAWL3DS_INLINE_GUEST_ACCESS) inline it; every other
+    # access calls one shared copy (Brawl3dsLoadCall/Brawl3dsStoreCall: the same call size as Memory::Read32).
     edit(inc / "memory_access.h", [
-        ("MKW_MEMORY_FORCE_INLINE T FlatLoad(uint32_t address) {\n",
-         "MKW_MEMORY_FORCE_INLINE T FlatLoad(uint32_t address) {\n"
+        ("template <typename T>\nMKW_MEMORY_FORCE_INLINE T FlatLoad(uint32_t address) {\n",
          f"#if {ARM32}\n"
+         "template <typename T>\n"
+         "MKW_MEMORY_FORCE_INLINE T Brawl3dsLoadInline(uint32_t address) {\n"
+         "    // A readable bias is only set for a full page whose successor is contiguous, so an access of up to\n"
+         "    // 8 bytes may run into the next page.\n"
+         "    const uintptr_t bias = g_fullReadablePageBias[address >> kPageShift];\n"
+         "    if (bias != 0) [[likely]] {\n"
+         "        T value;\n"
+         "        std::memcpy(&value, reinterpret_cast<const uint8_t*>((bias - 1u) + address), sizeof(T));\n"
+         "        return MaybeByteSwap(value);\n"
+         "    }\n"
          "    if constexpr (sizeof(T) == 1) return static_cast<T>(Memory::Read8(address));\n"
          "    else if constexpr (sizeof(T) == 2) return static_cast<T>(Memory::Read16(address));\n"
          "    else if constexpr (sizeof(T) == 4) return static_cast<T>(Memory::Read32(address));\n"
          "    else return static_cast<T>(Memory::Read64(address));\n"
-         "#endif\n", 1),
-        ("MKW_MEMORY_FORCE_INLINE void FlatStore(uint32_t address, T value) {\n",
-         "MKW_MEMORY_FORCE_INLINE void FlatStore(uint32_t address, T value) {\n"
-         f"#if {ARM32}\n"
+         "}\n"
+         "template <typename T>\n"
+         "MKW_MEMORY_FORCE_INLINE void Brawl3dsStoreInline(uint32_t address, T value) {\n"
+         "    // Coarse writable pages only; a store that would cross into the next page, or any page holding\n"
+         "    // executable code, MMIO or nothing, takes the checked call (it applies those policies).\n"
+         "    const uintptr_t bias = g_fullWritablePageBias[address >> kPageShift];\n"
+         "    if (bias != 0 && (sizeof(T) == 1 || (address & kPageMask) <= kPageSize - sizeof(T))) [[likely]] {\n"
+         "        const T swapped = MaybeByteSwap(value);\n"
+         "        std::memcpy(reinterpret_cast<uint8_t*>((bias - 1u) + address), &swapped, sizeof(T));\n"
+         "        return;\n"
+         "    }\n"
          "    if constexpr (sizeof(T) == 1) Memory::Write8(address, static_cast<uint8_t>(value));\n"
          "    else if constexpr (sizeof(T) == 2) Memory::Write16(address, static_cast<uint16_t>(value));\n"
          "    else if constexpr (sizeof(T) == 4) Memory::Write32(address, static_cast<uint32_t>(value));\n"
          "    else Memory::Write64(address, static_cast<uint64_t>(value));\n"
+         "}\n"
+         "template <typename T>\n"
+         "__attribute__((noinline)) T Brawl3dsLoadCall(uint32_t address) { return Brawl3dsLoadInline<T>(address); }\n"
+         "template <typename T>\n"
+         "__attribute__((noinline)) void Brawl3dsStoreCall(uint32_t address, T value) {\n"
+         "    Brawl3dsStoreInline<T>(address, value);\n"
+         "}\n"
+         "#endif\n\n"
+         "namespace Brawl3dsEarly {\n"
+         f"#if {ARM32} && defined(BRAWL3DS_INLINE_GUEST_ACCESS)\n"
+         "inline constexpr bool kTake = false;\n"
+         f"#elif {ARM32}\n"
+         "inline constexpr bool kTake = true;\n"
+         "#else\n"
+         "inline constexpr bool kTake = GuestFlat::RequiresCheckedAccess();\n"
+         "#endif\n"
+         f"#if {ARM32}\n"
+         "MKW_MEMORY_FORCE_INLINE uint8_t Read8(uint32_t a) { return Brawl3dsLoadCall<uint8_t>(a); }\n"
+         "MKW_MEMORY_FORCE_INLINE uint16_t Read16(uint32_t a) { return Brawl3dsLoadCall<uint16_t>(a); }\n"
+         "MKW_MEMORY_FORCE_INLINE uint32_t Read32(uint32_t a) { return Brawl3dsLoadCall<uint32_t>(a); }\n"
+         "MKW_MEMORY_FORCE_INLINE void Write8(uint32_t a, uint8_t v) { Brawl3dsStoreCall<uint8_t>(a, v); }\n"
+         "MKW_MEMORY_FORCE_INLINE void Write16(uint32_t a, uint16_t v) { Brawl3dsStoreCall<uint16_t>(a, v); }\n"
+         "MKW_MEMORY_FORCE_INLINE void Write32(uint32_t a, uint32_t v) { Brawl3dsStoreCall<uint32_t>(a, v); }\n"
+         "MKW_MEMORY_FORCE_INLINE void WriteFloat32(uint32_t a, double v) {\n"
+         "    Brawl3dsStoreCall<uint32_t>(a, ConvertPpcDoubleToSingleBits(v));\n"
+         "}\n"
+         "MKW_MEMORY_FORCE_INLINE void WriteFloat64(uint32_t a, double v) {\n"
+         "    uint64_t bits;\n"
+         "    std::memcpy(&bits, &v, sizeof(bits));\n"
+         "    Brawl3dsStoreCall<uint64_t>(a, bits);\n"
+         "}\n"
+         "#else\n"
+         "MKW_MEMORY_FORCE_INLINE uint8_t Read8(uint32_t a) { return Memory::Read8(a); }\n"
+         "MKW_MEMORY_FORCE_INLINE uint16_t Read16(uint32_t a) { return Memory::Read16(a); }\n"
+         "MKW_MEMORY_FORCE_INLINE uint32_t Read32(uint32_t a) { return Memory::Read32(a); }\n"
+         "MKW_MEMORY_FORCE_INLINE void Write8(uint32_t a, uint8_t v) { Memory::Write8(a, v); }\n"
+         "MKW_MEMORY_FORCE_INLINE void Write16(uint32_t a, uint16_t v) { Memory::Write16(a, v); }\n"
+         "MKW_MEMORY_FORCE_INLINE void Write32(uint32_t a, uint32_t v) { Memory::Write32(a, v); }\n"
+         "MKW_MEMORY_FORCE_INLINE void WriteFloat32(uint32_t a, double v) { Memory::WriteFloat32(a, v); }\n"
+         "MKW_MEMORY_FORCE_INLINE void WriteFloat64(uint32_t a, double v) { Memory::WriteFloat64(a, v); }\n"
+         "#endif\n"
+         "}  // namespace Brawl3dsEarly\n\n"
+         "template <typename T>\nMKW_MEMORY_FORCE_INLINE T FlatLoad(uint32_t address) {\n"
+         f"#if {ARM32} && defined(BRAWL3DS_INLINE_GUEST_ACCESS)\n"
+         "    return Brawl3dsLoadInline<T>(address);\n"
+         f"#elif {ARM32}\n"
+         "    return Brawl3dsLoadCall<T>(address);\n"
+         "#endif\n", 1),
+        ("MKW_MEMORY_FORCE_INLINE void FlatStore(uint32_t address, T value) {\n",
+         "MKW_MEMORY_FORCE_INLINE void FlatStore(uint32_t address, T value) {\n"
+         f"#if {ARM32} && defined(BRAWL3DS_INLINE_GUEST_ACCESS)\n"
+         "    Brawl3dsStoreInline<T>(address, value);\n"
+         "    return;\n"
+         f"#elif {ARM32}\n"
+         "    Brawl3dsStoreCall<T>(address, value);\n"
          "    return;\n"
          "#endif\n", 1),
+        # FlatRead*/FlatWrite* go to Memory::* first thing when RequiresCheckedAccess() (constexpr true on ARM32,
+        # which keeps the flat-base pointer paths compiled out). On ARM32 that early exit becomes Brawl3dsEarly:
+        # skipped in the hot shards (so they reach the inline FlatLoad/FlatStore, FlatWrite* sending MMIO stores to
+        # Write*Slow first), the shared fast-path call everywhere else (one call per access, as before).
+        ("    if (GuestFlat::RequiresCheckedAccess()) return Memory::Read",
+         "    if (Brawl3dsEarly::kTake) return Brawl3dsEarly::Read", 3),
+        ("    const uint64_t bits = GuestFlat::RequiresCheckedAccess()\n",
+         "    const uint64_t bits = (GuestFlat::RequiresCheckedAccess() && !kBrawl3dsPageBiasAccess)\n", 1),
+        ("    if (GuestFlat::RequiresCheckedAccess()) { Memory::Write",
+         "    if (Brawl3dsEarly::kTake) { Brawl3dsEarly::Write", 5),
+        # Range accesses (ReadResolved*/WriteResolved*: one resolve, then several accesses at offsets from it), in
+        # the hot shards only; elsewhere a null resolve keeps the checked path as before.
+        ("    if (GuestFlat::RequiresCheckedAccess()) {\n        // A host page can cover multiple",
+         f"#if {ARM32} && defined(BRAWL3DS_INLINE_GUEST_ACCESS)\n"
+         "    if (needsWrite) {\n"
+         "        uint8_t* host = Brawl3dsWritableHost(guestStart, length);\n"
+         "        if (!host || (needsRead && Brawl3dsReadableHost(guestStart, length) != host)) return nullptr;\n"
+         "        return host;\n"
+         "    }\n"
+         "    return Brawl3dsReadableHost(guestStart, length);\n"
+         "#endif\n"
+         "    if (GuestFlat::RequiresCheckedAccess()) {\n        // A host page can cover multiple", 1),
+        # The helpers, placed before their first user (ResolveRangeHost).
+        ("MKW_MEMORY_FORCE_INLINE uint8_t* ResolveRangeHost(",
+         f"#if {ARM32}\n"
+         "inline constexpr bool kBrawl3dsPageBiasAccess = true;\n"
+         "// Host pointer for [address, address + length) when it lies in one plain-RAM 1 MiB page, else null.\n"
+         "MKW_MEMORY_FORCE_INLINE uint8_t* Brawl3dsReadableHost(uint32_t address, uint32_t length) {\n"
+         "    const uint32_t page = address >> kPageShift;\n"
+         "    if (((address + (length - 1u)) >> kPageShift) != page) [[unlikely]] return nullptr;\n"
+         "    const uintptr_t bias = g_fullReadablePageBias[page];\n"
+         "    return bias ? reinterpret_cast<uint8_t*>((bias - 1u) + address) : nullptr;\n"
+         "}\n"
+         "MKW_MEMORY_FORCE_INLINE uint8_t* Brawl3dsWritableHost(uint32_t address, uint32_t length) {\n"
+         "    const uint32_t page = address >> kPageShift;\n"
+         "    if (((address + (length - 1u)) >> kPageShift) != page) [[unlikely]] return nullptr;\n"
+         "    const uintptr_t bias = g_fullWritablePageBias[page];\n"
+         "    return bias ? reinterpret_cast<uint8_t*>((bias - 1u) + address) : nullptr;\n"
+         "}\n"
+         "#else\n"
+         "inline constexpr bool kBrawl3dsPageBiasAccess = false;\n"
+         "#endif\n\n"
+         "MKW_MEMORY_FORCE_INLINE uint8_t* ResolveRangeHost(", 1),
     ])
 
     edit(inc / "runtime_config.h", [

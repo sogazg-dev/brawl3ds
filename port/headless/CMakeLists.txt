@@ -31,11 +31,14 @@ set(BRAWL3DS_INCLUDES
   "${W}/Dependencies/xxhash" "${W}/Dependencies/imgui" "${SDL3_DIR}/include")
 # The PC build's numeric settings: no fast-math, no FP contraction (results must match the PowerPC's rounding).
 set(BRAWL3DS_FP_FLAGS -fno-fast-math -ffp-contract=off)
+# The ARM11 allows unaligned word loads/stores (ldr/str/ldrh/strh; not ldrd/ldm), and the 3DS kernel leaves that
+# enabled. Without this clang assumes strict alignment and turns every inlined guest access into byte loads/stores.
+set(BRAWL3DS_ALIGN_FLAGS -munaligned-access)
 
 function(brawl3ds_target target)
   target_compile_definitions(${target} PRIVATE ${BRAWL3DS_DEFINES})
   target_include_directories(${target} PRIVATE ${BRAWL3DS_INCLUDES})
-  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${BRAWL3DS_FP_FLAGS} -w>)
+  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${BRAWL3DS_FP_FLAGS} ${BRAWL3DS_ALIGN_FLAGS} -w>)
 endfunction()
 
 # --- third-party libraries (the same source sets as Brawl Recompiled's runtime/CMakeLists.txt) ---
@@ -90,6 +93,18 @@ add_library(b3_shards STATIC ${SHARD_SOURCES})
 brawl3ds_target(b3_shards)
 target_include_directories(b3_shards PRIVATE "${SHARD_DIR}")
 target_compile_options(b3_shards PRIVATE -Oz -std=gnu++17 -include "${RT}/include/mkw_pch.h")
+# The shards holding the functions a real-hardware profile found hot (tools/hot_shards.py shards
+# port/headless/hot_functions.txt <SHARD_DIR> <SHARD_DIR>/hot_shards.txt) inline every guest load and store; the rest
+# call one shared copy of the same fast path (memory_access.h), which keeps the code small enough to boot.
+set(HOT_SHARDS_LIST "${SHARD_DIR}/hot_shards.txt")
+if(EXISTS "${HOT_SHARDS_LIST}")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${HOT_SHARDS_LIST}")
+  file(STRINGS "${HOT_SHARDS_LIST}" HOT_SHARDS)
+  list(TRANSFORM HOT_SHARDS PREPEND "${SHARD_DIR}/")
+  set_source_files_properties(${HOT_SHARDS} PROPERTIES COMPILE_DEFINITIONS BRAWL3DS_INLINE_GUEST_ACCESS=1)
+  list(LENGTH HOT_SHARDS HOT_SHARD_COUNT)
+  message(STATUS "brawl3ds: ${HOT_SHARD_COUNT} hot shards inline guest memory accesses")
+endif()
 
 # --- the program ---
 add_executable(brawl3ds "${PORT}/main_3ds.cpp" "${PORT}/aurora_headless_3ds.cpp"

@@ -145,6 +145,14 @@ void Brawl3dsAllocTrackDump(const char* path, unsigned frame)
 void* __wrap_malloc(size_t size)
 {
     void* p = __real_malloc(size);
+    if (!p && size) {
+        // Every failed allocation (operator new too: it allocates through malloc), so an out-of-memory stop names
+        // the size that did not fit. write(2) and a stack buffer: no stdio, which could itself allocate.
+        char line[96];
+        const int len = std::snprintf(line, sizeof(line), "[alloc] malloc(%lu) FAILED (caller %p)\n",
+                                      static_cast<unsigned long>(size), __builtin_return_address(0));
+        if (len > 0) write(2, line, static_cast<size_t>(len));
+    }
     if (!g_insideNew) Insert(p, size, __builtin_return_address(0));
     return p;
 }
