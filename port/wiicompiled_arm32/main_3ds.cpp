@@ -391,8 +391,11 @@ int StepForScene(const std::string& scene)
 // while the runtime's own threads (the AX mix worker, watchdogs) are still running on stacks inside it: Azahar
 // logged ~2,200 "unmapped" reads from the mix worker's stack right after the match ended, which a real 3DS turns
 // into a data abort at exit. svcExitProcess stops every thread first.
-// aptExit comes first: it tells the HOME Menu that the application is closing. Without it (first real-hardware
-// run that reached the end) the HOME Menu never got control back and the console asked to be restarted.
+// The service shutdown of that path still has to run: __appExit() is libctru's own (hidExit, which also closes the
+// New 3DS's ir:rst, fsExit, aptExit, which tells the HOME Menu the application is closing, and srvExit). With only
+// aptExit the HOME Menu still reported "An error has occurred" and asked for a restart after every real-hardware
+// run; without any of it, likewise.
+extern "C" void __appExit(void);
 [[noreturn]] void ExitNow()
 {
     std::fflush(stdout);
@@ -400,7 +403,7 @@ int StepForScene(const std::string& scene)
     if (g_log) std::fclose(g_log);
     g_log = nullptr;
     gfxExit();
-    aptExit();
+    __appExit();
     svcExitProcess();
     for (;;) {
     }

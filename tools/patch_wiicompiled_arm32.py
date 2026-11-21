@@ -557,7 +557,21 @@ def main(wiicompiled: Path):
          "    return NandCopyFile(from, to, std::filesystem::copy_options::none, ec);\n"
          "}\n", 1),
     ])
-    for name, count in (("nand_api.cpp", 2), ("nand_async.cpp", 1), ("nand_fs.cpp", 1)):
+    # Plain NANDOpen for writing (mode 2/3) also seeds a shadow copy of the whole file first, a PC-runtime guard
+    # against a crash between NANDWrite and NANDClose (the console's plain NANDOpen writes in place; NANDSafeOpen is
+    # the game's own crash-safe path and keeps its copy). Brawl opens the 14 MB collect.vff that way at boot and
+    # closes it without writing a byte, and on a real New 3DS the copy took from 9 s to over 3 minutes from one
+    # run to the next (SD write speed for a new 14 MB file). On the 3DS plain opens write in place.
+    edit(src / "hle" / "storage" / "nand_api.cpp", [
+        ("std::filesystem::copy_file(", "NandCopyFile(", 2),
+        ("    if ((mode == 2 || mode == 3) && PathExists(hostPath) && !IsDirectory(hostPath)) {\n",
+         "#if defined(__3DS__)\n"
+         "    if (false) {  // brawl3ds: no shadow copy for plain write opens (see tools/patch_wiicompiled_arm32.py)\n"
+         "#else\n"
+         "    if ((mode == 2 || mode == 3) && PathExists(hostPath) && !IsDirectory(hostPath)) {\n"
+         "#endif\n", 1),
+    ])
+    for name, count in (("nand_async.cpp", 1), ("nand_fs.cpp", 1)):
         edit(src / "hle" / "storage" / name, [("std::filesystem::copy_file(", "NandCopyFile(", count)])
 
     edit(inc / "system_bridge.h", [
