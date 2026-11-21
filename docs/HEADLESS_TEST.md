@@ -21,7 +21,7 @@ plays, and this build only holds the code that the PC coverage run of this match
 | # | Step | What it is | Typical length |
 |---|------|-----------|----------------|
 | 1 | Checking game files | `game/` and the save are present | instant |
-| 2 | Indexing the game folder | walks the 5,314 disc files on the SD | ~3 s |
+| 2 | Indexing the game folder | lists the 5,314 disc files on the SD (one read per folder) | seconds |
 | 3 | Reserving Wii memory | MEM1/MEM2/module homes | instant |
 | 4 | Starting the runtime | game code, modules, virtual NAND | ~30 s (Azahar) |
 | 5 | Safety screen (scStrap) | Brawl's idle timeout | 1,435 frames |
@@ -40,9 +40,11 @@ of the runtime's log, how long ago it last printed something, and its last line.
 into `headless.log` every 15 s. If 10 minutes pass with no new output, the screen says the run is probably
 stuck. START closes the test during these steps too.
 
-Before this fix, step 4 walked all 5,314 disc files twice with `fs::relative`. That call checks every folder in
-a file's path on the SD card, one at a time. A real New 3DS spent more than 20 minutes in step 4 because of it.
-The patch replaces it with a string-only `lexically_relative` (see `tools/patch_wiicompiled_arm32.py`).
+On a real New 3DS, each `stat` of a file on the SD card takes ~50 ms. A `std::filesystem` walk of the game
+folder took 4m38s, and the runtime's two start-up walks (the save key and the DVD index, with `fs::relative`
+checking every folder in each path) never finished step 4 in an hour. Now step 2 lists the folder with
+`FSDIR_Read`, which returns names and sizes 64 at a time (`port/wiicompiled_arm32/fast_tree_3ds.cpp`). It keeps
+the result, and the patched runtime answers both walks from it, so the card is read once.
 
 ## What goes on the SD card
 

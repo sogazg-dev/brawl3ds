@@ -93,7 +93,8 @@ target_compile_options(b3_shards PRIVATE -Oz -std=gnu++17 -include "${RT}/includ
 
 # --- the program ---
 add_executable(brawl3ds "${PORT}/main_3ds.cpp" "${PORT}/aurora_headless_3ds.cpp"
-  "${PORT}/posix_and_aurora_extras_3ds.cpp" "${PORT}/alloc_tracker_3ds.cpp" "${GEN3DS_DIR}/link_stubs.cpp")
+  "${PORT}/posix_and_aurora_extras_3ds.cpp" "${PORT}/alloc_tracker_3ds.cpp" "${PORT}/fast_tree_3ds.cpp"
+  "${GEN3DS_DIR}/link_stubs.cpp")
 brawl3ds_target(brawl3ds)
 target_compile_options(brawl3ds PRIVATE -O2 -std=gnu++20 -include "${RT}/include/mkw_pch.h")
 set_target_properties(brawl3ds PROPERTIES SUFFIX ".elf")

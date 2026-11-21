@@ -24,6 +24,7 @@
 #include <string>
 #include <sys/stat.h>
 
+#include "brawl3ds_fast_tree.h"
 #include "isa/ppc_isa_context.h"
 #include "save_states.h"
 
@@ -656,27 +657,24 @@ int main(int, char**)
                         "to sdmc:/3ds/brawl3ds/UserData/NAND/title/\n00010000/52534245/data");
     }
 
-    // The runtime indexes the whole disc folder at boot (5314 files for Brawl). Time the same kind of walk here so
-    // the log shows how long the SD card takes, and whether directory iteration works at all.
+    // The runtime indexes the whole disc folder at boot (5,314 files for Brawl), twice. A stat per file takes ~50 ms
+    // on a real New 3DS (a std::filesystem walk took 4m38s here), so the patched runtime asks Brawl3dsListTree,
+    // which reads each folder with FSDIR_Read (names and sizes, 64 per call). List the game folder now: it times
+    // the card and fills the cache the runtime's two walks are answered from.
     EnterStep(1);
     {
         const uint64_t start = svcGetSystemTick();
-        uint32_t files = 0, dirs = 0;
+        const auto* tree = Brawl3dsListTree("/3ds/brawl3ds/game");
         uint64_t bytes = 0;
-        std::error_code ec;
-        for (std::filesystem::recursive_directory_iterator it("/3ds/brawl3ds/game/files", ec), end;
-             !ec && it != end; it.increment(ec)) {
-            if (it->is_directory(ec)) {
-                ++dirs;
-            } else {
-                ++files;
-                bytes += it->file_size(ec);
-            }
-            if ((files & 511u) == 0 && files) Log("  ...%u files after %.0f ms\n", files, TicksToMs(svcGetSystemTick() - start));
+        if (tree) {
+            for (const Brawl3dsTreeFile& file : *tree) bytes += file.size;
         }
-        Log("game folder walk: %u files, %u folders, %llu MiB in %.0f ms%s%s\n", files, dirs,
+        Log("game folder listing (FSDIR_Read): %u files, %llu MiB in %.0f ms%s\n", tree ? unsigned(tree->size()) : 0u,
             static_cast<unsigned long long>(bytes >> 20), TicksToMs(svcGetSystemTick() - start),
-            ec ? ", error: " : "", ec ? ec.message().c_str() : "");
+            tree ? "" : ", could not open the folder");
+        if (!tree || tree->empty()) {
+            StopWithMessage("Game folder unreadable", "could not list sdmc:/3ds/brawl3ds/game");
+        }
     }
 
     // Deterministic mode: guest clocks follow frames, so the attract demo is the same match on every run.

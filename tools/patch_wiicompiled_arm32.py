@@ -61,6 +61,7 @@ def main(wiicompiled: Path):
     src = wiicompiled / "runtime" / "src"
     (src / "platform" / "3ds").mkdir(parents=True, exist_ok=True)
     for name, dest in [("brawl3ds_neon_shim.h", inc / "brawl3ds_neon_shim.h"),
+                       ("brawl3ds_fast_tree.h", inc / "brawl3ds_fast_tree.h"),
                        ("host_context_3ds.inc", src / "host_context_3ds.inc"),
                        ("co_switch_arm32.S", src / "platform" / "3ds" / "co_switch.S"),
                        ("guest_flat_memory_3ds.cpp", src / "platform" / "3ds" / "guest_flat_memory_3ds.cpp")]:
@@ -319,20 +320,48 @@ def main(wiicompiled: Path):
          "bool EnsureConfigured() {\n#if defined(_WIN32) || defined(__3DS__)", 1),
     ])
 
-    # Both walks of the disc folder (the save key and the DVD index, 5,314 files each) took each file's path relative
-    # to the root with fs::relative, which canonicalises both paths: a stat of every component, for every file. On the
-    # 3DS each stat is an SD card round trip and a linear FAT directory search, so start-up spent many minutes there
-    # (real hardware sat in step 4 for 20+ minutes). The iterator builds every path as root / name..., so the purely
-    # textual lexically_relative gives the same answer without touching the card.
+    # Start-up walks the disc folder twice (the save key and the DVD index, 5,314 files each), getting every file's
+    # size with stat and its relative path with fs::relative (a stat per path component). On a real New 3DS one
+    # stat is ~50 ms (newlib opens the file, asks its size, closes it), so step 4 never finished in an hour. On the
+    # 3DS both walks use Brawl3dsListTree (port/wiicompiled_arm32/fast_tree_3ds.cpp) instead: FSDIR_Read returns
+    # names and sizes 64 at a time, and the tree is read from the card once and kept.
     edit(inc / "nand_path.h", [
-        ("std::filesystem::relative(it->path(), root, fileError).generic_u8string();",
-         "\n#if defined(__3DS__)\n                it->path().lexically_relative(root).generic_u8string();  // no SD stat per component\n"
-         "#else\n                std::filesystem::relative(it->path(), root, fileError).generic_u8string();\n#endif\n", 1),
+        ("#include <vector>\n\nnamespace RuntimeNandPath {",
+         "#include <vector>\n\n#if defined(__3DS__)\n#include \"brawl3ds_fast_tree.h\"\n#endif\n\nnamespace RuntimeNandPath {", 1),
+        ("    for (std::filesystem::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {\n",
+         "#if defined(__3DS__)\n"
+         "    if (const auto* tree = Brawl3dsListTree(root.generic_string())) {  // no stat per file on the SD card\n"
+         "        for (const auto& file : *tree) files.emplace_back(file.relative, file.size);\n"
+         "    }\n"
+         "#else\n"
+         "    for (std::filesystem::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {\n", 1),
+        ("        }\n    }\n    if (files.empty()) {\n",
+         "        }\n    }\n#endif\n    if (files.empty()) {\n", 1),
     ])
     edit(src / "hle" / "storage" / "dvd.cpp", [
-        ("        const fs::path relative = fs::relative(entry.path(), root, entryEc);\n",
-         "#if defined(__3DS__)\n        const fs::path relative = entry.path().lexically_relative(root);  // no SD stat per component\n"
-         "#else\n        const fs::path relative = fs::relative(entry.path(), root, entryEc);\n#endif\n", 1),
+        ("#include \"runtime_product.h\"\n",
+         "#include \"runtime_product.h\"\n#if defined(__3DS__)\n#include \"brawl3ds_fast_tree.h\"\n#endif\n", 1),
+        ("    const auto registerEntry = [&](const fs::directory_entry& entry) {\n",
+         "#if defined(__3DS__)\n"
+         "    // One FSDIR_Read per folder instead of a stat per file (~50 ms each on the console).\n"
+         "    if (recursive) {\n"
+         "        if (const auto* tree = Brawl3dsListTree(root.generic_string())) {\n"
+         "            std::string prefix = virtualPrefix.empty() ? \"/\" : virtualPrefix;\n"
+         "            if (prefix.back() != '/' && prefix.back() != '\\\\') {\n"
+         "                prefix += \"/\";\n"
+         "            }\n"
+         "            for (const auto& file : *tree) {\n"
+         "                std::string dvdPath = prefix + file.relative;\n"
+         "                if (!addNewFiles && !DvdEntryExists(dvdPath)) {\n"
+         "                    continue;\n"
+         "                }\n"
+         "                RegisterFileEntry(std::move(dvdPath), root / file.relative, static_cast<uint32_t>(file.size));\n"
+         "            }\n"
+         "            return;\n"
+         "        }\n"
+         "    }\n"
+         "#endif\n"
+         "    const auto registerEntry = [&](const fs::directory_entry& entry) {\n", 1),
     ])
 
     edit(inc / "system_bridge.h", [
