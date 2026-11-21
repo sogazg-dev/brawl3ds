@@ -152,6 +152,8 @@ char g_lastLine[96] = "";
 long g_stdoutBytes = 0;
 uint64_t g_lastProgress = 0;  // tick of the last new runtime output or game frame
 bool g_hungReported = false;
+const char* volatile g_heartbeatWait = nullptr;  // the heartbeat's current file operation, shown on screen
+uint32_t g_heartbeats = 0;
 uint64_t g_runStart = 0, g_stepStart = 0;
 uint32_t g_stepFrameStart = 0;
 uint64_t g_stepTicks[kStepCount] = {};
@@ -258,6 +260,10 @@ void DrawStatusLocked(const char* warning)
         PutText(fb, 1, 8, g_lastLine, kGrey);
     } else {
         PutText(fb, 1, 7, "(not frame based)", kGrey);
+    }
+    if (g_frames == 0 && g_heartbeats) {
+        PrintAt(fb, 1, 21, kGrey, "heartbeat %u%s%s", g_heartbeats, g_heartbeatWait ? ", next: " : "",
+                g_heartbeatWait ? g_heartbeatWait : "");
     }
     PrintAt(fb, 1, 9, kWhite, "time in this step   %s", a);
 
@@ -467,20 +473,27 @@ void HeartbeatThread(void*)
     for (;;) {
         svcSleepThread(1000000000LL);
         ++seconds;
+        g_heartbeats = seconds;
         if (g_frames > 0) {
             if (g_step >= kStepResults) return;
             continue;  // frames are running: Brawl3dsFrameEnd redraws and watches for stalls
         }
-        std::fflush(stdout);
-        std::fflush(stderr);
+        // Screen first: it needs no file access, so it keeps working even if the SD card service or a stdio lock is
+        // stuck. g_heartbeatWait names the next operation, so a frozen screen shows which one never returned.
+        // (No fflush(stdout) here: if the main thread hangs mid-write it holds that lock, and the heartbeat would
+        // hang with it. stdout's 1 KiB buffer still reaches the card often enough to see progress.)
+        if (!g_lastProgress) g_lastProgress = svcGetSystemTick();
+        g_heartbeatWait = "SD: size of stdout.txt";
+        DrawStatus(g_hungReported ? "No output for 10 min: probably stuck. START exits; send stdout.txt" : nullptr);
         struct stat info {};
         if (stat("sdmc:/3ds/brawl3ds/stdout.txt", &info) == 0 && info.st_size != g_stdoutBytes) {
             g_stdoutBytes = info.st_size;
             g_lastProgress = svcGetSystemTick();
+            g_heartbeatWait = "SD: reading stdout.txt";
             ReadLastLine(g_stdoutBytes);
         }
-        if (!g_lastProgress) g_lastProgress = svcGetSystemTick();
         const double idle = SecondsSince(g_lastProgress);
+        g_heartbeatWait = "SD: writing headless.log";
         if (seconds % 15 == 0) {
             Log("  .. step %d of %d still running, %.0f s in; runtime log %ld bytes, last output %.0f s ago: %s\n",
                 g_step + 1, kStepCount, SecondsSince(g_stepStart), g_stdoutBytes, idle, g_lastLine);
@@ -501,6 +514,7 @@ void HeartbeatThread(void*)
             svcSleepThread(1500000000LL);
             svcExitProcess();
         }
+        g_heartbeatWait = nullptr;
         DrawStatus(g_hungReported ? "No output for 10 min: probably stuck. START exits; send stdout.txt"
                                   : nullptr);
     }
@@ -622,6 +636,7 @@ int main(int, char**)
     mkdir("sdmc:/3ds", 0777);
     mkdir(kRoot, 0777);
     g_log = std::fopen("sdmc:/3ds/brawl3ds/headless.log", "w");
+    std::remove("sdmc:/3ds/brawl3ds/crash.txt");  // a crash.txt left by an earlier run would look like this run's
 
     bool isNew = false;
     APT_CheckNew3DS(&isNew);
@@ -685,11 +700,17 @@ int main(int, char**)
     std::freopen("sdmc:/3ds/brawl3ds/stderr.txt", "w", stderr);
     g_consoleActive = false;
     {
-        s32 priority = 0x30;
-        svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
-        if (!threadCreate(HeartbeatThread, nullptr, 64 * 1024, priority > 0x19 ? priority - 1 : 0x18, -2, true)) {
-            Log("heartbeat thread could not start\n");
-        }
+        // The CIA's exheader starts the main thread at priority 16, the highest an application may use, so nothing
+        // could preempt it: on real hardware the heartbeat (then created below it) never ran while start-up kept
+        // the CPU busy, and a worker thread the main thread waits for could starve the same way. Drop the main
+        // thread to the usual application priority and put the heartbeat clearly above it.
+        s32 before = 0, after = 0;
+        svcGetThreadPriority(&before, CUR_THREAD_HANDLE);
+        svcSetThreadPriority(CUR_THREAD_HANDLE, 0x30);
+        svcGetThreadPriority(&after, CUR_THREAD_HANDLE);
+        const bool started = threadCreate(HeartbeatThread, nullptr, 64 * 1024, 0x18, -2, true) != nullptr;
+        Log("thread priorities: main %ld -> %ld, heartbeat 24 (%s)\n", static_cast<long>(before),
+            static_cast<long>(after), started ? "started" : "could not start");
     }
 
     // Guest RAM first, before the runtime's own allocations fragment the regular heap.
