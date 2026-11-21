@@ -154,6 +154,25 @@ uint64_t g_lastProgress = 0;  // tick of the last new runtime output or game fra
 bool g_hungReported = false;
 const char* volatile g_heartbeatWait = nullptr;  // the heartbeat's current file operation, shown on screen
 uint32_t g_heartbeats = 0;
+thread_local bool tl_isHeartbeat = false;
+unsigned g_memoryKiB = 0;
+// The main thread's g_currentCpuContext (thread_local), recorded by the main thread itself so the heartbeat can
+// sample the running guest code: lr is the return address of the latest guest call, r1 the guest stack.
+CpuContext* volatile* g_mainGuestContextSlot = nullptr;
+uint32_t g_sampleLr = 0, g_sampleSp = 0, g_sampleR3 = 0;
+uint32_t g_sameLrBeats = 0;
+
+void SampleGuest()
+{
+    if (!g_mainGuestContextSlot) return;
+    const CpuContext* ctx = *g_mainGuestContextSlot;
+    if (!ctx) return;
+    const uint32_t lr = ctx->lr;
+    g_sameLrBeats = lr == g_sampleLr ? g_sameLrBeats + 1 : 0;
+    g_sampleLr = lr;
+    g_sampleSp = ctx->gpr[1];
+    g_sampleR3 = ctx->gpr[3];
+}
 uint64_t g_runStart = 0, g_stepStart = 0;
 uint32_t g_stepFrameStart = 0;
 uint64_t g_stepTicks[kStepCount] = {};
@@ -255,8 +274,8 @@ void DrawStatusLocked(const char* warning)
         Bar(fb, 8, static_cast<double>(stepFrames) / kSteps[g_step].pcFrames, g_step == kStepMatch ? kGreen : kWhite);
     } else if (g_stdoutBytes > 0) {
         // Runtime start-up: show its log growing and the latest line, so a slow step is visibly alive.
-        const double idle = g_lastProgress ? SecondsSince(g_lastProgress) : 0;
-        PrintAt(fb, 1, 7, idle > 60 ? kRed : kGrey, "runtime log %ld KB, new output %.0fs ago", g_stdoutBytes >> 10, idle);
+        const unsigned idle = g_lastProgress ? static_cast<unsigned>(SecondsSince(g_lastProgress)) : 0;
+        PrintAt(fb, 1, 7, idle > 60 ? kRed : kGrey, "runtime log %ld KB, new output %us ago", g_stdoutBytes >> 10, idle);
         PutText(fb, 1, 8, g_lastLine, kGrey);
     } else {
         PutText(fb, 1, 7, "(not frame based)", kGrey);
@@ -264,6 +283,10 @@ void DrawStatusLocked(const char* warning)
     if (g_frames == 0 && g_heartbeats) {
         PrintAt(fb, 1, 21, kGrey, "heartbeat %u%s%s", g_heartbeats, g_heartbeatWait ? ", next: " : "",
                 g_heartbeatWait ? g_heartbeatWait : "");
+        if (g_sampleLr) {
+            PrintAt(fb, 1, 22, kWhite, "guest lr %08lX sp %08lX (same %us)", static_cast<unsigned long>(g_sampleLr),
+                    static_cast<unsigned long>(g_sampleSp), g_sameLrBeats);
+        }
     }
     PrintAt(fb, 1, 9, kWhite, "time in this step   %s", a);
 
@@ -289,7 +312,10 @@ void DrawStatusLocked(const char* warning)
         PrintAt(fb, 1, 16, kGrey, "(%u frames at the current speed)", remaining);
         PrintAt(fb, 1, 18, kWhite, "speed %5.1f fps  (%.1f ms/frame)", 1000.0 / g_recentFrameMs, g_recentFrameMs);
     }
-    PrintAt(fb, 1, 19, kWhite, "frame %u   memory %.1f MB", g_frames, (mallinfo().uordblks >> 10) / 1024.0);
+    // mallinfo() takes the allocator's lock: only the main thread may ask (the heartbeat must keep drawing even if
+    // the main thread is stuck inside malloc). Integer formatting only: newlib's float printf can allocate.
+    if (!tl_isHeartbeat) g_memoryKiB = static_cast<unsigned>(mallinfo().uordblks >> 10);
+    PrintAt(fb, 1, 19, kWhite, "frame %u   memory %u.%u MB", g_frames, g_memoryKiB / 1024, g_memoryKiB % 1024 * 10 / 1024);
     if (!g_scene.empty()) PrintAt(fb, 1, 20, kGrey, "scene %s", g_scene.c_str());
 
     if (warning) {
@@ -469,11 +495,17 @@ void ReadLastLine(long size)
 // logs a heartbeat every 15 s, and flags 10 minutes without any new output as a probable hang. START exits.
 void HeartbeatThread(void*)
 {
+    tl_isHeartbeat = true;
+    Log("heartbeat: thread running\n");
     uint32_t seconds = 0;
     for (;;) {
         svcSleepThread(1000000000LL);
         ++seconds;
         g_heartbeats = seconds;
+        if (seconds <= 30) {
+            Log("heartbeat %u: frames %u, step %d, wait %s\n", seconds, g_frames, g_step + 1,
+                g_heartbeatWait ? g_heartbeatWait : "-");
+        }
         if (g_frames > 0) {
             if (g_step >= kStepResults) return;
             continue;  // frames are running: Brawl3dsFrameEnd redraws and watches for stalls
@@ -483,6 +515,7 @@ void HeartbeatThread(void*)
         // (No fflush(stdout) here: if the main thread hangs mid-write it holds that lock, and the heartbeat would
         // hang with it. stdout's 1 KiB buffer still reaches the card often enough to see progress.)
         if (!g_lastProgress) g_lastProgress = svcGetSystemTick();
+        SampleGuest();
         g_heartbeatWait = "SD: size of stdout.txt";
         DrawStatus(g_hungReported ? "No output for 10 min: probably stuck. START exits; send stdout.txt" : nullptr);
         struct stat info {};
@@ -495,8 +528,11 @@ void HeartbeatThread(void*)
         const double idle = SecondsSince(g_lastProgress);
         g_heartbeatWait = "SD: writing headless.log";
         if (seconds % 15 == 0) {
-            Log("  .. step %d of %d still running, %.0f s in; runtime log %ld bytes, last output %.0f s ago: %s\n",
-                g_step + 1, kStepCount, SecondsSince(g_stepStart), g_stdoutBytes, idle, g_lastLine);
+            Log("  .. step %d of %d still running, %.0f s in; guest lr %08lX sp %08lX r3 %08lX; runtime log %ld "
+                "bytes, last output %.0f s ago: %s\n",
+                g_step + 1, kStepCount, SecondsSince(g_stepStart), static_cast<unsigned long>(g_sampleLr),
+                static_cast<unsigned long>(g_sampleSp), static_cast<unsigned long>(g_sampleR3), g_stdoutBytes, idle,
+                g_lastLine);
         }
         if (idle > 600 && !g_hungReported) {
             g_hungReported = true;
@@ -722,6 +758,7 @@ int main(int, char**)
         static_cast<unsigned long>(linearSpaceFree() >> 10));
 
     EnterStep(3);
+    g_mainGuestContextSlot = &g_currentCpuContext;  // this thread's instance, for the heartbeat's guest sampler
     SDL_SetMainReady();
     char program[] = "sdmc:/3ds/brawl3ds/brawl3ds.3dsx";
     char* argv[] = {program, nullptr};
