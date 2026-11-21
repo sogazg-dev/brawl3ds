@@ -32,6 +32,10 @@
 #include "isa/ppc_isa_context.h"
 #include "save_states.h"
 
+void Brawl3dsProfilerStart(CpuContext* volatile* mainContextSlot);
+void Brawl3dsProfilerSetRecording(bool on);
+void Brawl3dsProfilerWrite(const char* path, unsigned frames, double averageFrameMs);
+
 #include <SDL3/SDL_main.h>  // SDL_SetMainReady: the build defines SDL_MAIN_HANDLED, this file owns main()
 
 int RuntimeMain(int argc, char** argv);
@@ -488,6 +492,7 @@ void WriteMatchSummary()
 {
     if (g_matchFrames == 0) return;
     const double avg = TicksToMs(g_matchSum) / g_matchFrames;
+    Brawl3dsProfilerWrite("sdmc:/3ds/brawl3ds/profile.txt", g_matchFrames, avg);
     Log("\n== VS demo match: %u frames measured ==\n"
         "average frame  %.2f ms (%.1f fps)\n"
         "average game   %.2f ms (time between aurora_begin_frame and aurora_end_frame)\n"
@@ -686,6 +691,7 @@ extern "C" void Brawl3dsFrameEnd()
     if (++g_windowFrames >= (g_scene == "scMelee" ? 60u : 10u)) WriteWindow();  // finer before the match: memory growth
 
     if (g_scene == "scMelee") {
+        if (g_matchFrames == 0) Brawl3dsProfilerSetRecording(true);  // profile.txt: the match only
         ++g_matchFrames;
         g_matchSum += total;
         g_matchWork += work;
@@ -726,6 +732,7 @@ int main(int, char**)
     mkdir("sdmc:/3ds", 0777);
     mkdir(kRoot, 0777);
     g_log = std::fopen("sdmc:/3ds/brawl3ds/headless.log", "w");
+    std::remove("sdmc:/3ds/brawl3ds/profile.txt");
     std::remove("sdmc:/3ds/brawl3ds/crash.txt");  // a crash.txt left by an earlier run would look like this run's
 
     bool isNew = false;
@@ -817,6 +824,7 @@ int main(int, char**)
 
     EnterStep(3);
     g_mainGuestContextSlot = &g_currentCpuContext;  // this thread's instance, for the heartbeat's guest sampler
+    Brawl3dsProfilerStart(g_mainGuestContextSlot);
     // The runtime's overlay code still calls ImGui on every presented frame (cursor auto-hide, ImGui::GetTime, ...)
     // even though the 3DS never renders an ImGui frame. Without a context those are null-pointer reads: Azahar
     // logs them as "unmapped Read32" and returns 0, a real New 3DS raises a data abort (settings_overlay::Draw
