@@ -364,6 +364,64 @@ def main(wiicompiled: Path):
          "    const auto registerEntry = [&](const fs::directory_entry& entry) {\n", 1),
     ])
 
+    # Opening an existing save file for writing first copies it to a shadow file with std::filesystem::copy_file.
+    # On the 3DS that copy crawls: the first real-hardware run spent 235 s in one scBoot frame copying the 14 MB
+    # collect.vff. On the 3DS NandCopyFile copies in 1 MiB unbuffered chunks instead (same copy_options rules).
+    edit(src / "hle" / "storage" / "nand_internal.h", [
+        ("#include <unistd.h>\n#endif\n",
+         "#include <unistd.h>\n#endif\n\n"
+         "inline bool NandCopyFile(const std::filesystem::path& from, const std::filesystem::path& to,\n"
+         "                         std::filesystem::copy_options options, std::error_code& ec) {\n"
+         "#if defined(__3DS__)\n"
+         "    using std::filesystem::copy_options;\n"
+         "    ec.clear();\n"
+         "    if (std::filesystem::exists(to, ec)) {\n"
+         "        if ((options & copy_options::skip_existing) != copy_options::none) return false;\n"
+         "        if ((options & copy_options::overwrite_existing) == copy_options::none) {\n"
+         "            ec = std::make_error_code(std::errc::file_exists);\n"
+         "            return false;\n"
+         "        }\n"
+         "    }\n"
+         "    ec.clear();\n"
+         "    FILE* in = std::fopen(from.string().c_str(), \"rb\");\n"
+         "    if (!in) {\n"
+         "        ec = std::error_code(errno, std::generic_category());\n"
+         "        return false;\n"
+         "    }\n"
+         "    FILE* out = std::fopen(to.string().c_str(), \"wb\");\n"
+         "    if (!out) {\n"
+         "        ec = std::error_code(errno, std::generic_category());\n"
+         "        std::fclose(in);\n"
+         "        return false;\n"
+         "    }\n"
+         "    std::setvbuf(in, nullptr, _IONBF, 0);\n"
+         "    std::setvbuf(out, nullptr, _IONBF, 0);\n"
+         "    constexpr size_t kChunk = 1u << 20;\n"
+         "    std::vector<char> buffer(kChunk);\n"
+         "    bool ok = true;\n"
+         "    for (;;) {\n"
+         "        const size_t got = std::fread(buffer.data(), 1, kChunk, in);\n"
+         "        if (got > 0 && std::fwrite(buffer.data(), 1, got, out) != got) { ok = false; break; }\n"
+         "        if (got < kChunk) { ok = !std::ferror(in); break; }\n"
+         "    }\n"
+         "    std::fclose(in);\n"
+         "    if (std::fclose(out) != 0) ok = false;\n"
+         "    if (!ok) {\n"
+         "        ec = std::make_error_code(std::errc::io_error);\n"
+         "        std::remove(to.string().c_str());\n"
+         "    }\n"
+         "    return ok;\n"
+         "#else\n"
+         "    return std::filesystem::copy_file(from, to, options, ec);\n"
+         "#endif\n"
+         "}\n"
+         "inline bool NandCopyFile(const std::filesystem::path& from, const std::filesystem::path& to, std::error_code& ec) {\n"
+         "    return NandCopyFile(from, to, std::filesystem::copy_options::none, ec);\n"
+         "}\n", 1),
+    ])
+    for name, count in (("nand_api.cpp", 2), ("nand_async.cpp", 1), ("nand_fs.cpp", 1)):
+        edit(src / "hle" / "storage" / name, [("std::filesystem::copy_file(", "NandCopyFile(", count)])
+
     edit(inc / "system_bridge.h", [
         ("#if defined(_WIN32)\nusing MkwJmpBuf = jmp_buf;",
          "#if defined(_WIN32) || defined(__3DS__)\nusing MkwJmpBuf = jmp_buf;", 1),
