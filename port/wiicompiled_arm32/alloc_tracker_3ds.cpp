@@ -180,6 +180,12 @@ void __wrap_free(void* p)
 
 void* __wrap__Znwj(size_t size)
 {
+    if (size >= (1u << 20)) {  // large C++ allocations and who makes them (memory is the limit on the 3DS)
+        char line[96];
+        const int len = std::snprintf(line, sizeof(line), "[alloc] new(%lu) from %p\n",
+                                      static_cast<unsigned long>(size), __builtin_return_address(0));
+        if (len > 0) write(2, line, static_cast<size_t>(len));
+    }
     ++g_insideNew;
     void* p = __real__Znwj(size);
     --g_insideNew;

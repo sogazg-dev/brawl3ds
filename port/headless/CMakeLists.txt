@@ -101,7 +101,10 @@ if(EXISTS "${HOT_SHARDS_LIST}")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${HOT_SHARDS_LIST}")
   file(STRINGS "${HOT_SHARDS_LIST}" HOT_SHARDS)
   list(TRANSFORM HOT_SHARDS PREPEND "${SHARD_DIR}/")
-  set_source_files_properties(${HOT_SHARDS} PROPERTIES COMPILE_DEFINITIONS BRAWL3DS_INLINE_GUEST_ACCESS=1)
+  # -O2 after the target's -Oz: -Oz runs clang's machine outliner, which turns repeated instruction runs in the
+  # hot loops into calls; -O2 costs about 30% more code in these shards only.
+  set_source_files_properties(${HOT_SHARDS} PROPERTIES COMPILE_DEFINITIONS BRAWL3DS_INLINE_GUEST_ACCESS=1
+    COMPILE_OPTIONS -O2)
   list(LENGTH HOT_SHARDS HOT_SHARD_COUNT)
   message(STATUS "brawl3ds: ${HOT_SHARD_COUNT} hot shards inline guest memory accesses")
 endif()

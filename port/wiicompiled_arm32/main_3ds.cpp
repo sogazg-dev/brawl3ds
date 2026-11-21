@@ -58,12 +58,12 @@ extern char* fake_heap_end;
 
 void __system_allocateHeaps(void)
 {
-    // Room for MEM1 (24 MiB), the module homes (12 MiB) and the locked cache (1 MiB) with GuestFlat's 4 MiB reserve
+    // Room for MEM1 (24 MiB), the module homes (12 MiB) and the locked cache (1 MiB) with GuestFlat's 1 MiB reserve
     // for audio/GPU buffers, so the regular heap only carries MEM2 (54 MiB) besides the runtime's own allocations
     // (~20 MiB in the match). Sized explicitly: with 38 MB of code the 96 MiB regular cap happened to leave 42 MiB
     // linear, but the inline memory accesses grew the code to 55 MB, the old 29 MiB pushed MEM1 into the regular
     // heap, and the runtime ran out of memory in step 4 (std::bad_alloc).
-    constexpr u32 kLinearHeap = 42u * 1024u * 1024u;
+    constexpr u32 kLinearHeap = 39u * 1024u * 1024u;  // 37 MiB of guest regions + the 1 MiB reserve + slack
     constexpr u32 kRegularHeapMax = 96u * 1024u * 1024u;  // the kernel's heap window at 0x08000000
 
     Handle limits = 0;

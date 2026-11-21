@@ -52,7 +52,9 @@ bool g_initialized = false;
 // The regular heap also serves every runtime allocation (newlib malloc), while linear memory is only used by audio
 // and GPU buffers. So a guest region goes to linear memory whenever it fits with this much left over for those, and
 // to the regular heap otherwise.
-constexpr size_t kLinearReserve = 4u * 1024u * 1024u;
+// The headless timing build has no GPU buffers and dummy audio, so 1 MiB is enough; the renderer will need its own
+// memory plan (this was 4 MiB, but the extra code of the -O2 hot shards needs that room in the regular heap).
+constexpr size_t kLinearReserve = 1u * 1024u * 1024u;
 
 // Blocks set aside by Brawl3dsReserveGuestMemory() before the runtime starts, so the big guest regions get their
 // memory before the runtime's own allocations fragment the regular heap.
