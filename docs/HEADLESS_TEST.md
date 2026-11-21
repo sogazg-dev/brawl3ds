@@ -23,7 +23,7 @@ plays, and this build only holds the code that the PC coverage run of this match
 | 1 | Checking game files | `game/` and the save are present | instant |
 | 2 | Indexing the game folder | walks the 5,314 disc files on the SD | ~3 s |
 | 3 | Reserving Wii memory | MEM1/MEM2/module homes | instant |
-| 4 | Starting the runtime | game code, modules, virtual NAND | a few seconds |
+| 4 | Starting the runtime | game code, modules, virtual NAND | ~30 s (Azahar) |
 | 5 | Safety screen (scStrap) | Brawl's idle timeout | 1,435 frames |
 | 6 | Loading boot data + save | scBoot | 44 frames |
 | 7 | Title screen idle (scTitle) | A skips the movie; waits for the attract demo, then loads it | ~1,186 frames |
@@ -34,6 +34,15 @@ The screen shows the frame count against the PC build's count for that step, tim
 an estimate of time left at the current speed, the fps, and memory. If a step runs far past its PC frame
 count (2× + 600 frames), the build stops with "Stalled" instead of waiting forever. `headless.log` ends
 with a time-per-step table.
+
+Steps 1–4 have no game frames, so a heartbeat redraws the screen every second during them. It shows the size
+of the runtime's log, how long ago it last printed something, and its last line. The same information goes
+into `headless.log` every 15 s. If 10 minutes pass with no new output, the screen says the run is probably
+stuck. START closes the test during these steps too.
+
+Before this fix, step 4 walked all 5,314 disc files twice with `fs::relative`. That call checks every folder in
+a file's path on the SD card, one at a time. A real New 3DS spent more than 20 minutes in step 4 because of it.
+The patch replaces it with a string-only `lexically_relative` (see `tools/patch_wiicompiled_arm32.py`).
 
 ## What goes on the SD card
 

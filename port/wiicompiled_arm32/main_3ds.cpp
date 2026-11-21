@@ -144,6 +144,13 @@ constexpr int kStepCount = sizeof(kSteps) / sizeof(kSteps[0]);
 constexpr int kStepStrap = 4, kStepBoot = 5, kStepTitle = 6, kStepMatch = 7, kStepResults = 8;  // indices
 
 int g_step = 0;
+// Heartbeat (HeartbeatThread): steps 1-4 run inside one long call with no game frames, so a second thread redraws
+// the screen once a second and shows the runtime's latest output line, to tell "slow" apart from "stuck".
+LightLock g_drawLock;
+char g_lastLine[96] = "";
+long g_stdoutBytes = 0;
+uint64_t g_lastProgress = 0;  // tick of the last new runtime output or game frame
+bool g_hungReported = false;
 uint64_t g_runStart = 0, g_stepStart = 0;
 uint32_t g_stepFrameStart = 0;
 uint64_t g_stepTicks[kStepCount] = {};
@@ -216,7 +223,16 @@ uint32_t RemainingFrames()
     return remaining;
 }
 
+void DrawStatusLocked(const char* warning);
+
 void DrawStatus(const char* warning = nullptr)
+{
+    LightLock_Lock(&g_drawLock);
+    DrawStatusLocked(warning);
+    LightLock_Unlock(&g_drawLock);
+}
+
+void DrawStatusLocked(const char* warning)
 {
     u8* fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, nullptr, nullptr);
     if (!fb) return;
@@ -234,6 +250,11 @@ void DrawStatus(const char* warning = nullptr)
     if (kSteps[g_step].pcFrames) {
         PrintAt(fb, 1, 7, kWhite, "frame %u of ~%u in this step", stepFrames, kSteps[g_step].pcFrames);
         Bar(fb, 8, static_cast<double>(stepFrames) / kSteps[g_step].pcFrames, g_step == kStepMatch ? kGreen : kWhite);
+    } else if (g_stdoutBytes > 0) {
+        // Runtime start-up: show its log growing and the latest line, so a slow step is visibly alive.
+        const double idle = g_lastProgress ? SecondsSince(g_lastProgress) : 0;
+        PrintAt(fb, 1, 7, idle > 60 ? kRed : kGrey, "runtime log %ld KB, new output %.0fs ago", g_stdoutBytes >> 10, idle);
+        PutText(fb, 1, 8, g_lastLine, kGrey);
     } else {
         PutText(fb, 1, 7, "(not frame based)", kGrey);
     }
@@ -408,6 +429,82 @@ void WriteMatchSummary()
         100.0 * g_matchOver33 / g_matchFrames);
 }
 
+// Latest non-empty line of stdout.txt, without colour escapes, for the status screen.
+void ReadLastLine(long size)
+{
+    std::FILE* f = std::fopen("sdmc:/3ds/brawl3ds/stdout.txt", "rb");
+    if (!f) return;
+    char buf[512];
+    const long from = size > static_cast<long>(sizeof(buf)) - 1 ? size - static_cast<long>(sizeof(buf)) + 1 : 0;
+    std::fseek(f, from, SEEK_SET);
+    const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::fclose(f);
+    buf[n] = 0;
+    size_t end = n;
+    while (end > 0 && (buf[end - 1] == '\n' || buf[end - 1] == '\r' || buf[end - 1] == ' ')) --end;
+    size_t start = end;
+    while (start > 0 && buf[start - 1] != '\n') --start;
+    char line[96];
+    size_t o = 0;
+    for (size_t i = start; i < end && o < 39; ++i) {  // one 39-column row on the bottom screen
+        if (buf[i] == 0x1b) {  // ESC [ ... m
+            while (i < end && buf[i] != 'm') ++i;
+            continue;
+        }
+        line[o++] = (buf[i] >= 32 && buf[i] < 127) ? buf[i] : ' ';
+    }
+    line[o] = 0;
+    if (o) std::memcpy(g_lastLine, line, o + 1);
+}
+
+// Runs beside RuntimeMain at a higher priority and sleeps most of the time. Before the first game frame (steps 1-4)
+// nothing else redraws the screen, so this flushes the runtime's output, shows its last line, redraws once a second,
+// logs a heartbeat every 15 s, and flags 10 minutes without any new output as a probable hang. START exits.
+void HeartbeatThread(void*)
+{
+    uint32_t seconds = 0;
+    for (;;) {
+        svcSleepThread(1000000000LL);
+        ++seconds;
+        if (g_frames > 0) {
+            if (g_step >= kStepResults) return;
+            continue;  // frames are running: Brawl3dsFrameEnd redraws and watches for stalls
+        }
+        std::fflush(stdout);
+        std::fflush(stderr);
+        struct stat info {};
+        if (stat("sdmc:/3ds/brawl3ds/stdout.txt", &info) == 0 && info.st_size != g_stdoutBytes) {
+            g_stdoutBytes = info.st_size;
+            g_lastProgress = svcGetSystemTick();
+            ReadLastLine(g_stdoutBytes);
+        }
+        if (!g_lastProgress) g_lastProgress = svcGetSystemTick();
+        const double idle = SecondsSince(g_lastProgress);
+        if (seconds % 15 == 0) {
+            Log("  .. step %d of %d still running, %.0f s in; runtime log %ld bytes, last output %.0f s ago: %s\n",
+                g_step + 1, kStepCount, SecondsSince(g_stepStart), g_stdoutBytes, idle, g_lastLine);
+        }
+        if (idle > 600 && !g_hungReported) {
+            g_hungReported = true;
+            Log("HUNG? no runtime output for 10 minutes in step %d of %d. Last line: %s\n", g_step + 1, kStepCount,
+                g_lastLine);
+            LogStepSummary();
+        }
+        hidScanInput();
+        if (hidKeysDown() & KEY_START) {
+            Log("stopped with START in step %d of %d (before the first game frame)\n", g_step + 1, kStepCount);
+            LogStepSummary();
+            if (g_log) std::fclose(g_log);
+            g_log = nullptr;
+            DrawStatus("Stopped with START. Closing...");
+            svcSleepThread(1500000000LL);
+            svcExitProcess();
+        }
+        DrawStatus(g_hungReported ? "No output for 10 min: probably stuck. START exits; send stdout.txt"
+                                  : nullptr);
+    }
+}
+
 } // namespace
 
 extern "C" void Brawl3dsFatal(const char* what)
@@ -514,6 +611,7 @@ extern "C" void Brawl3dsFrameEnd()
 
 int main(int, char**)
 {
+    LightLock_Init(&g_drawLock);
     gfxInitDefault();
     consoleInit(GFX_TOP, nullptr);
     g_consoleActive = true;
@@ -541,8 +639,8 @@ int main(int, char**)
                 "time spent and an estimate of time left.\n"
                 "Steps 5 and 7 are Brawl's own idle\n"
                 "timers: a player pressing A skips them.\n\n"
-                "Stops by itself after 30 s of the match\n"
-                "(or press START). Results:\n"
+                "Stops by itself when the demo match\n"
+                "ends (or press START). Results:\n"
                 "  sdmc:/3ds/brawl3ds/headless.log\n", kStepCount);
 
     EnterStep(0);
@@ -588,6 +686,13 @@ int main(int, char**)
     std::freopen("sdmc:/3ds/brawl3ds/stdout.txt", "w", stdout);
     std::freopen("sdmc:/3ds/brawl3ds/stderr.txt", "w", stderr);
     g_consoleActive = false;
+    {
+        s32 priority = 0x30;
+        svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
+        if (!threadCreate(HeartbeatThread, nullptr, 64 * 1024, priority > 0x19 ? priority - 1 : 0x18, -2, true)) {
+            Log("heartbeat thread could not start\n");
+        }
+    }
 
     // Guest RAM first, before the runtime's own allocations fragment the regular heap.
     EnterStep(2);

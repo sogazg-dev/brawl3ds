@@ -319,6 +319,22 @@ def main(wiicompiled: Path):
          "bool EnsureConfigured() {\n#if defined(_WIN32) || defined(__3DS__)", 1),
     ])
 
+    # Both walks of the disc folder (the save key and the DVD index, 5,314 files each) took each file's path relative
+    # to the root with fs::relative, which canonicalises both paths: a stat of every component, for every file. On the
+    # 3DS each stat is an SD card round trip and a linear FAT directory search, so start-up spent many minutes there
+    # (real hardware sat in step 4 for 20+ minutes). The iterator builds every path as root / name..., so the purely
+    # textual lexically_relative gives the same answer without touching the card.
+    edit(inc / "nand_path.h", [
+        ("std::filesystem::relative(it->path(), root, fileError).generic_u8string();",
+         "\n#if defined(__3DS__)\n                it->path().lexically_relative(root).generic_u8string();  // no SD stat per component\n"
+         "#else\n                std::filesystem::relative(it->path(), root, fileError).generic_u8string();\n#endif\n", 1),
+    ])
+    edit(src / "hle" / "storage" / "dvd.cpp", [
+        ("        const fs::path relative = fs::relative(entry.path(), root, entryEc);\n",
+         "#if defined(__3DS__)\n        const fs::path relative = entry.path().lexically_relative(root);  // no SD stat per component\n"
+         "#else\n        const fs::path relative = fs::relative(entry.path(), root, entryEc);\n#endif\n", 1),
+    ])
+
     edit(inc / "system_bridge.h", [
         ("#if defined(_WIN32)\nusing MkwJmpBuf = jmp_buf;",
          "#if defined(_WIN32) || defined(__3DS__)\nusing MkwJmpBuf = jmp_buf;", 1),
