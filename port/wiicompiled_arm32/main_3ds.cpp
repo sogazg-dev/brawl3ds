@@ -732,6 +732,22 @@ int main(int, char**)
     gfxInitDefault();
     consoleInit(GFX_TOP, nullptr);
     g_consoleActive = true;
+    // Exit test: SELECT held at launch returns from main at once, through libctru's ordinary exit, before anything
+    // of this build runs (no speedup, no threads, no runtime). Every real-hardware run so far has ended with the
+    // HOME Menu's "An error has occurred" (hold POWER, restart): if this ends the same way, the cause is the
+    // 178 MB memory mode or the exheader, not this build's exit path.
+    bool selectHeld = false;
+    for (int i = 0; i < 4 && !selectHeld; ++i) {  // HID may not have sampled the buttons yet on the first scan
+        svcSleepThread(20000000LL);
+        hidScanInput();
+        selectHeld = (hidKeysHeld() & KEY_SELECT) != 0;
+    }
+    if (selectHeld) {
+        std::printf("Exit test (SELECT held at launch):\nreturning from main through libctru's normal exit.\n");
+        svcSleepThread(2000000000LL);
+        gfxExit();
+        return 0;
+    }
     osSetSpeedupEnable(true);
     threadOnException(OnException, g_exceptionStack + sizeof(g_exceptionStack), WRITE_DATA_TO_HANDLER_STACK);
 
