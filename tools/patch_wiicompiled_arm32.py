@@ -511,20 +511,32 @@ def main(wiicompiled: Path):
         ("  if (!g_gxState.zFreeze) update_zfreeze_reference(prim, fmt, data + pos, vtxCount, vtxSize, bigEndian);\n"
          "  // SPM: with the view widened",
          "#if defined(__3DS__)\n"
-         "  if (!g_gxState.stateDirty && brawl3ds_append_draw(prim, fmt, data + pos, vtxCount, vtxSize, bigEndian)) {\n"
-         "    pos += totalVtxBytes;\n"
-         "    return true;\n"
+         "  brawl3ds_note_draw_endian(bigEndian);\n"
+         "  if (!g_gxState.stateDirty) {\n"
+         "    if (brawl3ds_append_draw(prim, fmt, data + pos, vtxCount, vtxSize, bigEndian)) {\n"
+         "      pos += totalVtxBytes;\n"
+         "      return true;\n"
+         "    }\n"
+         "    // No batch to append to: draw it in full (Aurora's own merge would keep it from the PICA renderer).\n"
+         "    g_gxState.stateDirty = true;\n"
          "  }\n"
          "#endif\n"
          "  if (!g_gxState.zFreeze) update_zfreeze_reference(prim, fmt, data + pos, vtxCount, vtxSize, bigEndian);\n"
          "  // SPM: with the view widened", 1),
-        ("static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian) {\n  ZoneScoped;\n",
+        ("bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,\n"
+         "                     uint32_t vertexBytes) {\n  ZoneScoped;\n",
          "#if defined(__3DS__)\n"
-         "// port/wiicompiled_arm32/aurora3ds/backend_3ds.cpp: appends to the current draw; false when there is none.\n"
+         "// port/wiicompiled_arm32/aurora3ds/backend_3ds.cpp: appends to the current draw (false when there is none),\n"
+         "// and the byte order of the draw being decoded.\n"
          "bool brawl3ds_append_draw(GXPrimitive prim, GXVtxFmt fmt, const u8* vertices, u16 vtxCount, u32 vtxSize,\n"
          "                          bool bigEndian) noexcept;\n"
+         "void brawl3ds_note_draw_endian(bool bigEndian) noexcept;\n"
          "#endif\n"
-         "static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian) {\n  ZoneScoped;\n", 1),
+         "bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,\n"
+         "                     uint32_t vertexBytes) {\n  ZoneScoped;\n"
+         "#if defined(__3DS__)\n"
+         "  brawl3ds_note_draw_endian(false);  // the runtime packs raw draws in host order\n"
+         "#endif\n", 1),
     ])
 
     edit(src / "hle" / "brawl_modules.cpp", [

@@ -63,7 +63,9 @@ void __system_allocateHeaps(void)
     // (~20 MiB in the match). Sized explicitly: with 38 MB of code the 96 MiB regular cap happened to leave 42 MiB
     // linear, but the inline memory accesses grew the code to 55 MB, the old 29 MiB pushed MEM1 into the regular
     // heap, and the runtime ran out of memory in step 4 (std::bad_alloc).
-    constexpr u32 kLinearHeap = 39u * 1024u * 1024u;  // 37 MiB of guest regions + the 1 MiB reserve + slack
+    // 37 MiB of guest regions + the 1 MiB reserve + slack, + 3 MiB for the PICA renderer (citro3d's command buffer,
+    // the per-frame vertex and index buffers: pica_renderer_3ds.cpp).
+    constexpr u32 kLinearHeap = 42u * 1024u * 1024u;
     constexpr u32 kRegularHeapMax = 96u * 1024u * 1024u;  // the kernel's heap window at 0x08000000
 
     Handle limits = 0;
@@ -119,6 +121,11 @@ uint64_t g_windowDraws = 0, g_windowVerts = 0, g_matchDraws = 0, g_matchVerts = 
 uint64_t g_matchDisplayListTicks = 0;  // time in Aurora's GXCallDisplayList during the match
 uint32_t g_pipelineConfigs = 0;
 extern "C" void Brawl3dsRendererTakeStats(uint64_t* displayListTicks, uint32_t* pipelines);
+extern "C" bool Brawl3dsPicaActive();            // aurora3ds/pica_renderer_3ds.cpp
+extern "C" void Brawl3dsPicaScreenshot(const char* path);
+extern "C" uint32_t Brawl3dsPicaTakeDropped();
+extern "C" void Brawl3dsPicaDebugNextFrame();
+uint64_t g_droppedDraws = 0;                     // draws the renderer's per-frame buffers had no room for
 extern "C" void Brawl3dsZonesReset();
 extern "C" void Brawl3dsZonesWrite(std::FILE* f, unsigned frames);
 uint64_t g_matchSum = 0, g_matchWork = 0, g_matchMax = 0;
@@ -344,7 +351,12 @@ void DrawStatusLocked(const char* warning)
     }
     PutText(fb, 1, 27, "START: stop early (results are kept)", kGrey);
     gfxFlushBuffers();
-    gfxSwapBuffers();
+    // Once the PICA renderer owns the top screen (citro3d swaps it), the status screen swaps only its own.
+    if (Brawl3dsPicaActive()) {
+        gfxScreenSwapBuffers(GFX_BOTTOM, false);
+    } else {
+        gfxSwapBuffers();
+    }
 }
 
 void EnterStep(int step)
@@ -670,7 +682,18 @@ extern "C" void Brawl3dsFrameEnd()
     const uint64_t total = g_lastEnd ? now - g_lastEnd : work;
     g_lastEnd = now;
     ++g_frames;
-    Brawl3dsRendererEndFrame();  // the renderer back end's per-frame staging is done with
+    Brawl3dsRendererEndFrame();  // the frame's PICA draws are submitted; the back end's staging is done with
+    g_droppedDraws += Brawl3dsPicaTakeDropped();
+    // The frame before each capture also logs its first batches to stderr.txt (decoded vertex, where it lands).
+    if (g_frames == 699 || g_frames == 1999 || g_frames == 2872) Brawl3dsPicaDebugNextFrame();
+    // Top-screen captures for checking the picture: the safety screen, the title screen, two match frames.
+    if (g_frames == 700 || g_frames == 2000 || g_frames == 2873 || g_frames == 3373) {
+        char path[64];
+        std::snprintf(path, sizeof(path), "sdmc:/3ds/brawl3ds/shot_%u.bmp", g_frames);
+        Brawl3dsPicaScreenshot(path);
+        Log("screenshot: %s (renderer %s, %llu draws dropped so far)\n", path,
+            Brawl3dsPicaActive() ? "active" : "not started", static_cast<unsigned long long>(g_droppedDraws));
+    }
     {
         uint64_t displayListTicks = 0;
         Brawl3dsRendererTakeStats(&displayListTicks, &g_pipelineConfigs);

@@ -42,6 +42,12 @@ extern "C" {
 
 extern "C" void Brawl3dsRendererCountDraw(uint32_t vertices, uint32_t indices);
 
+// pica_renderer_3ds.cpp
+void Brawl3dsPicaDraw(GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, const uint16_t* indices,
+                      uint32_t indexCount, bool bigEndian);
+bool Brawl3dsPicaAppend(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, bool bigEndian);
+void Brawl3dsPicaEndFrame();
+
 namespace {
 constexpr uint32_t kTopWidth = 400;
 constexpr uint32_t kTopHeight = 240;
@@ -124,6 +130,7 @@ aurora::gx::DrawData g_lastDraw{};
 bool g_haveDraw = false;     // g_lastDraw is this frame's current draw (unchanged-state draws append to it)
 GXVtxFmt g_lastDrawFmt = GX_VTXFMT0;
 uint64_t g_appendedDraws = 0, g_appendedVerts = 0;
+bool g_drawBigEndian = true;  // set per draw by Aurora's handle_draw / submit_raw_draw (patch script)
 std::vector<aurora::gx::PipelineConfig> g_pipelines;
 std::unordered_multimap<size_t, size_t> g_pipelineIndex;  // config hash -> index in g_pipelines
 uint64_t g_displayListTicks = 0;  // time in Aurora's GXCallDisplayList (the runtime's display-list draws)
@@ -242,6 +249,10 @@ void push_draw_command(gx::DrawData data)
     g_haveDraw = true;
     g_lastDrawFmt = gx::g_gxState.lastVtxFmt;
     Brawl3dsRendererCountDraw(data.vtxCount, data.indexCount);
+    if (data.expandedPrimitive || data.vtxCount == 0) return;  // lines and points: not drawn yet
+    Brawl3dsPicaDraw(g_lastDrawFmt, g_arena.at(data.vertRange.offset), data.vtxCount,
+                     reinterpret_cast<const uint16_t*>(g_arena.at(data.idxRange.offset)), data.indexCount,
+                     g_drawBigEndian);
 }
 template <>
 void push_draw_command(clear::DrawData)
@@ -410,17 +421,22 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive, GXVtxFmt fmt)
 // handle_draw ahead of its merge path). Milestone 1 counts it; milestone 2 decodes its vertices into the current
 // PICA batch. Lines and points keep Aurora's path (they draw expanded), as does a draw in another vertex format.
 namespace aurora::gx::fifo {
-bool brawl3ds_append_draw(GXPrimitive prim, GXVtxFmt fmt, const u8*, u16 vtxCount, u32, bool) noexcept
+bool brawl3ds_append_draw(GXPrimitive prim, GXVtxFmt fmt, const u8* vertices, u16 vtxCount, u32,
+                          bool bigEndian) noexcept
 {
     if (!g_haveDraw || g_lastDraw.expandedPrimitive || fmt != g_lastDrawFmt || prim == GX_LINES ||
         prim == GX_LINESTRIP || prim == GX_POINTS) {
         return false;
     }
+    if (!Brawl3dsPicaAppend(prim, fmt, vertices, vtxCount, bigEndian)) return false;
     ++g_appendedDraws;
     g_appendedVerts += vtxCount;
     Brawl3dsRendererCountDraw(vtxCount, 0);
     return true;
 }
+
+// The byte order of the draw being decoded: display lists are big-endian, the runtime's packed raw draws are not.
+void brawl3ds_note_draw_endian(bool bigEndian) noexcept { g_drawBigEndian = bigEndian; }
 } // namespace aurora::gx::fifo
 
 // Aurora's ZoneScoped sites (aurora3ds/tracy/Tracy.hpp): per-site inclusive time and calls over the match.
@@ -470,6 +486,7 @@ extern "C" void Brawl3dsRendererTakeStats(uint64_t* displayListTicks, uint32_t* 
 // Called once per game frame by the 3DS frame hook: the staged bytes of the frame are no longer needed.
 extern "C" void Brawl3dsRendererEndFrame()
 {
+    Brawl3dsPicaEndFrame();  // before the arena is reused: the frame's draws are submitted
     g_arena.reset();
     g_storage.clear();
     g_haveDraw = false;  // a new frame has no current draw

@@ -80,8 +80,25 @@ target_include_directories(b3_absl PRIVATE "${DEPS}/abseil-cpp" "${DEPS}/fmt/inc
 target_compile_options(b3_absl PRIVATE -Os -std=gnu++20 -w)
 
 file(GLOB AURORA_GX_SOURCES "${AURORA}/lib/dolphin/gx/*.cpp")
+# The PICA200 vertex shader: picasso -> .shbin -> a byte array (tools/embed_binary.py).
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(GX_SHADER_BIN "${CMAKE_BINARY_DIR}/gx_m2.shbin")
+set(GX_SHADER_CPP "${CMAKE_BINARY_DIR}/gx_m2_shbin.cpp")
+add_custom_command(OUTPUT "${GX_SHADER_CPP}"
+  COMMAND "${DEVKITPRO}/tools/bin/picasso.exe" -o "${GX_SHADER_BIN}" "${PORT}/aurora3ds/gx_m2.v.pica"
+  COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/../../tools/embed_binary.py" "${GX_SHADER_BIN}"
+    brawl3ds_gx_m2_shbin "${GX_SHADER_CPP}"
+  DEPENDS "${PORT}/aurora3ds/gx_m2.v.pica" "${CMAKE_CURRENT_LIST_DIR}/../../tools/embed_binary.py")
+set(SELFTEST_SHADER_BIN "${CMAKE_BINARY_DIR}/selftest.shbin")
+set(SELFTEST_SHADER_CPP "${CMAKE_BINARY_DIR}/selftest_shbin.cpp")
+add_custom_command(OUTPUT "${SELFTEST_SHADER_CPP}"
+  COMMAND "${DEVKITPRO}/tools/bin/picasso.exe" -o "${SELFTEST_SHADER_BIN}" "${PORT}/aurora3ds/selftest.v.pica"
+  COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/../../tools/embed_binary.py" "${SELFTEST_SHADER_BIN}"
+    brawl3ds_selftest_shbin "${SELFTEST_SHADER_CPP}"
+  DEPENDS "${PORT}/aurora3ds/selftest.v.pica" "${CMAKE_CURRENT_LIST_DIR}/../../tools/embed_binary.py")
 add_library(b3_aurora STATIC ${AURORA_GX_SOURCES} "${AURORA}/lib/gx/command_processor.cpp"
-  "${AURORA}/lib/gx/shader_info.cpp" "${AURORA}/lib/gx/fifo.cpp" "${PORT}/aurora3ds/backend_3ds.cpp")
+  "${AURORA}/lib/gx/shader_info.cpp" "${AURORA}/lib/gx/fifo.cpp" "${PORT}/aurora3ds/backend_3ds.cpp"
+  "${PORT}/aurora3ds/pica_renderer_3ds.cpp" "${GX_SHADER_CPP}" "${SELFTEST_SHADER_CPP}")
 brawl3ds_target(b3_aurora)
 target_include_directories(b3_aurora BEFORE PRIVATE "${PORT}/aurora3ds")
 target_include_directories(b3_aurora PRIVATE "${AURORA}/include" "${AURORA}/lib" "${DEPS}/abseil-cpp"
@@ -164,7 +181,7 @@ target_link_libraries(brawl3ds PRIVATE
   -Wl,--whole-archive b3_shards b3_generated b3_runtime -Wl,--no-whole-archive
   -Wl,--start-group b3_aurora b3_absl b3_cryptopp b3_pugixml b3_fatfs b3_xxhash b3_imgui
   "${SDL3_DIR}/lib/libSDL3.a" -Wl,--end-group
-  "-L${CTR_ROOT}/lib" -lctru -lm)
+  "-L${CTR_ROOT}/lib" -lcitro3d -lctru -lm)
 
 add_custom_command(TARGET brawl3ds POST_BUILD
   COMMAND "${DEVKITPRO}/tools/bin/3dsxtool.exe" "$<TARGET_FILE:brawl3ds>" "${CMAKE_BINARY_DIR}/brawl3ds.3dsx"
