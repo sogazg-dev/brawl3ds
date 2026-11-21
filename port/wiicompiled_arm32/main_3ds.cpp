@@ -24,7 +24,11 @@
 #include <string>
 #include <sys/stat.h>
 
+#include <unistd.h>
+
 #include "brawl3ds_fast_tree.h"
+#include "imgui.h"
+#include "memory.h"
 #include "isa/ppc_isa_context.h"
 #include "save_states.h"
 
@@ -376,6 +380,33 @@ int StepForScene(const std::string& scene)
     return g_step;
 }
 
+// Ends the process without libctru's normal exit path. That path runs static destructors and then frees the heap
+// while the runtime's own threads (the AX mix worker, watchdogs) are still running on stacks inside it: Azahar
+// logged ~2,200 "unmapped" reads from the mix worker's stack right after the match ended, which a real 3DS turns
+// into a data abort at exit. svcExitProcess stops every thread first.
+[[noreturn]] void ExitNow()
+{
+    std::fflush(stdout);
+    std::fflush(stderr);
+    if (g_log) std::fclose(g_log);
+    g_log = nullptr;
+    gfxExit();
+    svcExitProcess();
+    for (;;) {
+    }
+}
+
+// The end of a normal run, called from the game's own frame (main thread): results are written, then the process
+// ends here. Asking the runtime to shut down instead (AURORA_EXIT) ends in libctru's exit path, which frees the heap
+// under the still-running mix worker (see ExitNow).
+[[noreturn]] void FinishRun(const char* why)
+{
+    Log("\nrun finished: %s, after %u frames\n", why, g_frames);
+    LogStepSummary();
+    DrawStatus("Finished - results in headless.log");
+    ExitNow();
+}
+
 [[noreturn]] void StopWithMessage(const char* title, const char* detail)
 {
     if (std::FILE* crash = std::fopen("sdmc:/3ds/brawl3ds/crash.txt", "w")) {
@@ -405,8 +436,7 @@ int StepForScene(const std::string& scene)
         gfxSwapBuffers();
         gspWaitForVBlank();
     }
-    gfxExit();
-    std::exit(1);
+    ExitNow();
 }
 
 // CPU exceptions (data abort, undefined instruction, ...): libctru calls OnException on g_exceptionStack in the
@@ -595,6 +625,19 @@ extern "C" void Brawl3dsFrameEnd()
     g_lastEnd = now;
     ++g_frames;
     // Track allocations from frame 10 (past boot) and report what is still held at frame 60: per-frame leaks.
+    if (g_frames == 1) {
+        // Where guest memory and the heap sit in the 3DS address space, to place addresses from crash reports and
+        // Azahar's "unmapped" log lines.
+        Log("memory map: MEM1 host %p, MEM2 host %p (+%u MiB), module homes host %p, heap %08lX-%08lX (sbrk %p), "
+            "linear %08lX-%08lX\n",
+            static_cast<void*>(Memory::GetPointer(Memory::kMem1CachedBase, 4)),
+            static_cast<void*>(Memory::GetPointer(Memory::kMem2CachedBase, 4)),
+            static_cast<unsigned>(Memory::kMem2Size >> 20),
+            static_cast<void*>(Memory::GetPointer(Memory::kModuleHomesBase, 4)),
+            static_cast<unsigned long>(__ctru_heap), static_cast<unsigned long>(__ctru_heap + __ctru_heap_size),
+            sbrk(0), static_cast<unsigned long>(__ctru_linear_heap),
+            static_cast<unsigned long>(__ctru_linear_heap + __ctru_linear_heap_size));
+    }
     if (g_frames == 10) Brawl3dsAllocTrackStart();
     if (g_frames == 60) Brawl3dsAllocTrackDump("sdmc:/3ds/brawl3ds/leaks.txt", g_frames);
 
@@ -608,7 +651,7 @@ extern "C" void Brawl3dsFrameEnd()
         if (matchEnded) {
             WriteMatchSummary();
             EnterStep(kStepResults);
-            g_exitRequested = true;
+            FinishRun("the demo match ended");
         } else {
             EnterStep(StepForScene(scene));
         }
@@ -651,15 +694,19 @@ extern "C" void Brawl3dsFrameEnd()
             WriteWindow();
             WriteMatchSummary();
             EnterStep(kStepResults);
-            g_exitRequested = true;
+            FinishRun("the measurement cap was reached");
         }
     }
 
     // Keep the console responsive (HOME menu, sleep, power button) and let START end the run.
     if ((g_frames & 7u) == 0) {
-        if (!aptMainLoop()) g_exitRequested = true;
+        if (!aptMainLoop()) FinishRun("the system asked the program to close");
         hidScanInput();
-        if (hidKeysDown() & KEY_START) g_exitRequested = true;
+        if (hidKeysDown() & KEY_START) {
+            WriteWindow();
+            WriteMatchSummary();
+            FinishRun("START was pressed");
+        }
         DrawStatus();
     }
 }
@@ -767,6 +814,11 @@ int main(int, char**)
 
     EnterStep(3);
     g_mainGuestContextSlot = &g_currentCpuContext;  // this thread's instance, for the heartbeat's guest sampler
+    // The runtime's overlay code still calls ImGui on every presented frame (cursor auto-hide, ImGui::GetTime, ...)
+    // even though the 3DS never renders an ImGui frame. Without a context those are null-pointer reads: Azahar
+    // logs them as "unmapped Read32" and returns 0, a real New 3DS raises a data abort (settings_overlay::Draw
+    // +0x120, ~30 s into step 4). An empty context makes them ordinary reads of the same zero values.
+    ImGui::CreateContext();
     SDL_SetMainReady();
     char program[] = "sdmc:/3ds/brawl3ds/brawl3ds.3dsx";
     char* argv[] = {program, nullptr};
@@ -776,7 +828,6 @@ int main(int, char**)
     if (g_step != kStepResults) WriteMatchSummary();  // already written when the match measurement completed
     Log("RuntimeMain returned %d after %u frames\n", result, g_frames);
     LogStepSummary();
-    if (g_log) std::fclose(g_log);
-    gfxExit();
-    return result;
+    (void)result;
+    ExitNow();
 }
