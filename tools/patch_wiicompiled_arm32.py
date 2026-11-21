@@ -491,6 +491,14 @@ def main(wiicompiled: Path):
          "static void handle_cp(u8 addr, u32 value, bool bigEndian) {\n  ZoneScopedN(\"handle_cp\");\n", 1),
         ("static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {\n",
          "static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {\n  ZoneScopedN(\"handle_xf\");\n", 1),
+        # read_u16/read_u32 passed the FIFO byte pointer to unaligned_load as `const u16*`/`const u32*`. That cast
+        # tells the compiler the bytes are aligned, so clang merged neighbouring field reads (handle_aurora's
+        # commands) into one ldm, which needs word alignment: a data abort on a real New 3DS 14 frames in (Azahar
+        # does not check). Copy from the byte pointer itself.
+        ("  const u16 val = unaligned_load(reinterpret_cast<const u16*>(ptr));\n",
+         "  u16 val;\n  memcpy(&val, ptr, sizeof(val));  // brawl3ds: from the byte pointer, no alignment assumed\n", 1),
+        ("  const u32 val = unaligned_load(reinterpret_cast<const u32*>(ptr));\n",
+         "  u32 val;\n  memcpy(&val, ptr, sizeof(val));  // brawl3ds: from the byte pointer, no alignment assumed\n", 1),
         ("static const CachedPipelineState& resolve_pipeline_state(GXPrimitive prim, GXVtxFmt fmt) {\n",
          "static const CachedPipelineState& resolve_pipeline_state(GXPrimitive prim, GXVtxFmt fmt) {\n"
          "  ZoneScopedN(\"resolve_pipeline_state\");\n", 1),
