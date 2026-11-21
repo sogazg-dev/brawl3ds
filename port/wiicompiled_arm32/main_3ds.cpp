@@ -114,6 +114,13 @@ uint32_t g_frames = 0, g_matchFrames = 0;
 // Per-second window and match totals (ticks).
 uint64_t g_windowSum = 0, g_windowMin = UINT64_MAX, g_windowMax = 0, g_windowWork = 0;
 uint32_t g_windowFrames = 0;
+// Draws reaching the 3DS renderer back end (aurora3ds/backend_3ds.cpp), per log window and over the match.
+uint64_t g_windowDraws = 0, g_windowVerts = 0, g_matchDraws = 0, g_matchVerts = 0;
+uint64_t g_matchDisplayListTicks = 0;  // time in Aurora's GXCallDisplayList during the match
+uint32_t g_pipelineConfigs = 0;
+extern "C" void Brawl3dsRendererTakeStats(uint64_t* displayListTicks, uint32_t* pipelines);
+extern "C" void Brawl3dsZonesReset();
+extern "C" void Brawl3dsZonesWrite(std::FILE* f, unsigned frames);
 uint64_t g_matchSum = 0, g_matchWork = 0, g_matchMax = 0;
 uint32_t g_matchOver16 = 0, g_matchOver33 = 0;
 std::string g_scene;
@@ -486,9 +493,13 @@ void WriteWindow()
 {
     if (g_windowFrames == 0) return;
     const double avg = TicksToMs(g_windowSum) / g_windowFrames;
-    Log("frame %6u  scene %-16s  avg %6.2f ms (game %6.2f)  min %6.2f  max %6.2f  ~%4.1f fps  malloc %d KiB\n",
+    Log("frame %6u  scene %-16s  avg %6.2f ms (game %6.2f)  min %6.2f  max %6.2f  ~%4.1f fps  malloc %d KiB"
+        "  draws %llu verts %llu\n",
         g_frames, g_scene.c_str(), avg, TicksToMs(g_windowWork) / g_windowFrames, TicksToMs(g_windowMin),
-        TicksToMs(g_windowMax), avg > 0 ? 1000.0 / avg : 0.0, mallinfo().uordblks >> 10);
+        TicksToMs(g_windowMax), avg > 0 ? 1000.0 / avg : 0.0, mallinfo().uordblks >> 10,
+        static_cast<unsigned long long>(g_windowDraws / g_windowFrames),
+        static_cast<unsigned long long>(g_windowVerts / g_windowFrames));
+    g_windowDraws = g_windowVerts = 0;
     g_windowSum = g_windowWork = g_windowMax = 0;
     g_windowMin = UINT64_MAX;
     g_windowFrames = 0;
@@ -499,16 +510,37 @@ void WriteMatchSummary()
     if (g_matchFrames == 0) return;
     const double avg = TicksToMs(g_matchSum) / g_matchFrames;
     Brawl3dsProfilerWrite("sdmc:/3ds/brawl3ds/profile.txt", g_matchFrames, avg);
+    Brawl3dsZonesWrite(g_log, g_matchFrames);
     Log("\n== VS demo match: %u frames measured ==\n"
         "average frame  %.2f ms (%.1f fps)\n"
         "average game   %.2f ms (time between aurora_begin_frame and aurora_end_frame)\n"
         "worst frame    %.2f ms\n"
         "frames > 16.7 ms (miss 60 fps): %u (%.1f%%)\n"
-        "frames > 33.3 ms (miss 30 fps): %u (%.1f%%)\n",
+        "frames > 33.3 ms (miss 30 fps): %u (%.1f%%)\n"
+        "renderer back end: %.0f draws and %.0f vertices per frame, %.2f ms per frame in GXCallDisplayList, "
+        "%u pipeline configs\n",
         g_matchFrames, avg, avg > 0 ? 1000.0 / avg : 0.0, TicksToMs(g_matchWork) / g_matchFrames,
         TicksToMs(g_matchMax), g_matchOver16, 100.0 * g_matchOver16 / g_matchFrames, g_matchOver33,
-        100.0 * g_matchOver33 / g_matchFrames);
+        100.0 * g_matchOver33 / g_matchFrames, static_cast<double>(g_matchDraws) / g_matchFrames,
+        static_cast<double>(g_matchVerts) / g_matchFrames, TicksToMs(g_matchDisplayListTicks) / g_matchFrames,
+        g_pipelineConfigs);
 }
+
+}  // namespace
+
+// The renderer back end's draw count (aurora3ds/backend_3ds.cpp), one call per GX draw that reaches it.
+extern "C" void Brawl3dsRendererCountDraw(uint32_t vertices, uint32_t)
+{
+    ++g_windowDraws;
+    g_windowVerts += vertices;
+    if (g_scene == "scMelee") {
+        ++g_matchDraws;
+        g_matchVerts += vertices;
+    }
+}
+extern "C" void Brawl3dsRendererEndFrame();
+
+namespace {
 
 // Latest non-empty line of stdout.txt, without colour escapes, for the status screen.
 void ReadLastLine(long size)
@@ -638,6 +670,12 @@ extern "C" void Brawl3dsFrameEnd()
     const uint64_t total = g_lastEnd ? now - g_lastEnd : work;
     g_lastEnd = now;
     ++g_frames;
+    Brawl3dsRendererEndFrame();  // the renderer back end's per-frame staging is done with
+    {
+        uint64_t displayListTicks = 0;
+        Brawl3dsRendererTakeStats(&displayListTicks, &g_pipelineConfigs);
+        if (g_scene == "scMelee") g_matchDisplayListTicks += displayListTicks;
+    }
     // Track allocations from frame 10 (past boot) and report what is still held at frame 60: per-frame leaks.
     if (g_frames == 1) {
         // Where guest memory and the heap sit in the 3DS address space, to place addresses from crash reports and
@@ -697,7 +735,10 @@ extern "C" void Brawl3dsFrameEnd()
     if (++g_windowFrames >= (g_scene == "scMelee" ? 60u : 10u)) WriteWindow();  // finer before the match: memory growth
 
     if (g_scene == "scMelee") {
-        if (g_matchFrames == 0) Brawl3dsProfilerSetRecording(true);  // profile.txt: the match only
+        if (g_matchFrames == 0) {
+            Brawl3dsProfilerSetRecording(true);  // profile.txt: the match only
+            Brawl3dsZonesReset();                // and Aurora's zone timers
+        }
         ++g_matchFrames;
         g_matchSum += total;
         g_matchWork += work;

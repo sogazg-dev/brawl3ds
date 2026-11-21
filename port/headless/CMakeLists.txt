@@ -68,6 +68,36 @@ add_library(b3_imgui STATIC ${IMGUI_SOURCES})
 brawl3ds_target(b3_imgui)
 target_compile_options(b3_imgui PRIVATE -Os -std=gnu++20)
 
+# --- Aurora's GX front end (docs/RENDERER_3DS.md): the GX API state and the command processor, unchanged, over the
+# 3DS back end in port/wiicompiled_arm32/aurora3ds (whose webgpu/webgpu_cpp.h stands in for Dawn's header). It needs
+# abseil's hash tables and fmt (Aurora's logging); Tracy compiles to nothing without TRACY_ENABLE.
+set(AURORA "${W}/aurora-main")
+set(DEPS "${W}/Dependencies")
+add_library(b3_absl STATIC "${DEPS}/abseil-cpp/absl/container/internal/raw_hash_set.cc"
+  "${DEPS}/abseil-cpp/absl/hash/internal/hash.cc" "${DEPS}/abseil-cpp/absl/hash/internal/city.cc"
+  "${DEPS}/abseil-cpp/absl/hash/internal/low_level_hash.cc" "${DEPS}/fmt/src/format.cc")
+target_include_directories(b3_absl PRIVATE "${DEPS}/abseil-cpp" "${DEPS}/fmt/include")
+target_compile_options(b3_absl PRIVATE -Os -std=gnu++20 -w)
+
+file(GLOB AURORA_GX_SOURCES "${AURORA}/lib/dolphin/gx/*.cpp")
+add_library(b3_aurora STATIC ${AURORA_GX_SOURCES} "${AURORA}/lib/gx/command_processor.cpp"
+  "${AURORA}/lib/gx/shader_info.cpp" "${AURORA}/lib/gx/fifo.cpp" "${PORT}/aurora3ds/backend_3ds.cpp")
+brawl3ds_target(b3_aurora)
+target_include_directories(b3_aurora BEFORE PRIVATE "${PORT}/aurora3ds")
+target_include_directories(b3_aurora PRIVATE "${AURORA}/include" "${AURORA}/lib" "${DEPS}/abseil-cpp"
+  "${DEPS}/fmt/include" "${DEPS}/tracy/public" "${AURORA}/extern")
+# newlib's unqualified log2 is the double one, so shader_info.cpp's float initializer narrows.
+target_compile_options(b3_aurora PRIVATE -Os -std=gnu++20 -Wno-c++11-narrowing)
+
+# The generated stubs minus the functions b3_aurora now defines (port/headless/stubs_replaced_by_aurora.txt).
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(LINK_STUBS "${CMAKE_BINARY_DIR}/link_stubs_filtered.cpp")
+add_custom_command(OUTPUT "${LINK_STUBS}"
+  COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/../../tools/filter_link_stubs.py"
+    "${GEN3DS_DIR}/link_stubs.cpp" "${CMAKE_CURRENT_LIST_DIR}/stubs_replaced_by_aurora.txt" "${LINK_STUBS}"
+  DEPENDS "${GEN3DS_DIR}/link_stubs.cpp" "${CMAKE_CURRENT_LIST_DIR}/stubs_replaced_by_aurora.txt"
+    "${CMAKE_CURRENT_LIST_DIR}/../../tools/filter_link_stubs.py")
+
 # --- runtime ---
 file(GLOB_RECURSE RUNTIME_SOURCES "${RT}/src/*.cpp")
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/(android|macos)/")
@@ -113,7 +143,7 @@ endif()
 # --- the program ---
 add_executable(brawl3ds "${PORT}/main_3ds.cpp" "${PORT}/aurora_headless_3ds.cpp"
   "${PORT}/posix_and_aurora_extras_3ds.cpp" "${PORT}/alloc_tracker_3ds.cpp" "${PORT}/fast_tree_3ds.cpp" "${PORT}/profiler_3ds.cpp"
-  "${GEN3DS_DIR}/link_stubs.cpp")
+  "${LINK_STUBS}")
 brawl3ds_target(brawl3ds)
 target_compile_options(brawl3ds PRIVATE -O2 -std=gnu++20 -include "${RT}/include/mkw_pch.h")
 set_target_properties(brawl3ds PROPERTIES SUFFIX ".elf")
@@ -125,12 +155,14 @@ set(CMAKE_CXX_LINK_EXECUTABLE
   "\"${DKA_GXX}\" <CMAKE_CXX_LINK_FLAGS> <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
 target_link_options(brawl3ds PRIVATE "-Wl,-Map,${CMAKE_BINARY_DIR}/brawl3ds.map" -Wl,--gc-sections
   # Live-allocation tracker (alloc_tracker_3ds.cpp).
-  -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free -Wl,--wrap=_Znwj -Wl,--wrap=_Znaj -Wl,--wrap=rename)
+  -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free -Wl,--wrap=_Znwj -Wl,--wrap=_Znaj -Wl,--wrap=rename
+  # The renderer back end times the runtime's display-list draws (aurora3ds/backend_3ds.cpp).
+  -Wl,--wrap=GXCallDisplayList)
 # The runtime registers its HLE functions and the translator's function tables through static initializers that
 # nothing references by name, so those archives must be linked whole (the PC build links them as object libraries).
 target_link_libraries(brawl3ds PRIVATE
   -Wl,--whole-archive b3_shards b3_generated b3_runtime -Wl,--no-whole-archive
-  -Wl,--start-group b3_cryptopp b3_pugixml b3_fatfs b3_xxhash b3_imgui
+  -Wl,--start-group b3_aurora b3_absl b3_cryptopp b3_pugixml b3_fatfs b3_xxhash b3_imgui
   "${SDL3_DIR}/lib/libSDL3.a" -Wl,--end-group
   "-L${CTR_ROOT}/lib" -lctru -lm)
 

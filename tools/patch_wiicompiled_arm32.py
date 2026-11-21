@@ -475,6 +475,50 @@ def main(wiicompiled: Path):
         "#define BRAWL3DS_PRISTINE(index) g_pristine[index]\n"
         "#define BRAWL3DS_PRISTINE_MISSING(index) g_pristine[index].empty()\n"
         "#endif\n")
+    # Aurora's command processor (linked on the 3DS for the renderer, docs/RENDERER_3DS.md) keeps a 1,024-entry
+    # pipeline-state cache of full configs and shader infos: 2.9 MB of static data, all of it out of the regular heap
+    # on the 3DS. A Brawl frame uses far fewer distinct pipeline states; 128 entries is about 360 KB.
+    edit(wiicompiled / "aurora-main" / "lib" / "gx" / "command_processor.cpp", [
+        ("  constexpr size_t CacheSize = 1024;\n  struct Entry {\n",
+         "#if defined(__3DS__)\n  constexpr size_t CacheSize = 128;\n#else\n  constexpr size_t CacheSize = 1024;\n#endif\n"
+         "  struct Entry {\n", 1),
+        # Extra Tracy zones on the per-command handlers. On the PC they cost nothing without TRACY_ENABLE; on the 3DS
+        # aurora3ds/tracy/Tracy.hpp turns every zone into a per-site timer reported in headless.log, which is how the
+        # front end's cost per match frame is broken down on the console.
+        ("static void handle_bp(u32 value, bool bigEndian) {\n",
+         "static void handle_bp(u32 value, bool bigEndian) {\n  ZoneScopedN(\"handle_bp\");\n", 1),
+        ("static void handle_cp(u8 addr, u32 value, bool bigEndian) {\n",
+         "static void handle_cp(u8 addr, u32 value, bool bigEndian) {\n  ZoneScopedN(\"handle_cp\");\n", 1),
+        ("static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {\n",
+         "static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {\n  ZoneScopedN(\"handle_xf\");\n", 1),
+        ("static const CachedPipelineState& resolve_pipeline_state(GXPrimitive prim, GXVtxFmt fmt) {\n",
+         "static const CachedPipelineState& resolve_pipeline_state(GXPrimitive prim, GXVtxFmt fmt) {\n"
+         "  ZoneScopedN(\"resolve_pipeline_state\");\n", 1),
+        # Brawl sends ~11,000 GX draws per match frame, ~10,700 of them with no state change since the previous one.
+        # Aurora merges those into the previous WebGPU draw, but first runs the z-freeze reference, its diagnostics,
+        # a vertex copy and a triangle-list index expansion for each: 13 us a draw in Azahar, ~140 ms a frame. The
+        # PICA200 draws strips and fans itself and the 3DS back end reads every vertex once anyway, so on the 3DS an
+        # unchanged-state draw goes straight to the back end as an append to its current draw. State changes (~555 a
+        # frame) still take Aurora's full path, which builds the pipeline state and uniforms the back end draws with.
+        ("  if (!g_gxState.zFreeze) update_zfreeze_reference(prim, fmt, data + pos, vtxCount, vtxSize, bigEndian);\n"
+         "  // SPM: with the view widened",
+         "#if defined(__3DS__)\n"
+         "  if (!g_gxState.stateDirty && brawl3ds_append_draw(prim, fmt, data + pos, vtxCount, vtxSize, bigEndian)) {\n"
+         "    pos += totalVtxBytes;\n"
+         "    return true;\n"
+         "  }\n"
+         "#endif\n"
+         "  if (!g_gxState.zFreeze) update_zfreeze_reference(prim, fmt, data + pos, vtxCount, vtxSize, bigEndian);\n"
+         "  // SPM: with the view widened", 1),
+        ("static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian) {\n  ZoneScoped;\n",
+         "#if defined(__3DS__)\n"
+         "// port/wiicompiled_arm32/aurora3ds/backend_3ds.cpp: appends to the current draw; false when there is none.\n"
+         "bool brawl3ds_append_draw(GXPrimitive prim, GXVtxFmt fmt, const u8* vertices, u16 vtxCount, u32 vtxSize,\n"
+         "                          bool bigEndian) noexcept;\n"
+         "#endif\n"
+         "static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian) {\n  ZoneScoped;\n", 1),
+    ])
+
     edit(src / "hle" / "brawl_modules.cpp", [
         ("#include <cstring>\n#include <mutex>\n", "#include <algorithm>\n#include <cstdio>\n#include <cstring>\n"
          "#include <mutex>\n#include <stdexcept>\n#include <string>\n", 1),

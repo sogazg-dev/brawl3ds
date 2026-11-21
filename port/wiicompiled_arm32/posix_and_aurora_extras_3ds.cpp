@@ -52,17 +52,11 @@ int chmod(const char*, mode_t)
     return 0;
 }
 
-// Aurora command_processor's SPM bring-up diagnostics (all off).
-int g_spmDrawDump = 0;
-int g_spmCullOff = 0;
-int g_spmSweepDump = 0;
-unsigned g_spmDrawIdx = 0;
-unsigned g_spmDrawLimit = 0;
-unsigned g_spmAudit[8] = {};
-
-// Aurora-internal GX entry points (runtime/src/hle/gx/gx_stubs.cpp, gx_init.cpp declare them locally).
-void __GXSetSUTexRegs() {}
-bool GXDisplayListIsEmpty() { return true; }
+// Aurora's command_processor diagnostics (g_spm*), __GXSetSUTexRegs and GXDisplayListIsEmpty are Aurora's own now
+// (b3_aurora, renderer milestone 1).
+// Aurora's debug-group markers: no GPU debugger on the 3DS.
+extern "C" void aurora_push_debug_group(const char*) {}
+extern "C" void aurora_pop_debug_group() {}
 // PNG decoding for the PC settings overlay's button art; nothing to show on the 3DS timing build.
 unsigned char* aurora_load_png_rgba(const char*, unsigned* width, unsigned* height)
 {

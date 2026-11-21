@@ -50,7 +50,5 @@ extern "C" void aurora_end_frame()
     Brawl3dsFrameEnd();
 }
 
-namespace aurora::gx::fifo {
-// Packed raw draws are accepted and dropped: there is no renderer in the timing build.
-bool submit_raw_draw(GXPrimitive, GXVtxFmt, const uint8_t*, uint16_t, uint32_t) { return true; }
-} // namespace aurora::gx::fifo
+// aurora::gx::fifo::submit_raw_draw (packed draws) is Aurora's own now: lib/gx/command_processor.cpp, linked through
+// b3_aurora with the 3DS back end (port/wiicompiled_arm32/aurora3ds/backend_3ds.cpp).
