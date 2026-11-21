@@ -409,20 +409,26 @@ int StepForScene(const std::string& scene)
     std::exit(1);
 }
 
-// CPU exceptions (data abort, undefined instruction, ...): libctru calls this on its own stack; it records the
-// registers and redirects the faulting thread into CrashReport, which may use the file system.
-alignas(8) uint8_t g_exceptionStack[16 * 1024];
+// CPU exceptions (data abort, undefined instruction, ...): libctru calls OnException on g_exceptionStack in the
+// faulting thread, which reports from there and never returns. (Redirecting the thread's pc/sp into the report
+// instead crashed a second time on a real New 3DS, losing the first fault's address.)
+alignas(8) uint8_t g_exceptionStack[64 * 1024];
 ERRF_ExceptionInfo g_exceptionInfo;
 CpuRegisters g_exceptionRegs;
 
 [[noreturn]] void CrashReport()
 {
-    char detail[256];
+    const CpuRegisters& r = g_exceptionRegs;
+    const auto u = [](u32 v) { return static_cast<unsigned long>(v); };
+    char detail[512];
     std::snprintf(detail, sizeof(detail),
-                  "exception type %d at pc=%08lX lr=%08lX sp=%08lX\nfault address %08lX (fsr %08lX)",
-                  static_cast<int>(g_exceptionInfo.type), static_cast<unsigned long>(g_exceptionRegs.pc),
-                  static_cast<unsigned long>(g_exceptionRegs.lr), static_cast<unsigned long>(g_exceptionRegs.sp),
-                  static_cast<unsigned long>(g_exceptionInfo.far), static_cast<unsigned long>(g_exceptionInfo.fsr));
+                  "exception type %d at pc=%08lX lr=%08lX sp=%08lX\nfault address %08lX (fsr %08lX) cpsr %08lX\n"
+                  "r0 %08lX r1 %08lX r2 %08lX r3 %08lX\nr4 %08lX r5 %08lX r6 %08lX r7 %08lX\n"
+                  "r8 %08lX r9 %08lX r10 %08lX r11 %08lX r12 %08lX\nguest lr %08lX sp %08lX (heartbeat sample)",
+                  static_cast<int>(g_exceptionInfo.type), u(r.pc), u(r.lr), u(r.sp), u(g_exceptionInfo.far),
+                  u(g_exceptionInfo.fsr), u(r.cpsr), u(r.r[0]), u(r.r[1]), u(r.r[2]), u(r.r[3]), u(r.r[4]), u(r.r[5]),
+                  u(r.r[6]), u(r.r[7]), u(r.r[8]), u(r.r[9]), u(r.r[10]), u(r.r[11]), u(r.r[12]), u(g_sampleLr),
+                  u(g_sampleSp));
     StopWithMessage("CPU exception", detail);
 }
 
@@ -430,9 +436,7 @@ void OnException(ERRF_ExceptionInfo* info, CpuRegisters* regs)
 {
     g_exceptionInfo = *info;
     g_exceptionRegs = *regs;
-    regs->pc = reinterpret_cast<u32>(&CrashReport);
-    regs->sp = reinterpret_cast<u32>(g_exceptionStack + sizeof(g_exceptionStack) - 4096);  // leave room
-    regs->cpsr &= ~(1u << 5);  // CrashReport is ARM code
+    CrashReport();  // on g_exceptionStack; locks this thread holds are recursive, so stdio and malloc still work
 }
 
 void WriteWindow()
@@ -730,6 +734,10 @@ int main(int, char**)
 
     // Deterministic mode: guest clocks follow frames, so the attract demo is the same match on every run.
     setenv("NSMBW_DETERMINISTIC", "1", 1);
+    // No sound output in this CPU timing build: SDL's dummy driver instead of the 3DS DSP (ndsp). The game still
+    // mixes its audio. On a real New 3DS, opening the ndsp device during start-up raised a CPU exception
+    // (registers pointing into ndspVars, 44100 Hz); that is for the audio phase, not this measurement.
+    setenv("SDL_AUDIO_DRIVER", "dummy", 1);
 
     // From here on the runtime's own output goes to a file; the screen keeps the instructions above.
     std::freopen("sdmc:/3ds/brawl3ds/stdout.txt", "w", stdout);
