@@ -384,6 +384,8 @@ int StepForScene(const std::string& scene)
 // while the runtime's own threads (the AX mix worker, watchdogs) are still running on stacks inside it: Azahar
 // logged ~2,200 "unmapped" reads from the mix worker's stack right after the match ended, which a real 3DS turns
 // into a data abort at exit. svcExitProcess stops every thread first.
+// aptExit comes first: it tells the HOME Menu that the application is closing. Without it (first real-hardware
+// run that reached the end) the HOME Menu never got control back and the console asked to be restarted.
 [[noreturn]] void ExitNow()
 {
     std::fflush(stdout);
@@ -391,6 +393,7 @@ int StepForScene(const std::string& scene)
     if (g_log) std::fclose(g_log);
     g_log = nullptr;
     gfxExit();
+    aptExit();
     svcExitProcess();
     for (;;) {
     }
@@ -582,7 +585,7 @@ void HeartbeatThread(void*)
             g_log = nullptr;
             DrawStatus("Stopped with START. Closing...");
             svcSleepThread(1500000000LL);
-            svcExitProcess();
+            ExitNow();
         }
         g_heartbeatWait = nullptr;
         DrawStatus(g_hungReported ? "No output for 10 min: probably stuck. START exits; send stdout.txt"
