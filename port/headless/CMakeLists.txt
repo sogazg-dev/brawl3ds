@@ -82,23 +82,17 @@ target_compile_options(b3_absl PRIVATE -Os -std=gnu++20 -w)
 file(GLOB AURORA_GX_SOURCES "${AURORA}/lib/dolphin/gx/*.cpp")
 # The PICA200 vertex shader: picasso -> .shbin -> a byte array (tools/embed_binary.py).
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
-set(GX_SHADER_BIN "${CMAKE_BINARY_DIR}/gx_m2.shbin")
-set(GX_SHADER_CPP "${CMAKE_BINARY_DIR}/gx_m2_shbin.cpp")
+set(GX_SHADER_BIN "${CMAKE_BINARY_DIR}/gx_m3.shbin")
+set(GX_SHADER_CPP "${CMAKE_BINARY_DIR}/gx_m3_shbin.cpp")
 add_custom_command(OUTPUT "${GX_SHADER_CPP}"
-  COMMAND "${DEVKITPRO}/tools/bin/picasso.exe" -o "${GX_SHADER_BIN}" "${PORT}/aurora3ds/gx_m2.v.pica"
+  COMMAND "${DEVKITPRO}/tools/bin/picasso.exe" -o "${GX_SHADER_BIN}" "${PORT}/aurora3ds/gx_m3.v.pica"
   COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/../../tools/embed_binary.py" "${GX_SHADER_BIN}"
-    brawl3ds_gx_m2_shbin "${GX_SHADER_CPP}"
-  DEPENDS "${PORT}/aurora3ds/gx_m2.v.pica" "${CMAKE_CURRENT_LIST_DIR}/../../tools/embed_binary.py")
-set(SELFTEST_SHADER_BIN "${CMAKE_BINARY_DIR}/selftest.shbin")
-set(SELFTEST_SHADER_CPP "${CMAKE_BINARY_DIR}/selftest_shbin.cpp")
-add_custom_command(OUTPUT "${SELFTEST_SHADER_CPP}"
-  COMMAND "${DEVKITPRO}/tools/bin/picasso.exe" -o "${SELFTEST_SHADER_BIN}" "${PORT}/aurora3ds/selftest.v.pica"
-  COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/../../tools/embed_binary.py" "${SELFTEST_SHADER_BIN}"
-    brawl3ds_selftest_shbin "${SELFTEST_SHADER_CPP}"
-  DEPENDS "${PORT}/aurora3ds/selftest.v.pica" "${CMAKE_CURRENT_LIST_DIR}/../../tools/embed_binary.py")
+    brawl3ds_gx_m3_shbin "${GX_SHADER_CPP}"
+  DEPENDS "${PORT}/aurora3ds/gx_m3.v.pica" "${CMAKE_CURRENT_LIST_DIR}/../../tools/embed_binary.py")
 add_library(b3_aurora STATIC ${AURORA_GX_SOURCES} "${AURORA}/lib/gx/command_processor.cpp"
   "${AURORA}/lib/gx/shader_info.cpp" "${AURORA}/lib/gx/fifo.cpp" "${PORT}/aurora3ds/backend_3ds.cpp"
-  "${PORT}/aurora3ds/pica_renderer_3ds.cpp" "${GX_SHADER_CPP}" "${SELFTEST_SHADER_CPP}")
+  "${PORT}/aurora3ds/pica_renderer_3ds.cpp" "${PORT}/aurora3ds/pica_tev_3ds.cpp"
+  "${PORT}/aurora3ds/pica_texture_3ds.cpp" "${PORT}/aurora3ds/gx_texture_decode.cpp" "${GX_SHADER_CPP}")
 brawl3ds_target(b3_aurora)
 target_include_directories(b3_aurora BEFORE PRIVATE "${PORT}/aurora3ds")
 target_include_directories(b3_aurora PRIVATE "${AURORA}/include" "${AURORA}/lib" "${DEPS}/abseil-cpp"
@@ -107,6 +101,7 @@ target_include_directories(b3_aurora PRIVATE "${AURORA}/include" "${AURORA}/lib"
 target_compile_options(b3_aurora PRIVATE -Os -std=gnu++20 -Wno-c++11-narrowing)
 # The per-draw hot path (FIFO parsing, vertex conversion) runs ~11,000 times a match frame: -O2 there.
 set_source_files_properties("${AURORA}/lib/gx/command_processor.cpp" "${PORT}/aurora3ds/pica_renderer_3ds.cpp"
+  "${PORT}/aurora3ds/pica_tev_3ds.cpp" "${PORT}/aurora3ds/pica_texture_3ds.cpp" "${PORT}/aurora3ds/gx_texture_decode.cpp"
   "${PORT}/aurora3ds/backend_3ds.cpp" TARGET_DIRECTORY b3_aurora PROPERTIES COMPILE_OPTIONS -O2)
 
 # The generated stubs minus the functions b3_aurora now defines (port/headless/stubs_replaced_by_aurora.txt).

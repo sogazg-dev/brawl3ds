@@ -1,40 +1,43 @@
-// PICA200 draw path for Aurora's GX front end on the 3DS (renderer milestone 2, docs/RENDERER_3DS.md): GX draws as
-// untextured geometry with vertex colors on the top screen.
+// PICA200 draw path for Aurora's GX front end on the 3DS (docs/RENDERER_3DS.md). Milestone 3: textures, TEV
+// (pica_tev_3ds.cpp), alpha test, blending, depth and culling.
 //
 // A batch is one full draw from Aurora (backend_3ds.cpp's push_draw_command: a GX state change, with its
-// triangle-list indices) plus the unchanged-state draws appended to it (brawl3ds_append_draw). Each GX vertex is
-// decoded on the CPU from the current vertex format (direct or indexed attributes, either byte order) into
-// position / color / matrix row; the vertex shader (gx_m2.v.pica) applies the vertex's GX position matrix and the
-// GX projection, uploaded as uniforms when the batch starts. Batches go to citro3d as indexed triangle lists into
-// per-frame linear-memory buffers; the frame begins at its first draw and ends in Brawl3dsPicaEndFrame.
-// Not yet: textures, TEV, lighting, blending, depth, culling, viewport/scissor (whole screen), EFB copies.
+// triangle-list indices) plus the unchanged-state draws appended to it (brawl3ds_append_draw). At a batch's start
+// the GX state is translated (ApplyMaterial), its textures bound (pica_texture_3ds.cpp) and the GX matrices
+// uploaded. Each GX vertex is decoded on the CPU from the current vertex format into position, channel color,
+// matrix row and up to two texture-coordinate sets; the vertex shader (gx_m3.v.pica) applies the GX position
+// matrix, the projection and the texture-coordinate generators. Batches go to citro3d as indexed triangle lists
+// into per-frame linear-memory buffers; the frame begins at its first draw and ends in Brawl3dsPicaEndFrame.
+// Not yet: lighting (the channel color is approximated), fog, indirect textures, viewport/scissor, EFB copies.
 
-#include "gx/gx.hpp"
+#include "pica_internal.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
-#include <citro3d.h>
-
-extern "C" const unsigned char brawl3ds_gx_m2_shbin[];
-extern "C" const unsigned int brawl3ds_gx_m2_shbin_size;
-extern "C" const unsigned char brawl3ds_selftest_shbin[];
-extern "C" const unsigned int brawl3ds_selftest_shbin_size;
+extern "C" const unsigned char brawl3ds_gx_m3_shbin[];
+extern "C" const unsigned int brawl3ds_gx_m3_shbin_size;
 
 namespace {
 using namespace aurora::gx;
+using namespace brawl3ds_pica;
 
 struct PicaVertex {
     float x, y, z;
-    uint8_t r, g, b, a;
-    uint8_t row;  // GX matrix row of the position matrix (0, 3, ..., 27)
-    uint8_t pad[3];
+    uint8_t r, g, b, a;   // the GX channel color (COLOR0A0)
+    uint8_t row;          // GX matrix row of the position matrix (0, 3, ..., 27)
+    uint8_t pad;
+    int16_t uv[2];        // one texture-coordinate set in 1/512 steps (+-64; MaterialPlan::uvAttr[0])
+    uint8_t pad2[2];
 };
-static_assert(sizeof(PicaVertex) == 20);
+static_assert(sizeof(PicaVertex) == 24);
+constexpr float kUvScale = 512.0f;  // gx_m3.v.pica multiplies by 1/512
 
-constexpr uint32_t kMaxVertices = 80 * 1024;   // per frame; Brawl's match draws ~69,000
+// Linear memory is nearly all guest RAM: these buffers, citro3d's command buffer and the texture staging buffer
+// have to fit in the ~3.5 MiB it leaves (main_3ds.cpp's kLinearHeap).
+constexpr uint32_t kMaxVertices = 78 * 1024;   // per frame; Brawl's match draws up to ~74,400
 constexpr uint32_t kMaxIndices = 160 * 1024;
 constexpr uint32_t kDisplayFlags =
     GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |
@@ -47,73 +50,74 @@ bool g_frameOpen = false;
 C3D_RenderTarget* g_target = nullptr;
 DVLB_s* g_dvlb = nullptr;
 shaderProgram_s g_program;
-int g_projLoc = -1, g_mtxLoc = -1;
+int g_projLoc = -1, g_mtxLoc = -1, g_texMtxLoc = -1, g_texSrcLoc = -1;
 PicaVertex* g_vertices = nullptr;
 uint16_t* g_indices = nullptr;
 uint32_t g_vtxUsed = 0, g_idxUsed = 0;
-// The open batch: its first vertex and index in the frame buffers.
+// The open batch: its first vertex and index in the frame buffers, and its material.
 uint32_t g_batchVtx = 0, g_batchIdx = 0;
-// Milestone 2 has no textures or TEV yet: a vertex without its own color gets its batch's false color, so the
-// shapes stay distinguishable in the screenshots (everything untextured was white).
-uint32_t g_batchSerial = 0;
-uint8_t g_falseColor[3] = {255, 255, 255};
 bool g_batchOpen = false;
+MaterialPlan g_plan;
 uint32_t g_droppedDraws = 0;
-const uint8_t* g_lastTopFramebuffer = nullptr;  // for Brawl3dsPicaScreenshot
 bool g_debugFrame = false;  // Brawl3dsPicaDebugNextFrame: log the next frame's first batches
 uint32_t g_debugBatches = 0;
-// citro3d's command buffer: a match frame has ~555 batches, each uploading 34 uniform vectors plus its draw, over
-// the 256 KiB default (svcBreak PANIC in Azahar at the match start).
-constexpr size_t kCommandBufferSize = 640 * 1024;
-
-void ApplyFixedState();
-void SelfTest();
+const uint8_t* g_lastTopFramebuffer = nullptr;  // for the screenshots
+// citro3d's command buffer: a match frame has ~555 batches, each uploading ~46 uniform vectors, its combiners,
+// textures and fragment state, plus its draw (~1 KiB a batch).
+constexpr size_t kCommandBufferSize = 768 * 1024;
 
 bool Init()
 {
     if (g_ready || g_failed) return g_ready;
     g_failed = true;  // until everything below succeeded
-    if (!C3D_Init(kCommandBufferSize)) return false;
+    auto fail = [](const char* what) {
+        std::fprintf(stderr, "[pica] renderer NOT started: %s failed (%u KiB linear, %u KiB VRAM free)\n", what,
+                     static_cast<unsigned>(linearSpaceFree() >> 10), static_cast<unsigned>(vramSpaceFree() >> 10));
+        return false;
+    };
+    if (!C3D_Init(kCommandBufferSize)) return fail("C3D_Init");
     g_target = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
-    if (!g_target) return false;
+    if (!g_target) return fail("the render target");
     C3D_RenderTargetSetOutput(g_target, GFX_TOP, GFX_LEFT, kDisplayFlags);
-    g_dvlb = DVLB_ParseFile(reinterpret_cast<u32*>(const_cast<unsigned char*>(brawl3ds_gx_m2_shbin)),
-                            brawl3ds_gx_m2_shbin_size);
-    if (!g_dvlb) return false;
+    g_dvlb = DVLB_ParseFile(reinterpret_cast<u32*>(const_cast<unsigned char*>(brawl3ds_gx_m3_shbin)),
+                            brawl3ds_gx_m3_shbin_size);
+    if (!g_dvlb) return fail("the shader");
     shaderProgramInit(&g_program);
     shaderProgramSetVsh(&g_program, &g_dvlb->DVLE[0]);
     g_projLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "proj");
     g_mtxLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "posmtx");
+    g_texMtxLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "texmtx");
+    g_texSrcLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "texsrc");
     g_vertices = static_cast<PicaVertex*>(linearAlloc(sizeof(PicaVertex) * kMaxVertices));
+    if (!g_vertices) return fail("the vertex buffer");
     g_indices = static_cast<uint16_t*>(linearAlloc(sizeof(uint16_t) * kMaxIndices));
-    if (!g_vertices || !g_indices) return false;
-    std::fprintf(stderr, "[pica] renderer ready: %u vertices, %u indices per frame (%u KiB linear)\n", kMaxVertices,
-                 kMaxIndices,
-                 static_cast<unsigned>((sizeof(PicaVertex) * kMaxVertices + 2 * kMaxIndices) >> 10));
+    if (!g_indices) return fail("the index buffer");
+    std::fprintf(stderr,
+                 "[pica] renderer ready: %u vertices, %u indices per frame (%u KiB linear), uniforms %d %d %d %d; "
+                 "%u KiB linear, %u KiB VRAM free\n",
+                 kMaxVertices, kMaxIndices,
+                 static_cast<unsigned>((sizeof(PicaVertex) * kMaxVertices + 2 * kMaxIndices) >> 10), g_projLoc,
+                 g_mtxLoc, g_texMtxLoc, g_texSrcLoc, static_cast<unsigned>(linearSpaceFree() >> 10),
+                 static_cast<unsigned>(vramSpaceFree() >> 10));
     g_failed = false;
     g_ready = true;
-    SelfTest();
     return true;
 }
 
-// The fixed state of milestone 2; set at the start of every frame (citro3d keeps it, but other code may not).
+// The state that does not change between batches; set at the start of every frame.
 void ApplyFixedState()
 {
     C3D_BindProgram(&g_program);
     C3D_AttrInfo* attr = C3D_GetAttrInfo();
     AttrInfo_Init(attr);
     AttrInfo_AddLoader(attr, 0, GPU_FLOAT, 3);          // position
-    AttrInfo_AddLoader(attr, 1, GPU_UNSIGNED_BYTE, 4);  // color
-    AttrInfo_AddLoader(attr, 2, GPU_UNSIGNED_BYTE, 4);  // matrix row (+ padding)
-    C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
-    C3D_CullFace(GPU_CULL_NONE);
-    C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
-    C3D_AlphaTest(false, GPU_ALWAYS, 0);
-    C3D_TexEnv* env = C3D_GetTexEnv(0);
-    C3D_TexEnvInit(env);
-    C3D_TexEnvSrc(env, C3D_Both, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
-    C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
-    for (int i = 1; i < 6; ++i) C3D_TexEnvInit(C3D_GetTexEnv(i));
+    AttrInfo_AddLoader(attr, 1, GPU_UNSIGNED_BYTE, 4);  // channel color
+    AttrInfo_AddLoader(attr, 2, GPU_UNSIGNED_BYTE, 2);  // matrix row (+ padding)
+    AttrInfo_AddLoader(attr, 3, GPU_SHORT, 2);          // texture coordinates x 512 (the shader sees u, v, 0, 1)
+    // GX clip-space z runs from -w (near) to 0 (far), which is also the PICA's clip range. citro3d's default depth
+    // map (depth = -z/w) makes near 1 and far 0; GX's depth buffer has near 0 and far 1, so the game's compare
+    // functions and clear value apply unchanged with depth = z/w + 1.
+    C3D_DepthMap(true, 1.0f, 1.0f);
 }
 
 bool OpenFrame()
@@ -121,9 +125,13 @@ bool OpenFrame()
     if (g_frameOpen) return true;
     if (!Init()) return false;
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);  // waits for the previous frame: its buffers are reused below
-    C3D_RenderTargetClear(g_target, C3D_CLEAR_ALL, 0x202020FF, 0);
+    const auto& cc = g_gxState.clearColor;
+    auto byte = [](float v) { return static_cast<uint32_t>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
+    const uint32_t clear = byte(cc[0]) << 24 | byte(cc[1]) << 16 | byte(cc[2]) << 8 | 0xFF;
+    C3D_RenderTargetClear(g_target, C3D_CLEAR_ALL, clear, 0x00FFFFFF);
     C3D_FrameDrawOn(g_target);
     ApplyFixedState();
+    TexturesBeginFrame();
     g_vtxUsed = g_idxUsed = 0;
     g_batchOpen = false;
     g_frameOpen = true;
@@ -135,29 +143,70 @@ void FlushBatch()
     if (!g_batchOpen) return;
     g_batchOpen = false;
     const uint32_t count = g_idxUsed - g_batchIdx;
-    if (count == 0) return;
+    if (count == 0 || g_plan.skip) return;
     C3D_BufInfo* buf = C3D_GetBufInfo();
     BufInfo_Init(buf);
-    BufInfo_Add(buf, g_vertices + g_batchVtx, sizeof(PicaVertex), 3, 0x210);
+    BufInfo_Add(buf, g_vertices + g_batchVtx, sizeof(PicaVertex), 4, 0x3210);
     C3D_DrawElements(GPU_TRIANGLES, static_cast<int>(count), C3D_UNSIGNED_SHORT, g_indices + g_batchIdx);
 }
 
-// Uniforms for a batch: the GX projection and position matrices as they are now.
-void UploadMatrices()
+inline C3D_FVec Row(const aurora::Vec4<float>& r) { return FVec4_New(r[0], r[1], r[2], r[3]); }
+
+// citro3d uploads every uniform vector marked dirty before the next draw; ~555 batches a frame rewriting all 46
+// overflowed the command buffer (svcBreak PANIC at the match start). Only vectors that changed are marked.
+inline void SetVec(int id, const C3D_FVec& v)
+{
+    C3D_FVec& cur = C3D_FVUnif[GPU_VERTEX_SHADER][id];
+    if (std::memcmp(&cur, &v, sizeof(v)) != 0) {
+        cur = v;
+        C3D_FVUnifDirty[GPU_VERTEX_SHADER][id] = true;
+    }
+}
+
+// Uniforms for a batch: the GX projection, position matrices and the texture-coordinate generators of its units.
+void UploadUniforms(const float scaleS[kMaxUnits], const float scaleT[kMaxUnits])
 {
     // The GX projection with the top screen's quarter turn folded in: clip (x, y) -> (y, -x), i.e. rows 1 and -0.
     const auto& p = g_gxState.proj;
-    C3D_FVec* proj = C3D_FVUnifWritePtr(GPU_VERTEX_SHADER, g_projLoc, 4);
-    proj[0] = FVec4_New(p.m1[0], p.m1[1], p.m1[2], p.m1[3]);
-    proj[1] = FVec4_New(-p.m0[0], -p.m0[1], -p.m0[2], -p.m0[3]);
-    proj[2] = FVec4_New(p.m2[0], p.m2[1], p.m2[2], p.m2[3]);
-    proj[3] = FVec4_New(p.m3[0], p.m3[1], p.m3[2], p.m3[3]);
-    C3D_FVec* rows = C3D_FVUnifWritePtr(GPU_VERTEX_SHADER, g_mtxLoc, 30);
+    SetVec(g_projLoc + 0, FVec4_New(p.m1[0], p.m1[1], p.m1[2], p.m1[3]));
+    SetVec(g_projLoc + 1, FVec4_New(-p.m0[0], -p.m0[1], -p.m0[2], -p.m0[3]));
+    SetVec(g_projLoc + 2, FVec4_New(p.m2[0], p.m2[1], p.m2[2], p.m2[3]));
+    SetVec(g_projLoc + 3, FVec4_New(p.m3[0], p.m3[1], p.m3[2], p.m3[3]));
     for (u32 i = 0; i < 10 && i < MaxPnMtx; ++i) {
         const auto& m = g_gxState.pnMtx[i].pos;
-        rows[i * 3 + 0] = FVec4_New(m.m0[0], m.m0[1], m.m0[2], m.m0[3]);
-        rows[i * 3 + 1] = FVec4_New(m.m1[0], m.m1[1], m.m1[2], m.m1[3]);
-        rows[i * 3 + 2] = FVec4_New(m.m2[0], m.m2[1], m.m2[2], m.m2[3]);
+        SetVec(g_mtxLoc + i * 3 + 0, Row(m.m0));
+        SetVec(g_mtxLoc + i * 3 + 1, Row(m.m1));
+        SetVec(g_mtxLoc + i * 3 + 2, Row(m.m2));
+    }
+
+    // Per unit: the source vector's weights (uv set A, uv set B, object position) and the texture matrix, rows
+    // s, t and q (q = 1 for a 2x4 matrix), scaled to the padded PICA texture.
+    for (int u = 0; u < kMaxUnits; ++u) {
+        C3D_FVec s = FVec4_New(1, 0, 0, 0), m0 = FVec4_New(1, 0, 0, 0), m1 = FVec4_New(0, 1, 0, 0),
+                 m2 = FVec4_New(0, 0, 0, 1);
+        if (u < g_plan.unitCount) {
+            const auto& tcg = g_gxState.tcgs[g_plan.units[u].texCoord & 7];
+            const int src = static_cast<int>(tcg.src);
+            if (src == GX_TG_POS) {
+                s = FVec4_New(0, 0, 1, 0);
+            } else if (src >= GX_TG_TEX0 && src <= GX_TG_TEX0 + 7) {
+                s = FVec4_New(1, 0, 0, 0);  // the vertex's one texture-coordinate set
+            }
+            const bool threeRows = tcg.type == GX_TG_MTX3x4;
+            if (tcg.mtx != GX_IDENTITY && tcg.mtx >= GX_TEXMTX0) {
+                const auto& m = g_gxState.texMtxs[std::min<u32>((tcg.mtx - GX_TEXMTX0) / 3, MaxTexMtx - 1)];
+                m0 = Row(m.m0);
+                m1 = Row(m.m1);
+                if (threeRows) m2 = Row(m.m2);
+            } else if (threeRows) {
+                m2 = FVec4_New(0, 0, 1, 0);
+            }
+            for (int c = 0; c < 4; ++c) m0.c[c] *= scaleS[u], m1.c[c] *= scaleT[u];
+        }
+        SetVec(g_texSrcLoc + u, s);
+        SetVec(g_texMtxLoc + u * 3 + 0, m0);
+        SetVec(g_texMtxLoc + u * 3 + 1, m1);
+        SetVec(g_texMtxLoc + u * 3 + 2, m2);
     }
 }
 
@@ -195,35 +244,35 @@ inline float LoadComponent(const uint8_t* p, GXCompType type, float scale, bool 
     }
     }
 }
-inline void LoadColor(const uint8_t* p, GXCompType type, bool be, PicaVertex& v)
+inline void LoadColor(const uint8_t* p, GXCompType type, bool be, uint8_t out[4])
 {
     switch (type) {
     case GX_RGB565: {
         const uint16_t c = Load16(p, be);
-        v.r = static_cast<uint8_t>((c >> 11) * 255 / 31);
-        v.g = static_cast<uint8_t>(((c >> 5) & 63) * 255 / 63);
-        v.b = static_cast<uint8_t>((c & 31) * 255 / 31);
-        v.a = 255;
+        out[0] = static_cast<uint8_t>((c >> 11) * 255 / 31);
+        out[1] = static_cast<uint8_t>(((c >> 5) & 63) * 255 / 63);
+        out[2] = static_cast<uint8_t>((c & 31) * 255 / 31);
+        out[3] = 255;
         break;
     }
     case GX_RGB8:
     case GX_RGBX8:
-        v.r = p[0], v.g = p[1], v.b = p[2], v.a = 255;
+        out[0] = p[0], out[1] = p[1], out[2] = p[2], out[3] = 255;
         break;
     case GX_RGBA4: {
         const uint16_t c = Load16(p, be);
-        v.r = static_cast<uint8_t>((c >> 12) * 17), v.g = static_cast<uint8_t>(((c >> 8) & 15) * 17);
-        v.b = static_cast<uint8_t>(((c >> 4) & 15) * 17), v.a = static_cast<uint8_t>((c & 15) * 17);
+        out[0] = static_cast<uint8_t>((c >> 12) * 17), out[1] = static_cast<uint8_t>(((c >> 8) & 15) * 17);
+        out[2] = static_cast<uint8_t>(((c >> 4) & 15) * 17), out[3] = static_cast<uint8_t>((c & 15) * 17);
         break;
     }
     case GX_RGBA6: {
         const uint32_t c = uint32_t{p[0]} << 16 | uint32_t{p[1]} << 8 | p[2];
-        v.r = static_cast<uint8_t>(((c >> 18) & 63) * 255 / 63), v.g = static_cast<uint8_t>(((c >> 12) & 63) * 255 / 63);
-        v.b = static_cast<uint8_t>(((c >> 6) & 63) * 255 / 63), v.a = static_cast<uint8_t>((c & 63) * 255 / 63);
+        out[0] = static_cast<uint8_t>(((c >> 18) & 63) * 255 / 63), out[1] = static_cast<uint8_t>(((c >> 12) & 63) * 255 / 63);
+        out[2] = static_cast<uint8_t>(((c >> 6) & 63) * 255 / 63), out[3] = static_cast<uint8_t>((c & 63) * 255 / 63);
         break;
     }
     default:  // GX_RGBA8
-        v.r = p[0], v.g = p[1], v.b = p[2], v.a = p[3];
+        out[0] = p[0], out[1] = p[1], out[2] = p[2], out[3] = p[3];
         break;
     }
 }
@@ -235,8 +284,7 @@ inline uint32_t DirectSize(int attr, const VtxAttrFmt& f)
     return comp_type_size(a, f.type) * comp_cnt_count(a, f.cnt);
 }
 
-// How to read the vertices of one draw, worked out once per draw from the GX vertex descriptor and format. It used
-// to be re-derived for every vertex: ~1.2 us a vertex on the console, ~80 ms of a match frame.
+// How to read the vertices of one draw, worked out once per draw from the GX vertex descriptor and format.
 struct AttrPlan {
     const uint8_t* base;  // indexed: the array
     uint32_t stride;
@@ -244,13 +292,16 @@ struct AttrPlan {
     uint32_t index;       // 0 = direct, 1 = 8-bit index, 2 = 16-bit index (in the stream's byte order)
     bool be;              // the values' byte order
     GXCompType type;
+    float scale;          // fixed-point components: 1 / 2^frac
+    bool two;             // texture coordinates: s and t (else s only); position: x y z (else x y)
 };
 struct VertexPlan {
     uint32_t size;        // bytes per GX vertex
     int pnMtxOffset;      // -1 = none
-    bool hasPos, hasClr, posXYZ;
-    float posScale;
+    bool hasPos, hasClr;
     AttrPlan pos, clr;
+    bool hasUv;
+    AttrPlan uv;
 };
 
 void BuildPlan(GXVtxFmt fmt, bool be, VertexPlan& plan)
@@ -273,6 +324,7 @@ void BuildPlan(GXVtxFmt fmt, bool be, VertexPlan& plan)
         a.offset = at;
         a.type = af.type;
         a.be = be;
+        a.scale = af.type == GX_F32 ? 1.0f : 1.0f / static_cast<float>(1u << af.frac);
         if (type == GX_DIRECT) {
             at += DirectSize(attr, af);
         } else {
@@ -286,13 +338,15 @@ void BuildPlan(GXVtxFmt fmt, bool be, VertexPlan& plan)
             if (!a.base) continue;  // no array set: nothing to read
         }
         if (attr == GX_VA_POS) {
+            a.two = af.cnt == GX_POS_XYZ;
             plan.hasPos = true;
             plan.pos = a;
-            plan.posXYZ = af.cnt == GX_POS_XYZ;
-            plan.posScale = af.type == GX_F32 ? 1.0f : 1.0f / static_cast<float>(1u << af.frac);
         } else if (attr == GX_VA_CLR0) {
             plan.hasClr = true;
             plan.clr = a;
+        } else if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) {
+            a.two = af.cnt == GX_TEX_ST;
+            if (g_plan.uvAttr[0] == attr) plan.hasUv = true, plan.uv = a;
         }
     }
     plan.size = at;
@@ -311,26 +365,63 @@ void DecodePositions(const VertexPlan& plan, const uint8_t* src, bool streamBe, 
 {
     const AttrPlan& a = plan.pos;
     constexpr uint32_t step = Type == GX_F32 ? 4 : (Type == GX_U16 || Type == GX_S16) ? 2 : 1;
-    const float scale = plan.posScale;
+    const float scale = a.scale;
     const bool be = a.be;
-    if (plan.posXYZ) {
-        for (uint32_t n = 0; n < count; ++n, src += plan.size) {
-            const uint8_t* values = AttrValues(a, src, streamBe);
-            PicaVertex& v = out[n];
-            v.x = LoadComponent(values, Type, scale, be);
-            v.y = LoadComponent(values + step, Type, scale, be);
-            v.z = LoadComponent(values + 2 * step, Type, scale, be);
-        }
-    } else {
-        for (uint32_t n = 0; n < count; ++n, src += plan.size) {
-            const uint8_t* values = AttrValues(a, src, streamBe);
-            PicaVertex& v = out[n];
-            v.x = LoadComponent(values, Type, scale, be);
-            v.y = LoadComponent(values + step, Type, scale, be);
-            v.z = 0.0f;
-        }
+    for (uint32_t n = 0; n < count; ++n, src += plan.size) {
+        const uint8_t* values = AttrValues(a, src, streamBe);
+        PicaVertex& v = out[n];
+        v.x = LoadComponent(values, Type, scale, be);
+        v.y = LoadComponent(values + step, Type, scale, be);
+        v.z = a.two ? LoadComponent(values + 2 * step, Type, scale, be) : 0.0f;
     }
 }
+
+void DecodeUvs(const AttrPlan& a, const uint8_t* src, bool streamBe, uint32_t count, uint32_t size, PicaVertex* out)
+{
+    const uint32_t step = a.type == GX_F32 ? 4 : (a.type == GX_U16 || a.type == GX_S16) ? 2 : 1;
+    for (uint32_t n = 0; n < count; ++n, src += size) {
+        const uint8_t* values = AttrValues(a, src, streamBe);
+        const float u = LoadComponent(values, a.type, a.scale, a.be) * kUvScale;
+        const float v = a.two ? LoadComponent(values + step, a.type, a.scale, a.be) * kUvScale : 0.0f;
+        out[n].uv[0] = static_cast<int16_t>(std::clamp(u, -32768.0f, 32767.0f));
+        out[n].uv[1] = static_cast<int16_t>(std::clamp(v, -32768.0f, 32767.0f));
+    }
+}
+
+// The GX channel COLOR0A0 for this batch: material (or vertex) color times the lighting. Lighting is milestone 4:
+// until then a lit channel is its ambient plus half of each enabled light's color, without direction.
+struct ChannelPlan {
+    bool rgbFromVertex, alphaFromVertex;
+    uint32_t rgbMul[3], alphaMul;  // 0..256 fixed point
+    uint8_t rgb[3], alpha;          // material color (register source)
+};
+
+void BuildChannel(ChannelPlan& ch)
+{
+    auto light = [](const ColorChannelConfig& cfg, const ColorChannelState& st, int c) {
+        if (!cfg.lightingEnabled) return 1.0f;
+        float v = st.ambColor[c];
+        for (u32 i = 0; i < GX::MaxLights; ++i)
+            if (st.lightMask.test(i)) v += 0.5f * g_gxState.lights[i].color[c];
+        return std::clamp(v, 0.0f, 1.0f);
+    };
+    auto byte = [](float v) { return static_cast<uint8_t>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
+    const auto& cc = g_gxState.colorChannelConfig[0];  // GX_COLOR0
+    const auto& cs = g_gxState.colorChannelState[0];
+    const auto& ac = g_gxState.colorChannelConfig[2];  // GX_ALPHA0
+    const auto& as = g_gxState.colorChannelState[2];
+    const bool none = g_gxState.numChans == 0;
+    ch.rgbFromVertex = !none && cc.matSrc == GX_SRC_VTX;
+    ch.alphaFromVertex = !none && ac.matSrc == GX_SRC_VTX;
+    for (int c = 0; c < 3; ++c) {
+        ch.rgb[c] = none ? 255 : byte(cs.matColor[c]);
+        ch.rgbMul[c] = none ? 256 : static_cast<uint32_t>(light(cc, cs, c) * 256.0f);
+    }
+    ch.alpha = none ? 255 : byte(as.matColor[3]);
+    ch.alphaMul = none ? 256 : static_cast<uint32_t>(light(ac, as, 3) * 256.0f);
+}
+
+ChannelPlan g_channel;
 
 // Decode `count` GX vertices of format `fmt` into the frame's vertex buffer; false when it is full.
 bool DecodeVertices(GXVtxFmt fmt, const uint8_t* src, uint32_t count, bool be)
@@ -340,22 +431,41 @@ bool DecodeVertices(GXVtxFmt fmt, const uint8_t* src, uint32_t count, bool be)
     BuildPlan(fmt, be, plan);
     PicaVertex* out = g_vertices + g_vtxUsed;
 
-    // Color (or the batch's false color) and matrix row, then the positions.
-    const uint8_t defaultRow = static_cast<uint8_t>(g_gxState.currentPnMtx * 3);
-    const uint32_t fallbackColor = uint32_t{g_falseColor[0]} | uint32_t{g_falseColor[1]} << 8 |
-                                   uint32_t{g_falseColor[2]} << 16 | 0xFF000000u;
-    if (plan.hasClr) {
+    // Channel color.
+    const ChannelPlan& ch = g_channel;
+    if ((ch.rgbFromVertex || ch.alphaFromVertex) && plan.hasClr) {
         const uint8_t* vtx = src;
-        for (uint32_t n = 0; n < count; ++n, vtx += plan.size) LoadColor(AttrValues(plan.clr, vtx, be), plan.clr.type, plan.clr.be, out[n]);
+        for (uint32_t n = 0; n < count; ++n, vtx += plan.size) {
+            uint8_t c[4];
+            LoadColor(AttrValues(plan.clr, vtx, be), plan.clr.type, plan.clr.be, c);
+            PicaVertex& v = out[n];
+            v.r = static_cast<uint8_t>(((ch.rgbFromVertex ? c[0] : ch.rgb[0]) * ch.rgbMul[0]) >> 8);
+            v.g = static_cast<uint8_t>(((ch.rgbFromVertex ? c[1] : ch.rgb[1]) * ch.rgbMul[1]) >> 8);
+            v.b = static_cast<uint8_t>(((ch.rgbFromVertex ? c[2] : ch.rgb[2]) * ch.rgbMul[2]) >> 8);
+            v.a = static_cast<uint8_t>(((ch.alphaFromVertex ? c[3] : ch.alpha) * ch.alphaMul) >> 8);
+        }
     } else {
-        for (uint32_t n = 0; n < count; ++n) std::memcpy(&out[n].r, &fallbackColor, 4);
+        const uint8_t r = static_cast<uint8_t>((ch.rgb[0] * ch.rgbMul[0]) >> 8);
+        const uint8_t g = static_cast<uint8_t>((ch.rgb[1] * ch.rgbMul[1]) >> 8);
+        const uint8_t b = static_cast<uint8_t>((ch.rgb[2] * ch.rgbMul[2]) >> 8);
+        const uint8_t a = static_cast<uint8_t>((ch.alpha * ch.alphaMul) >> 8);
+        for (uint32_t n = 0; n < count; ++n) out[n].r = r, out[n].g = g, out[n].b = b, out[n].a = a;
     }
+    // Matrix row.
     if (plan.pnMtxOffset >= 0) {
         const uint8_t* vtx = src + plan.pnMtxOffset;
         for (uint32_t n = 0; n < count; ++n, vtx += plan.size) out[n].row = *vtx;
     } else {
-        for (uint32_t n = 0; n < count; ++n) out[n].row = defaultRow;
+        const uint8_t row = static_cast<uint8_t>(g_gxState.currentPnMtx * 3);
+        for (uint32_t n = 0; n < count; ++n) out[n].row = row;
     }
+    // Texture coordinates.
+    if (plan.hasUv) {
+        DecodeUvs(plan.uv, src, be, count, plan.size, out);
+    } else {
+        for (uint32_t n = 0; n < count; ++n) out[n].uv[0] = out[n].uv[1] = 0;
+    }
+    // Positions.
     if (plan.hasPos) {
         switch (plan.pos.type) {
         case GX_U8: DecodePositions<GX_U8>(plan, src, be, count, out); break;
@@ -417,13 +527,14 @@ void Brawl3dsPicaDraw(GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, 
         ++g_droppedDraws;
         return;
     }
-    UploadMatrices();
-    {
-        uint32_t h = ++g_batchSerial * 2654435761u;
-        g_falseColor[0] = static_cast<uint8_t>(64 + ((h >> 8) & 191));
-        g_falseColor[1] = static_cast<uint8_t>(64 + ((h >> 16) & 191));
-        g_falseColor[2] = static_cast<uint8_t>(64 + ((h >> 24) & 191));
-    }
+    // The batch's material: combiners and fragment state, its textures, then the uniforms (which need the
+    // textures' padding scales) and the channel color.
+    ApplyMaterial(g_plan);
+    float scaleS[kMaxUnits] = {1, 1, 1}, scaleT[kMaxUnits] = {1, 1, 1};
+    for (int u = 0; u < g_plan.unitCount; ++u) BindTexture(u, g_plan.units[u].texMap, scaleS[u], scaleT[u]);
+    UploadUniforms(scaleS, scaleT);
+    BuildChannel(g_channel);
+
     g_batchVtx = g_vtxUsed;
     g_batchIdx = g_idxUsed;
     if (!DecodeVertices(fmt, vertices, vtxCount, bigEndian)) {
@@ -434,122 +545,27 @@ void Brawl3dsPicaDraw(GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, 
     g_idxUsed += indexCount;
     g_batchOpen = true;
 
-    // One frame's debug dump (Brawl3dsPicaDebugNextFrame): the first batches, their first vertex and where the
-    // shader's transform puts it, computed the same way on the CPU.
-    if (g_debugFrame && g_debugBatches < 8) {
+    // One frame's debug dump (Brawl3dsPicaDebugNextFrame): the first batches' materials and first vertex.
+    if (g_debugFrame && g_debugBatches < 12) {
         ++g_debugBatches;
         const PicaVertex& v = g_vertices[g_batchVtx];
-        const u32 mi = v.row / 3;
-        const auto& m = g_gxState.pnMtx[mi < MaxPnMtx ? mi : 0].pos;
-        const float view[4] = {m.m0[0] * v.x + m.m0[1] * v.y + m.m0[2] * v.z + m.m0[3],
-                               m.m1[0] * v.x + m.m1[1] * v.y + m.m1[2] * v.z + m.m1[3],
-                               m.m2[0] * v.x + m.m2[1] * v.y + m.m2[2] * v.z + m.m2[3], 1.0f};
-        const auto& p = g_gxState.proj;
-        auto dot = [&](const auto& r) { return r[0] * view[0] + r[1] * view[1] + r[2] * view[2] + r[3] * view[3]; };
         std::fprintf(stderr,
-                     "[pica] batch %u: fmt %d, %u verts, %u indices (first %u %u %u), be %d, uniforms proj %d mtx %d\n"
-                     "[pica]   vertex (%.3f %.3f %.3f) rgba %02x%02x%02x%02x row %u -> view (%.3f %.3f %.3f)"
-                     " -> clip (%.3f %.3f %.3f w %.3f)\n",
-                     g_debugBatches, static_cast<int>(fmt), vtxCount, indexCount, indexCount ? indices[0] : 0,
-                     indexCount > 1 ? indices[1] : 0, indexCount > 2 ? indices[2] : 0, bigEndian ? 1 : 0, g_projLoc,
-                     g_mtxLoc, v.x, v.y, v.z, v.r, v.g, v.b, v.a, v.row, view[0], view[1], view[2], dot(p.m0),
-                     dot(p.m1), dot(p.m2), dot(p.m3));
+                     "[pica] batch %u: fmt %d, %u verts, %u indices, tev %u stages, %d units (", g_debugBatches,
+                     static_cast<int>(fmt), vtxCount, indexCount, g_gxState.numTevStages, g_plan.unitCount);
+        for (int u = 0; u < g_plan.unitCount; ++u) {
+            const auto& t = g_gxState.loadedTextures[g_plan.units[u].texMap];
+            std::fprintf(stderr, "%smap %u coord %u %ux%u fmt %u", u ? ", " : "", g_plan.units[u].texMap,
+                         g_plan.units[u].texCoord, t.width(), t.height(), t.format());
+        }
+        std::fprintf(stderr,
+                     "), uv attrs %d %d, blend %d, z %d/%d/%d, cull %d, skip %d\n"
+                     "[pica]   vertex (%.3f %.3f %.3f) rgba %02x%02x%02x%02x row %u uv (%.3f %.3f)\n",
+                     g_plan.uvAttr[0], g_plan.uvAttr[1], static_cast<int>(g_gxState.blendMode),
+                     g_gxState.depthCompare ? 1 : 0, static_cast<int>(g_gxState.depthFunc),
+                     g_gxState.depthUpdate ? 1 : 0, static_cast<int>(g_gxState.cullMode), g_plan.skip ? 1 : 0, v.x,
+                     v.y, v.z, v.r, v.g, v.b, v.a, v.row, v.uv[0] / kUvScale, v.uv[1] / kUvScale);
     }
 }
-
-extern "C" void Brawl3dsPicaScreenshot(const char* path);
-
-namespace {
-// Bring-up self-test, once when the renderer starts: two frames with a red triangle in clip space through identity
-// matrices, A drawn with C3D_DrawArrays, B with C3D_DrawElements, each saved to the SD card. Which ones show the
-// triangle separates the draw call from the shader and state.
-void SelfTest()
-{
-    const PicaVertex tri[3] = {{-0.5f, -0.5f, -0.5f, 255, 0, 0, 255, 0, {}},
-                               {0.5f, -0.5f, -0.5f, 255, 0, 0, 255, 0, {}},
-                               {0.0f, 0.5f, -0.5f, 255, 0, 0, 255, 0, {}}};
-    std::memcpy(g_vertices, tri, sizeof(tri));
-    g_indices[0] = 0, g_indices[1] = 1, g_indices[2] = 2;
-    GSPGPU_FlushDataCache(g_vertices, sizeof(tri));
-    GSPGPU_FlushDataCache(g_indices, 8);
-    for (int variant = 0; variant < 3; ++variant) {
-        C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
-        C3D_RenderTargetClear(g_target, C3D_CLEAR_ALL, 0x202020FF, 0);
-        C3D_FrameDrawOn(g_target);
-        ApplyFixedState();
-        if (variant == 2) {  // C: position from the buffer, color and matrix row as fixed attributes
-            C3D_AttrInfo* attr = C3D_GetAttrInfo();
-            AttrInfo_Init(attr);
-            AttrInfo_AddLoader(attr, 0, GPU_FLOAT, 3);
-            AttrInfo_AddFixed(attr, 1);
-            AttrInfo_AddFixed(attr, 2);
-            C3D_FixedAttribSet(1, 255.0f, 0.0f, 0.0f, 255.0f);
-            C3D_FixedAttribSet(2, 0.0f, 0.0f, 0.0f, 0.0f);
-        }
-        C3D_FVec* proj = C3D_FVUnifWritePtr(GPU_VERTEX_SHADER, g_projLoc, 4);
-        proj[0] = FVec4_New(1, 0, 0, 0), proj[1] = FVec4_New(0, 1, 0, 0);
-        proj[2] = FVec4_New(0, 0, 1, 0), proj[3] = FVec4_New(0, 0, 0, 1);
-        C3D_FVec* rows = C3D_FVUnifWritePtr(GPU_VERTEX_SHADER, g_mtxLoc, 3);
-        rows[0] = FVec4_New(1, 0, 0, 0), rows[1] = FVec4_New(0, 1, 0, 0), rows[2] = FVec4_New(0, 0, 1, 0);
-        C3D_BufInfo* buf = C3D_GetBufInfo();
-        BufInfo_Init(buf);
-        if (variant == 2) {
-            BufInfo_Add(buf, g_vertices, sizeof(PicaVertex), 1, 0x0);
-        } else {
-            BufInfo_Add(buf, g_vertices, sizeof(PicaVertex), 3, 0x210);
-        }
-        if (variant == 1) {
-            C3D_DrawElements(GPU_TRIANGLES, 3, C3D_UNSIGNED_SHORT, g_indices);
-        } else {
-            C3D_DrawArrays(GPU_TRIANGLES, 0, 3);
-        }
-        g_lastTopFramebuffer = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
-        C3D_FrameEnd(0);
-        static const char* const kNames[] = {"sdmc:/3ds/brawl3ds/selftest_arrays.bmp",
-                                             "sdmc:/3ds/brawl3ds/selftest_elements.bmp",
-                                             "sdmc:/3ds/brawl3ds/selftest_fixedattr.bmp"};
-        Brawl3dsPicaScreenshot(kNames[variant]);
-    }
-    // D: the smallest shader (selftest.v.pica: one 4x4 matrix), citro3d's tilted ortho projection, a green triangle
-    // in 400x240 screen pixels, a fixed color: the same shape as devkitPro's simple_tri example.
-    if (DVLB_s* dvlb = DVLB_ParseFile(reinterpret_cast<u32*>(const_cast<unsigned char*>(brawl3ds_selftest_shbin)),
-                                      brawl3ds_selftest_shbin_size)) {
-        shaderProgram_s program;
-        shaderProgramInit(&program);
-        shaderProgramSetVsh(&program, &dvlb->DVLE[0]);
-        const int mvpLoc = shaderInstanceGetUniformLocation(program.vertexShader, "mvp");
-        const PicaVertex tri[3] = {{200.0f, 200.0f, 0.5f, 0, 0, 0, 0, 0, {}},
-                                   {100.0f, 40.0f, 0.5f, 0, 0, 0, 0, 0, {}},
-                                   {300.0f, 40.0f, 0.5f, 0, 0, 0, 0, 0, {}}};
-        std::memcpy(g_vertices + 8, tri, sizeof(tri));
-        GSPGPU_FlushDataCache(g_vertices + 8, sizeof(tri));
-        C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
-        C3D_RenderTargetClear(g_target, C3D_CLEAR_ALL, 0x202020FF, 0);
-        C3D_FrameDrawOn(g_target);
-        ApplyFixedState();
-        C3D_BindProgram(&program);
-        C3D_AttrInfo* attr = C3D_GetAttrInfo();
-        AttrInfo_Init(attr);
-        AttrInfo_AddLoader(attr, 0, GPU_FLOAT, 3);
-        AttrInfo_AddFixed(attr, 1);
-        C3D_FixedAttribSet(1, 0.0f, 1.0f, 0.0f, 1.0f);
-        C3D_Mtx mvp;
-        Mtx_OrthoTilt(&mvp, 0.0f, 400.0f, 0.0f, 240.0f, 0.0f, 1.0f, true);
-        C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, mvpLoc, &mvp);
-        C3D_BufInfo* buf = C3D_GetBufInfo();
-        BufInfo_Init(buf);
-        BufInfo_Add(buf, g_vertices + 8, sizeof(PicaVertex), 1, 0x0);
-        C3D_DrawArrays(GPU_TRIANGLES, 0, 3);
-        g_lastTopFramebuffer = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
-        C3D_FrameEnd(0);
-        Brawl3dsPicaScreenshot("sdmc:/3ds/brawl3ds/selftest_minimal.bmp");
-        std::fprintf(stderr, "[pica] self-test D: mvp uniform at %d\n", mvpLoc);
-    } else {
-        std::fprintf(stderr, "[pica] self-test D: the self-test shader did not parse\n");
-    }
-    std::fprintf(stderr, "[pica] self-test frames written (selftest_*.bmp)\n");
-}
-} // namespace
 
 extern "C" void Brawl3dsPicaDebugNextFrame()
 {
@@ -600,63 +616,6 @@ void TakePendingCapture()
     std::snprintf(c.path, sizeof(c.path), "%s", g_pendingCapturePath);
     c.rgb = rgb;
 }
-} // namespace
-
-void WriteBmp(const char* path, const uint8_t* rgb);
-
-extern "C" void Brawl3dsPicaCaptureNextFrame(const char* path)
-{
-    if (!g_ready || !g_lastTopFramebuffer) return;
-    g_pendingCaptureSource = g_lastTopFramebuffer;
-    std::snprintf(g_pendingCapturePath, sizeof(g_pendingCapturePath), "%s", path);
-}
-
-extern "C" void Brawl3dsPicaWriteCaptures()
-{
-    for (uint32_t i = 0; i < g_captureCount; ++i) {
-        WriteBmp(g_captures[i].path, g_captures[i].rgb);
-        std::free(g_captures[i].rgb);
-    }
-    g_captureCount = 0;
-}
-
-void Brawl3dsPicaEndFrame()
-{
-    if (!g_frameOpen) return;
-    FlushBatch();
-    GSPGPU_FlushDataCache(g_vertices, g_vtxUsed * sizeof(PicaVertex));
-    GSPGPU_FlushDataCache(g_indices, g_idxUsed * sizeof(uint16_t));
-    // The framebuffer citro3d copies this frame into (its back buffer until the copy is done and it swaps).
-    // A capture asked for after the previous frame: that frame's copy is complete now (C3D_FrameBegin waited).
-    TakePendingCapture();
-    g_lastTopFramebuffer = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
-    C3D_FrameEnd(0);
-    g_frameOpen = false;
-    g_debugFrame = false;  // a debug dump covers one frame
-}
-
-extern "C" bool Brawl3dsPicaActive() { return g_ready; }
-extern "C" uint32_t Brawl3dsPicaTakeDropped()
-{
-    const uint32_t n = g_droppedDraws;
-    g_droppedDraws = 0;
-    return n;
-}
-
-// The last rendered top-screen frame as a 400x240 24-bit BMP, written at once (the renderer's start-up self-test).
-extern "C" void Brawl3dsPicaScreenshot(const char* path)
-{
-    if (!g_ready) return;
-    constexpr uint32_t w = 240, h = 400;  // the framebuffer is portrait
-    // citro3d runs a frame's GPU work asynchronously after C3D_FrameEnd, then copies the target into the top
-    // screen's framebuffer (RGB8, 240x400, in ordinary memory). Let that finish, then read the copy the last frame
-    // went to. (A GPU transfer of our own waited on a GSP event citro3d's queue can take first: one console run sat
-    // in it for four minutes. The target itself is in VRAM, which the CPU cannot read.)
-    if (!g_lastTopFramebuffer) return;
-    svcSleepThread(200000000LL);
-    GSPGPU_InvalidateDataCache(g_lastTopFramebuffer, w * h * 3);
-    WriteBmp(path, g_lastTopFramebuffer);
-}
 
 // A 240x400 RGB8 top-screen framebuffer copy as a 400x240 24-bit BMP.
 void WriteBmp(const char* path, const uint8_t* rgb)
@@ -687,4 +646,51 @@ void WriteBmp(const char* path, const uint8_t* rgb)
         }
         std::fclose(f);
     }
+}
+} // namespace
+
+extern "C" void Brawl3dsPicaCaptureNextFrame(const char* path)
+{
+    if (!g_ready || !g_lastTopFramebuffer) return;
+    g_pendingCaptureSource = g_lastTopFramebuffer;
+    std::snprintf(g_pendingCapturePath, sizeof(g_pendingCapturePath), "%s", path);
+}
+
+extern "C" void Brawl3dsPicaWriteCaptures()
+{
+    for (uint32_t i = 0; i < g_captureCount; ++i) {
+        WriteBmp(g_captures[i].path, g_captures[i].rgb);
+        std::free(g_captures[i].rgb);
+    }
+    g_captureCount = 0;
+}
+
+// Material and texture statistics for the match summary (headless.log).
+extern "C" void Brawl3dsPicaWriteStats(std::FILE* f, unsigned frames)
+{
+    WriteTevStats(f, frames);
+    WriteTextureStats(f, frames);
+}
+
+void Brawl3dsPicaEndFrame()
+{
+    if (!g_frameOpen) return;
+    FlushBatch();
+    GSPGPU_FlushDataCache(g_vertices, g_vtxUsed * sizeof(PicaVertex));
+    GSPGPU_FlushDataCache(g_indices, g_idxUsed * sizeof(uint16_t));
+    // A capture asked for after the previous frame: that frame's copy is complete now (C3D_FrameBegin waited).
+    TakePendingCapture();
+    // The framebuffer citro3d copies this frame into (its back buffer until the copy is done and it swaps).
+    g_lastTopFramebuffer = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
+    C3D_FrameEnd(0);
+    g_frameOpen = false;
+    g_debugFrame = false;  // a debug dump covers one frame
+}
+
+extern "C" bool Brawl3dsPicaActive() { return g_ready; }
+extern "C" uint32_t Brawl3dsPicaTakeDropped()
+{
+    const uint32_t n = g_droppedDraws;
+    g_droppedDraws = 0;
+    return n;
 }

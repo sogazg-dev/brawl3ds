@@ -65,6 +65,8 @@ void __system_allocateHeaps(void)
     // heap, and the runtime ran out of memory in step 4 (std::bad_alloc).
     // 37 MiB of guest regions + the 1 MiB reserve + slack, + 3 MiB for the PICA renderer (citro3d's command buffer,
     // the per-frame vertex and index buffers: pica_renderer_3ds.cpp).
+    // (44 MiB, 2 MiB more for the renderer, left the regular heap too small to start: 96-byte mallocs failed in
+    // step 4. The renderer fits in the ~3.5 MiB guest RAM leaves: pica_renderer_3ds.cpp.)
     constexpr u32 kLinearHeap = 42u * 1024u * 1024u;
     constexpr u32 kRegularHeapMax = 96u * 1024u * 1024u;  // the kernel's heap window at 0x08000000
 
@@ -124,6 +126,7 @@ extern "C" void Brawl3dsRendererTakeStats(uint64_t* displayListTicks, uint32_t* 
 extern "C" bool Brawl3dsPicaActive();            // aurora3ds/pica_renderer_3ds.cpp
 extern "C" void Brawl3dsPicaCaptureNextFrame(const char* path);
 extern "C" void Brawl3dsPicaWriteCaptures();
+extern "C" void Brawl3dsPicaWriteStats(std::FILE* f, unsigned frames);
 extern "C" uint32_t Brawl3dsPicaTakeDropped();
 extern "C" void Brawl3dsPicaDebugNextFrame();
 uint64_t g_droppedDraws = 0;                     // draws the renderer's per-frame buffers had no room for
@@ -524,6 +527,7 @@ void WriteMatchSummary()
     const double avg = TicksToMs(g_matchSum) / g_matchFrames;
     Brawl3dsProfilerWrite("sdmc:/3ds/brawl3ds/profile.txt", g_matchFrames, avg);
     Brawl3dsZonesWrite(g_log, g_matchFrames);
+    Brawl3dsPicaWriteStats(g_log, g_matchFrames);
     Brawl3dsPicaWriteCaptures();
     Log("\n== VS demo match: %u frames measured ==\n"
         "average frame  %.2f ms (%.1f fps)\n"
@@ -725,6 +729,7 @@ extern "C" void Brawl3dsFrameEnd()
         // The demo match is ~1,141 frames (it ends before the 1,800-frame cap): leaving scMelee ends the measurement.
         const bool matchEnded = g_scene == "scMelee" && g_matchFrames > 0 && g_step == kStepMatch;
         g_scene = scene;
+        if (g_scene == "scMelee") Brawl3dsPicaWriteStats(nullptr, 0);  // the match statistics start here
         if (matchEnded) {
             WriteMatchSummary();
             EnterStep(kStepResults);

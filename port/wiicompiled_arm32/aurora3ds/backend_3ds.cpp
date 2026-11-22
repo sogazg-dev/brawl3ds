@@ -77,12 +77,14 @@ public:
     {
         return m_chunks[encoded >> kChunkShift].bytes + (encoded & (kChunkSize - 1));
     }
-    // A new frame: chunks are reused; one-off oversized chunks and anything past the first eight are released.
+    // A new frame: chunks are reused; one-off oversized chunks and anything past the first sixteen are released.
+    // (A match frame fills ~8; releasing and re-allocating 256 KiB blocks every frame fragmented the heap until one
+    // allocation failed.)
     void reset()
     {
         size_t kept = 0;
         for (Chunk& chunk : m_chunks) {
-            if (chunk.size == kChunkSize && kept < 8) {
+            if (chunk.size == kChunkSize && kept < 16) {
                 m_chunks[kept++] = chunk;
             } else {
                 std::free(chunk.bytes);
