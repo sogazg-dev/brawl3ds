@@ -460,6 +460,7 @@ extern "C" void __appExit(void);
     if (g_log) std::fclose(g_log);
     g_log = nullptr;
     if (!g_consoleActive) {
+        // (The renderer had the top screen at 24 bits; consoleInit puts it back to the console's format.)
         consoleInit(GFX_TOP, nullptr);
         g_consoleActive = true;
     }

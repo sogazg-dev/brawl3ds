@@ -75,6 +75,12 @@ bool Init()
                      static_cast<unsigned>(linearSpaceFree() >> 10), static_cast<unsigned>(vramSpaceFree() >> 10));
         return false;
     };
+    // The top screen still has the start-up text console's format (libctru's consoleInit: RGB565, single buffer),
+    // but the render target's display transfer writes 24-bit pixels: the screen showed the frame as two to three
+    // smeared copies while the (24-bit) screenshots were right. 24-bit again, before the buffers below take the
+    // linear memory it needs; single-buffered, as double buffering needs ~280 KiB more than is left.
+    gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);
+    gfxSetDoubleBuffering(GFX_TOP, false);
     if (!C3D_Init(kCommandBufferSize)) return fail("C3D_Init");
     g_target = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
     if (!g_target) return fail("the render target");
