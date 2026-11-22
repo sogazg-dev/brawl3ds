@@ -105,6 +105,9 @@ target_include_directories(b3_aurora PRIVATE "${AURORA}/include" "${AURORA}/lib"
   "${DEPS}/fmt/include" "${DEPS}/tracy/public" "${AURORA}/extern")
 # newlib's unqualified log2 is the double one, so shader_info.cpp's float initializer narrows.
 target_compile_options(b3_aurora PRIVATE -Os -std=gnu++20 -Wno-c++11-narrowing)
+# The per-draw hot path (FIFO parsing, vertex conversion) runs ~11,000 times a match frame: -O2 there.
+set_source_files_properties("${AURORA}/lib/gx/command_processor.cpp" "${PORT}/aurora3ds/pica_renderer_3ds.cpp"
+  "${PORT}/aurora3ds/backend_3ds.cpp" TARGET_DIRECTORY b3_aurora PROPERTIES COMPILE_OPTIONS -O2)
 
 # The generated stubs minus the functions b3_aurora now defines (port/headless/stubs_replaced_by_aurora.txt).
 find_package(Python3 REQUIRED COMPONENTS Interpreter)

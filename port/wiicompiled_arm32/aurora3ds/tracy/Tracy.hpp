@@ -50,6 +50,13 @@ private:
     static brawl3ds_zones::Site BRAWL3DS_ZONE_CAT(brawl3dsZoneSite, __LINE__){label, __LINE__, 0, 0, nullptr, false}; \
     brawl3ds_zones::Scope BRAWL3DS_ZONE_CAT(brawl3dsZoneScope, __LINE__)(BRAWL3DS_ZONE_CAT(brawl3dsZoneSite, __LINE__))
 
+// Each zone costs two svcGetSystemTick kernel calls; with ~11,000 GX draws a match frame that was itself ~20 ms on
+// the console, so the zones are off unless the build defines BRAWL3DS_GX_ZONES=1.
+#if defined(BRAWL3DS_GX_ZONES) && BRAWL3DS_GX_ZONES
 #define ZoneScoped BRAWL3DS_ZONE(__FUNCTION__)
 #define ZoneScopedN(name) BRAWL3DS_ZONE(name)
+#else
+#define ZoneScoped ((void)0)
+#define ZoneScopedN(name) ((void)0)
+#endif
 #define TracyPlot(name, value) ((void)0)

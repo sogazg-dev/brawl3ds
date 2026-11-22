@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <citro3d.h>
@@ -58,6 +59,7 @@ uint32_t g_batchSerial = 0;
 uint8_t g_falseColor[3] = {255, 255, 255};
 bool g_batchOpen = false;
 uint32_t g_droppedDraws = 0;
+const uint8_t* g_lastTopFramebuffer = nullptr;  // for Brawl3dsPicaScreenshot
 bool g_debugFrame = false;  // Brawl3dsPicaDebugNextFrame: log the next frame's first batches
 uint32_t g_debugBatches = 0;
 // citro3d's command buffer: a match frame has ~555 batches, each uploading 34 uniform vectors plus its draw, over
@@ -160,14 +162,19 @@ void UploadMatrices()
 }
 
 // --- GX vertex decoding ---
+// Unaligned loads: the build passes -munaligned-access, and memcpy of 2 or 4 bytes becomes one ldrh/ldr (never the
+// ldm that faults on the console).
 inline uint16_t Load16(const uint8_t* p, bool be)
 {
-    return be ? static_cast<uint16_t>(p[0] << 8 | p[1]) : static_cast<uint16_t>(p[1] << 8 | p[0]);
+    uint16_t v;
+    std::memcpy(&v, p, 2);
+    return be ? __builtin_bswap16(v) : v;
 }
 inline uint32_t Load32(const uint8_t* p, bool be)
 {
-    return be ? (uint32_t{p[0]} << 24 | uint32_t{p[1]} << 16 | uint32_t{p[2]} << 8 | p[3])
-              : (uint32_t{p[3]} << 24 | uint32_t{p[2]} << 16 | uint32_t{p[1]} << 8 | p[0]);
+    uint32_t v;
+    std::memcpy(&v, p, 4);
+    return be ? __builtin_bswap32(v) : v;
 }
 inline float LoadComponent(const uint8_t* p, GXCompType type, float scale, bool be)
 {
@@ -221,59 +228,144 @@ inline void LoadColor(const uint8_t* p, GXCompType type, bool be, PicaVertex& v)
     }
 }
 
-// Bytes one attribute takes in the vertex stream; for direct data also where its values are.
+// Bytes one attribute takes in the vertex stream.
 inline uint32_t DirectSize(int attr, const VtxAttrFmt& f)
 {
     const auto a = static_cast<GXAttr>(attr);
     return comp_type_size(a, f.type) * comp_cnt_count(a, f.cnt);
 }
 
+// How to read the vertices of one draw, worked out once per draw from the GX vertex descriptor and format. It used
+// to be re-derived for every vertex: ~1.2 us a vertex on the console, ~80 ms of a match frame.
+struct AttrPlan {
+    const uint8_t* base;  // indexed: the array
+    uint32_t stride;
+    uint32_t offset;      // where the value, or its index, starts in the GX vertex
+    uint32_t index;       // 0 = direct, 1 = 8-bit index, 2 = 16-bit index (in the stream's byte order)
+    bool be;              // the values' byte order
+    GXCompType type;
+};
+struct VertexPlan {
+    uint32_t size;        // bytes per GX vertex
+    int pnMtxOffset;      // -1 = none
+    bool hasPos, hasClr, posXYZ;
+    float posScale;
+    AttrPlan pos, clr;
+};
+
+void BuildPlan(GXVtxFmt fmt, bool be, VertexPlan& plan)
+{
+    const auto& vf = g_gxState.vtxFmts[fmt];
+    const auto& desc = g_gxState.vtxDesc;
+    plan = {};
+    plan.pnMtxOffset = -1;
+    uint32_t at = 0;
+    for (int attr = GX_VA_PNMTXIDX; attr <= GX_VA_TEX7; ++attr) {
+        const GXAttrType type = desc[attr];
+        if (type == GX_NONE) continue;
+        if (attr <= GX_VA_TEX7MTXIDX) {  // matrix indices: one byte, always direct
+            if (attr == GX_VA_PNMTXIDX) plan.pnMtxOffset = static_cast<int>(at);
+            ++at;
+            continue;
+        }
+        const auto& af = vf.attrs[attr];
+        AttrPlan a{};
+        a.offset = at;
+        a.type = af.type;
+        a.be = be;
+        if (type == GX_DIRECT) {
+            at += DirectSize(attr, af);
+        } else {
+            const uint32_t idxBytes = type == GX_INDEX16 ? 2 : 1;
+            a.index = idxBytes;
+            at += (attr == GX_VA_NRM && af.cnt == GX_NRM_NBT3) ? idxBytes * 3 : idxBytes;
+            const auto& array = g_gxState.arrays[attr];
+            a.base = static_cast<const uint8_t*>(array.data);
+            a.stride = array.stride;
+            a.be = !array.le;
+            if (!a.base) continue;  // no array set: nothing to read
+        }
+        if (attr == GX_VA_POS) {
+            plan.hasPos = true;
+            plan.pos = a;
+            plan.posXYZ = af.cnt == GX_POS_XYZ;
+            plan.posScale = af.type == GX_F32 ? 1.0f : 1.0f / static_cast<float>(1u << af.frac);
+        } else if (attr == GX_VA_CLR0) {
+            plan.hasClr = true;
+            plan.clr = a;
+        }
+    }
+    plan.size = at;
+}
+
+inline const uint8_t* AttrValues(const AttrPlan& a, const uint8_t* vtx, bool streamBe)
+{
+    const uint8_t* p = vtx + a.offset;
+    if (a.index == 0) return p;
+    return a.base + (a.index == 2 ? Load16(p, streamBe) : *p) * a.stride;
+}
+
+// The positions of one draw, in a loop specialized for their component type.
+template <GXCompType Type>
+void DecodePositions(const VertexPlan& plan, const uint8_t* src, bool streamBe, uint32_t count, PicaVertex* out)
+{
+    const AttrPlan& a = plan.pos;
+    constexpr uint32_t step = Type == GX_F32 ? 4 : (Type == GX_U16 || Type == GX_S16) ? 2 : 1;
+    const float scale = plan.posScale;
+    const bool be = a.be;
+    if (plan.posXYZ) {
+        for (uint32_t n = 0; n < count; ++n, src += plan.size) {
+            const uint8_t* values = AttrValues(a, src, streamBe);
+            PicaVertex& v = out[n];
+            v.x = LoadComponent(values, Type, scale, be);
+            v.y = LoadComponent(values + step, Type, scale, be);
+            v.z = LoadComponent(values + 2 * step, Type, scale, be);
+        }
+    } else {
+        for (uint32_t n = 0; n < count; ++n, src += plan.size) {
+            const uint8_t* values = AttrValues(a, src, streamBe);
+            PicaVertex& v = out[n];
+            v.x = LoadComponent(values, Type, scale, be);
+            v.y = LoadComponent(values + step, Type, scale, be);
+            v.z = 0.0f;
+        }
+    }
+}
+
 // Decode `count` GX vertices of format `fmt` into the frame's vertex buffer; false when it is full.
 bool DecodeVertices(GXVtxFmt fmt, const uint8_t* src, uint32_t count, bool be)
 {
     if (g_vtxUsed + count > kMaxVertices) return false;
-    const auto& vf = g_gxState.vtxFmts[fmt];
-    const auto& desc = g_gxState.vtxDesc;
-    const uint8_t defaultRow = static_cast<uint8_t>(g_gxState.currentPnMtx * 3);
+    VertexPlan plan;
+    BuildPlan(fmt, be, plan);
     PicaVertex* out = g_vertices + g_vtxUsed;
-    for (uint32_t n = 0; n < count; ++n) {
-        PicaVertex v{};
-        v.r = g_falseColor[0], v.g = g_falseColor[1], v.b = g_falseColor[2], v.a = 255;  // no vertex color
-        v.row = defaultRow;
-        for (int attr = GX_VA_PNMTXIDX; attr <= GX_VA_TEX7; ++attr) {
-            const GXAttrType type = desc[attr];
-            if (type == GX_NONE) continue;
-            if (attr <= GX_VA_TEX7MTXIDX) {  // matrix indices: one byte, always direct
-                if (attr == GX_VA_PNMTXIDX) v.row = *src;
-                ++src;
-                continue;
-            }
-            const auto& af = vf.attrs[attr];
-            const uint8_t* values;
-            bool valuesBe = be;
-            if (type == GX_DIRECT) {
-                values = src;
-                src += DirectSize(attr, af);
-            } else {
-                const uint32_t idx = type == GX_INDEX16 ? Load16(src, be) : *src;
-                const uint32_t idxBytes = type == GX_INDEX16 ? 2 : 1;
-                src += (attr == GX_VA_NRM && af.cnt == GX_NRM_NBT3) ? idxBytes * 3 : idxBytes;
-                const auto& array = g_gxState.arrays[attr];
-                if (!array.data) continue;
-                values = static_cast<const uint8_t*>(array.data) + idx * array.stride;
-                valuesBe = !array.le;
-            }
-            if (attr == GX_VA_POS) {
-                const float scale = af.type == GX_F32 ? 1.0f : 1.0f / static_cast<float>(1u << af.frac);
-                const uint32_t step = comp_type_size(GX_VA_POS, af.type);
-                v.x = LoadComponent(values, af.type, scale, valuesBe);
-                v.y = LoadComponent(values + step, af.type, scale, valuesBe);
-                v.z = af.cnt == GX_POS_XYZ ? LoadComponent(values + 2 * step, af.type, scale, valuesBe) : 0.0f;
-            } else if (attr == GX_VA_CLR0) {
-                LoadColor(values, af.type, valuesBe, v);
-            }
+
+    // Color (or the batch's false color) and matrix row, then the positions.
+    const uint8_t defaultRow = static_cast<uint8_t>(g_gxState.currentPnMtx * 3);
+    const uint32_t fallbackColor = uint32_t{g_falseColor[0]} | uint32_t{g_falseColor[1]} << 8 |
+                                   uint32_t{g_falseColor[2]} << 16 | 0xFF000000u;
+    if (plan.hasClr) {
+        const uint8_t* vtx = src;
+        for (uint32_t n = 0; n < count; ++n, vtx += plan.size) LoadColor(AttrValues(plan.clr, vtx, be), plan.clr.type, plan.clr.be, out[n]);
+    } else {
+        for (uint32_t n = 0; n < count; ++n) std::memcpy(&out[n].r, &fallbackColor, 4);
+    }
+    if (plan.pnMtxOffset >= 0) {
+        const uint8_t* vtx = src + plan.pnMtxOffset;
+        for (uint32_t n = 0; n < count; ++n, vtx += plan.size) out[n].row = *vtx;
+    } else {
+        for (uint32_t n = 0; n < count; ++n) out[n].row = defaultRow;
+    }
+    if (plan.hasPos) {
+        switch (plan.pos.type) {
+        case GX_U8: DecodePositions<GX_U8>(plan, src, be, count, out); break;
+        case GX_S8: DecodePositions<GX_S8>(plan, src, be, count, out); break;
+        case GX_U16: DecodePositions<GX_U16>(plan, src, be, count, out); break;
+        case GX_S16: DecodePositions<GX_S16>(plan, src, be, count, out); break;
+        default: DecodePositions<GX_F32>(plan, src, be, count, out); break;
         }
-        out[n] = v;
+    } else {
+        for (uint32_t n = 0; n < count; ++n) out[n].x = out[n].y = out[n].z = 0.0f;
     }
     g_vtxUsed += count;
     return true;
@@ -411,6 +503,7 @@ void SelfTest()
         } else {
             C3D_DrawArrays(GPU_TRIANGLES, 0, 3);
         }
+        g_lastTopFramebuffer = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
         C3D_FrameEnd(0);
         static const char* const kNames[] = {"sdmc:/3ds/brawl3ds/selftest_arrays.bmp",
                                              "sdmc:/3ds/brawl3ds/selftest_elements.bmp",
@@ -447,6 +540,7 @@ void SelfTest()
         BufInfo_Init(buf);
         BufInfo_Add(buf, g_vertices + 8, sizeof(PicaVertex), 1, 0x0);
         C3D_DrawArrays(GPU_TRIANGLES, 0, 3);
+        g_lastTopFramebuffer = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
         C3D_FrameEnd(0);
         Brawl3dsPicaScreenshot("sdmc:/3ds/brawl3ds/selftest_minimal.bmp");
         std::fprintf(stderr, "[pica] self-test D: mvp uniform at %d\n", mvpLoc);
@@ -483,6 +577,9 @@ void Brawl3dsPicaEndFrame()
     FlushBatch();
     GSPGPU_FlushDataCache(g_vertices, g_vtxUsed * sizeof(PicaVertex));
     GSPGPU_FlushDataCache(g_indices, g_idxUsed * sizeof(uint16_t));
+    // The framebuffer citro3d copies this frame into (its back buffer until the copy is done and it swaps).
+    g_lastTopFramebuffer = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
+    g_lastTopFramebuffer = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
     C3D_FrameEnd(0);
     g_frameOpen = false;
     g_debugFrame = false;  // a debug dump covers one frame
@@ -501,13 +598,14 @@ extern "C" void Brawl3dsPicaScreenshot(const char* path)
 {
     if (!g_ready) return;
     constexpr uint32_t w = 240, h = 400;  // the framebuffer is portrait
-    auto* rgb = static_cast<uint8_t*>(linearAlloc(w * h * 3));
-    if (!rgb) return;
-    // citro3d runs a frame's GPU work asynchronously after C3D_FrameEnd; a transfer issued at once can read the
-    // target before it (only the clear has landed). Let the GPU finish first.
+    // citro3d runs a frame's GPU work asynchronously after C3D_FrameEnd, then copies the target into the top
+    // screen's framebuffer (RGB8, 240x400, in ordinary memory). Let that finish, then read the copy the last frame
+    // went to. (A GPU transfer of our own waited on a GSP event citro3d's queue can take first: one console run sat
+    // in it for four minutes. The target itself is in VRAM, which the CPU cannot read.)
+    if (!g_lastTopFramebuffer) return;
     svcSleepThread(200000000LL);
-    C3D_SyncDisplayTransfer(reinterpret_cast<u32*>(g_target->frameBuf.colorBuf), GX_BUFFER_DIM(w, h),
-                            reinterpret_cast<u32*>(rgb), GX_BUFFER_DIM(w, h), kDisplayFlags);
+    const uint8_t* rgb = g_lastTopFramebuffer;
+    GSPGPU_InvalidateDataCache(rgb, w * h * 3);
     if (std::FILE* f = std::fopen(path, "wb")) {
         // BMP: 400 wide, 240 tall, bottom-up rows of BGR. Framebuffer pixel (x, y) (x across 240, y down 400, BGR)
         // shows at screen (y, 239 - x).
@@ -533,5 +631,4 @@ extern "C" void Brawl3dsPicaScreenshot(const char* path)
         }
         std::fclose(f);
     }
-    linearFree(rgb);
 }
