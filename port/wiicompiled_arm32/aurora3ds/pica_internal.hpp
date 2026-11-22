@@ -27,6 +27,8 @@ struct MaterialPlan {
     // The GX texture-coordinate sources the vertex buffer must carry (GX_VA_TEX0..TEX7), at most two.
     int uvAttr[2] = {-1, -1};
     bool skip = false;  // GX_CULL_ALL: nothing to draw
+    bool approximated = false;  // the combiners only approximate the GX TEV setup
+    int picaStages = 0;
 };
 
 // pica_tev_3ds.cpp: translate the current GX state (TEV, texture orders, alpha compare, blend, depth, cull) into

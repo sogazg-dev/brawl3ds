@@ -7,10 +7,18 @@ namespace {
 
 inline uint16_t Be16(const uint8_t* p) { return static_cast<uint16_t>(p[0] << 8 | p[1]); }
 
+// Reduction of the texture being decoded: 0 = full size, 1 = every second texel each way, 2 = every fourth.
+uint32_t g_shift = 0;
+
 inline void Put(uint8_t* out, uint32_t w, uint32_t h, uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b,
                 uint8_t a)
 {
     if (x >= w || y >= h) return;  // blocks past the edge of a texture whose size is not a block multiple
+    if (g_shift) {
+        if ((x | y) & ((1u << g_shift) - 1)) return;
+        x >>= g_shift, y >>= g_shift;
+        w = w >> g_shift ? w >> g_shift : 1;
+    }
     uint8_t* p = out + (static_cast<std::size_t>(y) * w + x) * 4;
     p[0] = r, p[1] = g, p[2] = b, p[3] = a;
 }
@@ -95,8 +103,9 @@ void DecodeCmpr(const uint8_t* src, uint32_t w, uint32_t h, uint8_t* out)
 } // namespace
 
 bool DecodeGxTexture(uint32_t format, const uint8_t* src, uint32_t w, uint32_t h, const uint8_t* tlut,
-                     uint32_t tlutFormat, uint32_t tlutEntries, uint8_t* out)
+                     uint32_t tlutFormat, uint32_t tlutEntries, uint8_t* out, uint32_t shift)
 {
+    g_shift = shift;
     switch (format) {
     case kGxI4:
         ForBlocks(w, h, 8, 8, 32, src, [&](uint32_t x, uint32_t y, uint32_t tx, uint32_t ty, const uint8_t* b) {

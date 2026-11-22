@@ -20,6 +20,9 @@
 extern "C" const unsigned char brawl3ds_gx_m3_shbin[];
 extern "C" const unsigned int brawl3ds_gx_m3_shbin_size;
 
+// What the renderer is doing, for main_3ds.cpp's stall report (heartbeat thread).
+extern "C" const char* volatile g_brawl3dsRenderPhase = "not started";
+
 namespace {
 using namespace aurora::gx;
 using namespace brawl3ds_pica;
@@ -63,6 +66,7 @@ bool g_skipFrame = false;       // OpenFrame gave up on a busy GPU: no drawing u
 uint32_t g_gpuStalls = 0;
 bool g_debugFrame = false;  // Brawl3dsPicaDebugNextFrame: log the next frame's first batches
 uint32_t g_debugBatches = 0;
+uint32_t g_debugSerial = 0;  // batches of the debug frame so far
 const uint8_t* g_lastTopFramebuffer = nullptr;  // for the screenshots
 // citro3d's command buffer: a match frame has ~555 batches, each uploading ~46 uniform vectors, its combiners,
 // textures and fragment state, plus its draw (~1 KiB a batch).
@@ -137,6 +141,7 @@ bool OpenFrame()
     // the safety screen. Poll instead, say so when the GPU stays busy, and drop the frame's drawing after 2 s.
     const uint64_t start = svcGetSystemTick();
     bool logged = false;
+    g_brawl3dsRenderPhase = "waiting for the GPU (frame start)";
     while (!C3D_FrameBegin(C3D_FRAME_NONBLOCK)) {
         const uint64_t waited = svcGetSystemTick() - start;
         if (!logged && waited > SYSCLOCK_ARM11) {
@@ -555,12 +560,16 @@ void Brawl3dsPicaDraw(GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, 
     }
     // The batch's material: combiners and fragment state, its textures, then the uniforms (which need the
     // textures' padding scales) and the channel color.
+    g_brawl3dsRenderPhase = "material and textures";
     ApplyMaterial(g_plan);
     float scaleS[kMaxUnits] = {1, 1, 1}, scaleT[kMaxUnits] = {1, 1, 1};
-    for (int u = 0; u < g_plan.unitCount; ++u) BindTexture(u, g_plan.units[u].texMap, scaleS[u], scaleT[u]);
+    int whiteUnits = 0;
+    for (int u = 0; u < g_plan.unitCount; ++u)
+        if (!BindTexture(u, g_plan.units[u].texMap, scaleS[u], scaleT[u])) ++whiteUnits;
     UploadUniforms(scaleS, scaleT);
     BuildChannel(g_channel);
 
+    g_brawl3dsRenderPhase = "vertices";
     g_batchVtx = g_vtxUsed;
     g_batchIdx = g_idxUsed;
     if (!DecodeVertices(fmt, vertices, vtxCount, bigEndian)) {
@@ -571,9 +580,28 @@ void Brawl3dsPicaDraw(GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, 
     g_idxUsed += indexCount;
     g_batchOpen = true;
 
-    // One frame's debug dump (Brawl3dsPicaDebugNextFrame): the first batches' materials and first vertex.
-    if (g_debugFrame && g_debugBatches < 12) {
+    // One frame's debug dump (Brawl3dsPicaDebugNextFrame): the first batches, then the ones whose material may be
+    // drawn wrong (approximated, a texture missing, three or more TEV stages), with their TEV stages.
+    ++g_debugSerial;
+    const bool suspect = g_plan.approximated || whiteUnits > 0 || g_gxState.numTevStages >= 3;
+    if (g_debugFrame && (g_debugSerial <= 6 || (suspect && g_debugBatches < 40))) {
         ++g_debugBatches;
+        std::fprintf(stderr, "[pica] -- batch #%u of the frame: %s%s%d PICA stages, %d white units\n", g_debugSerial,
+                     g_plan.approximated ? "approximated, " : "", suspect ? "suspect, " : "", g_plan.picaStages,
+                     whiteUnits);
+        for (u32 s = 0; s < g_gxState.numTevStages && s < MaxTevStages; ++s) {
+            const TevStage& st = g_gxState.tevStages[s];
+            std::fprintf(stderr,
+                         "[pica]    tev %u: color %d %d %d %d op %d bias %d scale %d out %d | alpha %d %d %d %d op %d "
+                         "bias %d scale %d out %d | map %d coord %d chan %d kc %d ka %d swap %d/%d ind %d\n",
+                         s, st.colorPass.a, st.colorPass.b, st.colorPass.c, st.colorPass.d, st.colorOp.op,
+                         st.colorOp.bias, st.colorOp.scale, st.colorOp.outReg, st.alphaPass.a, st.alphaPass.b,
+                         st.alphaPass.c, st.alphaPass.d, st.alphaOp.op, st.alphaOp.bias, st.alphaOp.scale,
+                         st.alphaOp.outReg, static_cast<int>(st.texMapId), static_cast<int>(st.texCoordId),
+                         static_cast<int>(st.channelId), static_cast<int>(st.kcSel), static_cast<int>(st.kaSel),
+                         static_cast<int>(st.tevSwapRas), static_cast<int>(st.tevSwapTex),
+                         static_cast<int>(st.indTexMtxId));
+        }
         const PicaVertex& v = g_vertices[g_batchVtx];
         std::fprintf(stderr,
                      "[pica] batch %u: fmt %d, %u verts, %u indices, tev %u stages, %d units (", g_debugBatches,
@@ -597,6 +625,7 @@ extern "C" void Brawl3dsPicaDebugNextFrame()
 {
     g_debugFrame = true;
     g_debugBatches = 0;
+    g_debugSerial = 0;
 }
 
 // An unchanged-state draw appended to the open batch; false when there is none (the caller draws it in full).
@@ -710,7 +739,9 @@ void Brawl3dsPicaEndFrame()
     TakePendingCapture();
     // The framebuffer citro3d copies this frame into (its back buffer until the copy is done and it swaps).
     g_lastTopFramebuffer = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
+    g_brawl3dsRenderPhase = "C3D_FrameEnd";
     C3D_FrameEnd(0);
+    g_brawl3dsRenderPhase = "idle (game code)";
     g_frameOpen = false;
     g_debugFrame = false;  // a debug dump covers one frame
 }

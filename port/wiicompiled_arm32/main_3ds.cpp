@@ -129,6 +129,7 @@ extern "C" void Brawl3dsPicaWriteCaptures();
 extern "C" void Brawl3dsPicaWriteStats(std::FILE* f, unsigned frames);
 extern "C" uint32_t Brawl3dsPicaTakeDropped();
 extern "C" void Brawl3dsPicaDebugNextFrame();
+extern "C" const char* volatile g_brawl3dsRenderPhase;  // aurora3ds/pica_renderer_3ds.cpp
 uint64_t g_droppedDraws = 0;                     // draws the renderer's per-frame buffers had no room for
 extern "C" void Brawl3dsZonesReset();
 extern "C" void Brawl3dsZonesWrite(std::FILE* f, unsigned frames);
@@ -548,9 +549,11 @@ void WriteMatchSummary()
 }  // namespace
 
 // The renderer back end's draw count (aurora3ds/backend_3ds.cpp), one call per GX draw that reaches it.
+uint32_t g_frameDraws = 0;  // this frame's GX draws (logged around the last capture)
 extern "C" void Brawl3dsRendererCountDraw(uint32_t vertices, uint32_t)
 {
     ++g_windowDraws;
+    ++g_frameDraws;
     g_windowVerts += vertices;
     if (g_scene == "scMelee") {
         ++g_matchDraws;
@@ -607,7 +610,25 @@ void HeartbeatThread(void*)
         }
         if (g_frames > 0) {
             if (g_step >= kStepResults) return;
-            continue;  // frames are running: Brawl3dsFrameEnd redraws and watches for stalls
+            // Frames are running: Brawl3dsFrameEnd redraws. A frame count that stops moving is a stall (seen in
+            // Azahar on the safety screen; on the console once, 248 s in VIWaitForRetrace after a 3 s frame): say
+            // where the guest and the renderer are, every 30 s while it lasts. (guest lr 80023B20 =
+            // VIWaitForRetrace's call in the frame loop.)
+            static uint32_t lastFrames = 0, stillSeconds = 0;
+            if (g_frames != lastFrames) {
+                if (stillSeconds >= 10) Log("stall over after %u s (frame %u)\n", stillSeconds, g_frames);
+                lastFrames = g_frames;
+                stillSeconds = 0;
+            } else if (++stillSeconds >= 10 && (stillSeconds - 10) % 30 == 0) {
+                SampleGuest();
+                Log("STALL: no frame for %u s at frame %u (step %d, scene %s); guest lr %08lX sp %08lX r3 %08lX; "
+                    "renderer: %s\n",
+                    stillSeconds, g_frames, g_step + 1, g_scene.c_str(), static_cast<unsigned long>(g_sampleLr),
+                    static_cast<unsigned long>(g_sampleSp), static_cast<unsigned long>(g_sampleR3),
+                    g_brawl3dsRenderPhase ? g_brawl3dsRenderPhase : "-");
+                if (g_log) std::fflush(g_log);
+            }
+            continue;
         }
         // Screen first: it needs no file access, so it keeps working even if the SD card service or a stdio lock is
         // stuck. g_heartbeatWait names the next operation, so a frozen screen shows which one never returned.
@@ -694,7 +715,11 @@ extern "C" void Brawl3dsFrameEnd()
     // The frame before each capture also logs its first batches to stderr.txt (decoded vertex, where it lands).
     if (g_frames == 699 || g_frames == 1999 || g_frames == 2872) Brawl3dsPicaDebugNextFrame();
     // Top-screen captures for checking the picture: the safety screen, the title screen, two match frames.
-    if (g_frames == 700 || g_frames == 2000 || g_frames == 2873 || g_frames == 3373) {
+    // Frames around the last capture: their draw counts (does the HUD come every other frame?).
+    if (g_frames >= 3370 && g_frames <= 3376) Log("frame %u: %u GX draws\n", g_frames, g_frameDraws);
+    g_frameDraws = 0;
+    // Two captures in a row at the end: the HUD showed on the screen but not in single captures.
+    if (g_frames == 700 || g_frames == 2000 || g_frames == 2873 || g_frames == 3373 || g_frames == 3374) {
         char path[64];
         std::snprintf(path, sizeof(path), "sdmc:/3ds/brawl3ds/shot_%u.bmp", g_frames);
         Brawl3dsPicaCaptureNextFrame(path);  // kept in memory, written with the results

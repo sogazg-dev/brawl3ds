@@ -765,6 +765,8 @@ void ApplyMaterial(MaterialPlan& plan)
     g_statGxStagesSum += static_cast<uint64_t>(stages);
     g_statMaxStages = std::max(g_statMaxStages, std::max(cc.prog[kRgb].count, cc.prog[kAlpha].count));
     if (cc.approximated) ++g_statApprox;
+    plan.approximated = cc.approximated;
+    plan.picaStages = total;
 }
 
 void WriteTevStats(std::FILE* f, unsigned frames)

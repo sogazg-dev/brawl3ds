@@ -232,28 +232,41 @@ uint8_t* g_scratch = nullptr;
 CreateResult Create(const GXTexObj_& obj, const GXTlutObj_* tlut, TexEntry& e)
 {
     const uint32_t w = obj.width(), h = obj.height(), fmt = obj.format();
-    if (!obj.data || w == 0 || h == 0 || w > 1024 || h > 1024) return CreateResult::kFailed;
+    if (!obj.data || w == 0 || h == 0 || w > 1024 || h > 1024) {
+        std::fprintf(stderr, "[pica] texture %ux%u format %u: %s\n", w, h, fmt, obj.data ? "too large" : "no data");
+        return CreateResult::kFailed;
+    }
     const bool paletted = fmt == GX_TF_C4 || fmt == GX_TF_C8 || fmt == GX_TF_C14X2;
-    if (paletted && (!tlut || !tlut->data || tlut->numEntries == 0)) return CreateResult::kFailed;
+    if (paletted && (!tlut || !tlut->data || tlut->numEntries == 0)) {
+        std::fprintf(stderr, "[pica] texture %ux%u format %u: no palette (tlut %u)\n", w, h, fmt,
+                     static_cast<unsigned>(obj.tlut));
+        return CreateResult::kFailed;
+    }
     if (!g_staging || g_uploadsThisFrame >= kMaxUploadsPerFrame) return CreateResult::kDeferred;
 
-    // Above 128 texels the top screen (400x240) cannot show the full resolution: keep half.
+    // Above 128 texels the top screen (400x240) cannot show the full resolution: keep half. Above 512x512 the
+    // decode buffer is too small: the decoder keeps every second (or fourth) texel.
+    uint32_t shift = 0;
+    while ((static_cast<size_t>(w >> shift) * (h >> shift) * 4) > kScratchBytes) ++shift;
     const bool half = (w > 128 || h > 128) && w >= 16 && h >= 16;
+    const uint32_t level = std::max<uint32_t>(shift, half ? 1 : 0);
     const uint32_t W = NextPow2(w), H = NextPow2(h);
-    const uint32_t picaW = half ? std::max(8u, W / 2) : W, picaH = half ? std::max(8u, H / 2) : H;
+    const uint32_t picaW = std::max(8u, W >> level), picaH = std::max(8u, H >> level);
     // The PICA format depends on the texels (alpha or not); this check uses the largest (4 bytes a texel).
     if (g_stagingUsed > 0 && g_stagingUsed + static_cast<size_t>(picaW) * picaH * 4 > kStagingBytes)
         return CreateResult::kDeferred;
 
-    if (!g_scratch || static_cast<size_t>(w) * h * 4 > kScratchBytes) return CreateResult::kFailed;  // over 512x512
+    if (!g_scratch) return CreateResult::kFailed;
     const uint64_t t0 = svcGetSystemTick();
     if (!DecodeGxTexture(fmt, static_cast<const uint8_t*>(obj.data), w, h,
                          tlut ? static_cast<const uint8_t*>(tlut->data) : nullptr, tlut ? tlut->format : 0,
-                         tlut ? tlut->numEntries : 0, g_scratch))
+                         tlut ? tlut->numEntries : 0, g_scratch, shift)) {
+        std::fprintf(stderr, "[pica] texture %ux%u format %u: unknown format\n", w, h, fmt);
         return CreateResult::kFailed;
+    }
     const uint8_t* rgba = g_scratch;
-    uint32_t tw = w, th = h;
-    if (half) HalveInPlace(g_scratch, w, h, tw, th);
+    uint32_t tw = std::max(1u, w >> shift), th = std::max(1u, h >> shift);
+    if (half && shift == 0) HalveInPlace(g_scratch, w, h, tw, th);
 
     const GPU_TEXCOLOR pf = PicaFormat(fmt, paletted ? tlut->format : 0, rgba, static_cast<size_t>(tw) * th);
     const size_t bytes = PicaBytes(pf, picaW, picaH);

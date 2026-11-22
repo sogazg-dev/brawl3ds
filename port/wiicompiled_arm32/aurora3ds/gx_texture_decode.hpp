@@ -16,9 +16,10 @@ enum GxTexFormat : uint32_t {
 };
 enum GxTlutFormat : uint32_t { kGxTlutIA8 = 0, kGxTlutRGB565 = 1, kGxTlutRGB5A3 = 2 };
 
-// Decodes the base level of a w x h texture into `out` (w * h * 4 bytes, RGBA). `tlut` (big-endian entries, the
+// Decodes the base level of a w x h texture into `out` (RGBA, (w >> shift) x (h >> shift) texels: `shift` keeps
+// every 2^shift-th texel each way, for textures larger than the caller's buffer). `tlut` (big-endian entries, the
 // palette format `tlutFormat`, `tlutEntries` long) is needed for C4/C8/C14X2. False for an unknown format.
 bool DecodeGxTexture(uint32_t format, const uint8_t* src, uint32_t w, uint32_t h, const uint8_t* tlut,
-                     uint32_t tlutFormat, uint32_t tlutEntries, uint8_t* out);
+                     uint32_t tlutFormat, uint32_t tlutEntries, uint8_t* out, uint32_t shift = 0);
 
 } // namespace brawl3ds_pica
