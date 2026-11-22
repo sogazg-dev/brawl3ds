@@ -596,10 +596,12 @@ void ApplyPixelState(MaterialPlan& plan)
     fs.depthFunc = g_gxState.depthCompare ? TestFunc(g_gxState.depthFunc) : GPU_ALWAYS;
     fs.writeMask = writeMask;
 
-    // GX front faces are clockwise on screen; after the projection (y up) they are counter-clockwise.
+    // GX front faces are clockwise in clip space (y up): Brawl's 2D layout quads (top left, top right, bottom right,
+    // bottom left with y up) are drawn with GX_CULL_BACK. The PICA names faces by counter-clockwise = front, so GX's
+    // back faces are the PICA's front ones. (The other way round, every 2D screen was black.)
     switch (g_gxState.cullMode) {
-    case GX_CULL_BACK: fs.cull = GPU_CULL_BACK_CCW; break;
-    case GX_CULL_FRONT: fs.cull = GPU_CULL_FRONT_CCW; break;
+    case GX_CULL_BACK: fs.cull = GPU_CULL_FRONT_CCW; break;
+    case GX_CULL_FRONT: fs.cull = GPU_CULL_BACK_CCW; break;
     case GX_CULL_ALL:
         fs.cull = GPU_CULL_NONE;
         plan.skip = true;

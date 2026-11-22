@@ -85,8 +85,12 @@ inline uint32_t Morton(uint32_t x, uint32_t y)
 void PackTiled(const uint8_t* rgba, uint32_t w, uint32_t h, uint32_t W, uint32_t H, GPU_TEXCOLOR fmt, uint8_t* out)
 {
     const uint32_t bpp = fmt == GPU_RGBA8 ? 4 : (fmt == GPU_LA4 ? 1 : 2);
+    // The PICA samples t = 0 from the last row in memory and t = 1 from the first, GX t = 0 from its first row:
+    // memory row y holds GX row H - 1 - y (rows past the GX height repeat its last row). Unflipped, every texture
+    // of the safety screen showed upside down.
     for (uint32_t y = 0; y < H; ++y) {
-        const uint8_t* row = rgba + static_cast<size_t>(std::min(y, h - 1)) * w * 4;
+        const uint32_t gxRow = H - 1 - y;
+        const uint8_t* row = rgba + static_cast<size_t>(std::min(gxRow, h - 1)) * w * 4;
         const uint32_t tileRow = (y >> 3) * (W >> 3);
         for (uint32_t x = 0; x < W; ++x) {
             const uint8_t* p = row + std::min(x, w - 1) * 4;
@@ -192,6 +196,8 @@ void EvictFor(size_t needed)
 // ahead of the frame's draws. The staging buffer is reused each frame (the previous frame's queue has finished by
 // then), so a frame uploads at most kStagingBytes in kMaxUploadsPerFrame copies; textures past that wait a frame.
 constexpr size_t kStagingBytes = 256u * 1024u;
+// Each upload is one entry on citro3d's GX command queue, which only starts running at the frame's end: with 16
+// a frame (plus citro3d's own entries) the safety screen's burst of textures stalled the game in Azahar twice.
 constexpr uint32_t kMaxUploadsPerFrame = 8;
 uint8_t* g_staging = nullptr;
 size_t g_stagingUsed = 0;

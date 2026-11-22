@@ -59,6 +59,8 @@ uint32_t g_batchVtx = 0, g_batchIdx = 0;
 bool g_batchOpen = false;
 MaterialPlan g_plan;
 uint32_t g_droppedDraws = 0;
+bool g_skipFrame = false;       // OpenFrame gave up on a busy GPU: no drawing until the frame ends
+uint32_t g_gpuStalls = 0;
 bool g_debugFrame = false;  // Brawl3dsPicaDebugNextFrame: log the next frame's first batches
 uint32_t g_debugBatches = 0;
 const uint8_t* g_lastTopFramebuffer = nullptr;  // for the screenshots
@@ -129,8 +131,26 @@ void ApplyFixedState()
 bool OpenFrame()
 {
     if (g_frameOpen) return true;
-    if (!Init()) return false;
-    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);  // waits for the previous frame: its buffers are reused below
+    if (g_skipFrame || !Init()) return false;
+    // The previous frame's GPU work must be done: this frame reuses its buffers. Not C3D_FRAME_SYNCDRAW, which also
+    // waits for citro3d's vblank-paced frame slot (the game paces itself): with it, Azahar runs stalled for good on
+    // the safety screen. Poll instead, say so when the GPU stays busy, and drop the frame's drawing after 2 s.
+    const uint64_t start = svcGetSystemTick();
+    bool logged = false;
+    while (!C3D_FrameBegin(C3D_FRAME_NONBLOCK)) {
+        const uint64_t waited = svcGetSystemTick() - start;
+        if (!logged && waited > SYSCLOCK_ARM11) {
+            std::fprintf(stderr, "[pica] GPU still busy with the previous frame after 1 s\n");
+            logged = true;
+        }
+        if (waited > 2ull * SYSCLOCK_ARM11) {
+            std::fprintf(stderr, "[pica] GPU busy for 2 s: this frame is not drawn\n");
+            ++g_gpuStalls;
+            g_skipFrame = true;
+            return false;
+        }
+        svcSleepThread(500000);  // 0.5 ms
+    }
     const auto& cc = g_gxState.clearColor;
     auto byte = [](float v) { return static_cast<uint32_t>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
     const uint32_t clear = byte(cc[0]) << 24 | byte(cc[1]) << 16 | byte(cc[2]) << 8 | 0xFF;
@@ -674,12 +694,14 @@ extern "C" void Brawl3dsPicaWriteCaptures()
 // Material and texture statistics for the match summary (headless.log).
 extern "C" void Brawl3dsPicaWriteStats(std::FILE* f, unsigned frames)
 {
+    if (f) std::fprintf(f, "GPU stalls (frames not drawn after 2 s of waiting): %u\n", g_gpuStalls);
     WriteTevStats(f, frames);
     WriteTextureStats(f, frames);
 }
 
 void Brawl3dsPicaEndFrame()
 {
+    g_skipFrame = false;
     if (!g_frameOpen) return;
     FlushBatch();
     GSPGPU_FlushDataCache(g_vertices, g_vtxUsed * sizeof(PicaVertex));
