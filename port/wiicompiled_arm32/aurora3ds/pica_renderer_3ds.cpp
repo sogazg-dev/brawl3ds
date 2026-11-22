@@ -571,6 +571,55 @@ bool Brawl3dsPicaAppend(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices,
     return true;
 }
 
+namespace {
+// In-game captures: Brawl3dsPicaCaptureNextFrame keeps the copy of the frame that just ended, taken at the next
+// frame's end (no waiting), and Brawl3dsPicaWriteCaptures writes them at the end of the run. Writing one at once
+// stalled the game ~3 s (a GPU wait and a slow SD write), and in two console runs one such stall was followed by a
+// four-minute one in VIWaitForRetrace.
+constexpr uint32_t kShotW = 240, kShotH = 400, kShotBytes = kShotW * kShotH * 3;
+struct Capture {
+    char path[64];
+    uint8_t* rgb;
+};
+Capture g_captures[8];
+uint32_t g_captureCount = 0;
+const uint8_t* g_pendingCaptureSource = nullptr;
+char g_pendingCapturePath[64];
+
+void TakePendingCapture()
+{
+    if (!g_pendingCaptureSource) return;
+    const uint8_t* src = g_pendingCaptureSource;
+    g_pendingCaptureSource = nullptr;
+    if (g_captureCount >= sizeof(g_captures) / sizeof(g_captures[0])) return;
+    auto* rgb = static_cast<uint8_t*>(std::malloc(kShotBytes));
+    if (!rgb) return;
+    GSPGPU_InvalidateDataCache(src, kShotBytes);
+    std::memcpy(rgb, src, kShotBytes);
+    Capture& c = g_captures[g_captureCount++];
+    std::snprintf(c.path, sizeof(c.path), "%s", g_pendingCapturePath);
+    c.rgb = rgb;
+}
+} // namespace
+
+void WriteBmp(const char* path, const uint8_t* rgb);
+
+extern "C" void Brawl3dsPicaCaptureNextFrame(const char* path)
+{
+    if (!g_ready || !g_lastTopFramebuffer) return;
+    g_pendingCaptureSource = g_lastTopFramebuffer;
+    std::snprintf(g_pendingCapturePath, sizeof(g_pendingCapturePath), "%s", path);
+}
+
+extern "C" void Brawl3dsPicaWriteCaptures()
+{
+    for (uint32_t i = 0; i < g_captureCount; ++i) {
+        WriteBmp(g_captures[i].path, g_captures[i].rgb);
+        std::free(g_captures[i].rgb);
+    }
+    g_captureCount = 0;
+}
+
 void Brawl3dsPicaEndFrame()
 {
     if (!g_frameOpen) return;
@@ -578,7 +627,8 @@ void Brawl3dsPicaEndFrame()
     GSPGPU_FlushDataCache(g_vertices, g_vtxUsed * sizeof(PicaVertex));
     GSPGPU_FlushDataCache(g_indices, g_idxUsed * sizeof(uint16_t));
     // The framebuffer citro3d copies this frame into (its back buffer until the copy is done and it swaps).
-    g_lastTopFramebuffer = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
+    // A capture asked for after the previous frame: that frame's copy is complete now (C3D_FrameBegin waited).
+    TakePendingCapture();
     g_lastTopFramebuffer = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
     C3D_FrameEnd(0);
     g_frameOpen = false;
@@ -593,7 +643,7 @@ extern "C" uint32_t Brawl3dsPicaTakeDropped()
     return n;
 }
 
-// The last rendered top-screen frame as a 400x240 24-bit BMP (for checking the picture in Azahar and on the console).
+// The last rendered top-screen frame as a 400x240 24-bit BMP, written at once (the renderer's start-up self-test).
 extern "C" void Brawl3dsPicaScreenshot(const char* path)
 {
     if (!g_ready) return;
@@ -604,8 +654,14 @@ extern "C" void Brawl3dsPicaScreenshot(const char* path)
     // in it for four minutes. The target itself is in VRAM, which the CPU cannot read.)
     if (!g_lastTopFramebuffer) return;
     svcSleepThread(200000000LL);
-    const uint8_t* rgb = g_lastTopFramebuffer;
-    GSPGPU_InvalidateDataCache(rgb, w * h * 3);
+    GSPGPU_InvalidateDataCache(g_lastTopFramebuffer, w * h * 3);
+    WriteBmp(path, g_lastTopFramebuffer);
+}
+
+// A 240x400 RGB8 top-screen framebuffer copy as a 400x240 24-bit BMP.
+void WriteBmp(const char* path, const uint8_t* rgb)
+{
+    constexpr uint32_t w = kShotW;
     if (std::FILE* f = std::fopen(path, "wb")) {
         // BMP: 400 wide, 240 tall, bottom-up rows of BGR. Framebuffer pixel (x, y) (x across 240, y down 400, BGR)
         // shows at screen (y, 239 - x).

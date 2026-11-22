@@ -122,7 +122,8 @@ uint64_t g_matchDisplayListTicks = 0;  // time in Aurora's GXCallDisplayList dur
 uint32_t g_pipelineConfigs = 0;
 extern "C" void Brawl3dsRendererTakeStats(uint64_t* displayListTicks, uint32_t* pipelines);
 extern "C" bool Brawl3dsPicaActive();            // aurora3ds/pica_renderer_3ds.cpp
-extern "C" void Brawl3dsPicaScreenshot(const char* path);
+extern "C" void Brawl3dsPicaCaptureNextFrame(const char* path);
+extern "C" void Brawl3dsPicaWriteCaptures();
 extern "C" uint32_t Brawl3dsPicaTakeDropped();
 extern "C" void Brawl3dsPicaDebugNextFrame();
 uint64_t g_droppedDraws = 0;                     // draws the renderer's per-frame buffers had no room for
@@ -523,6 +524,7 @@ void WriteMatchSummary()
     const double avg = TicksToMs(g_matchSum) / g_matchFrames;
     Brawl3dsProfilerWrite("sdmc:/3ds/brawl3ds/profile.txt", g_matchFrames, avg);
     Brawl3dsZonesWrite(g_log, g_matchFrames);
+    Brawl3dsPicaWriteCaptures();
     Log("\n== VS demo match: %u frames measured ==\n"
         "average frame  %.2f ms (%.1f fps)\n"
         "average game   %.2f ms (time between aurora_begin_frame and aurora_end_frame)\n"
@@ -690,7 +692,7 @@ extern "C" void Brawl3dsFrameEnd()
     if (g_frames == 700 || g_frames == 2000 || g_frames == 2873 || g_frames == 3373) {
         char path[64];
         std::snprintf(path, sizeof(path), "sdmc:/3ds/brawl3ds/shot_%u.bmp", g_frames);
-        Brawl3dsPicaScreenshot(path);
+        Brawl3dsPicaCaptureNextFrame(path);  // kept in memory, written with the results
         Log("screenshot: %s (renderer %s, %llu draws dropped so far)\n", path,
             Brawl3dsPicaActive() ? "active" : "not started", static_cast<unsigned long long>(g_droppedDraws));
     }
