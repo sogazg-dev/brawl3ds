@@ -2,12 +2,20 @@
 ; texture-coordinate generators.
 ; Inputs: position (object space); the channel's material color (0-255: the vertex color or the material
 ; register); the GX matrix row of the vertex's position matrix (PNMTXIDX: 0, 3, ..., 27, or the current matrix)
-; with the object-space normal (x127); one texture-coordinate set (u, v in 1/512 steps; set B, from the loader's
-; (z, w) = (0, 1), is unused: its weights are 0).
-; Uniforms: the GX projection (4 rows, pre-rotated for the 240x400 portrait framebuffer: rows 1, -0, 2, 3), the 10
-; GX position matrices (3 rows each), per texture unit a source selector (weights of set A, set B and the object
-; position) and a texture matrix (rows s, t, q; q = (0, 0, 0, 1) for a 2x4 GX matrix); for lighting the ambient
-; color, the batch's light model and up to 8 lights.
+; with the object-space normal (x127); texture-coordinate set A (u, v in 1/512 steps); set B (the same), loaded
+; only for batches that read two sets (twoset): the others keep the four inputs, and v4 is never read for them.
+; Uniforms: the GX projection (4 rows, pre-rotated for the 240x400 portrait framebuffer: rows 1, -0, 2, 3, with the
+; GX viewport folded in), the 10 GX position matrices (3 rows each), per texture unit a source selector (weights of
+; set A, set B, the object position and the object normal) and a texture matrix (rows s, t, q; q = (0, 0, 0, 1) for
+; a 2x4 GX matrix); for lighting the ambient color, the batch's light model and up to 8 lights.
+;
+;
+; GX fog, per vertex (when the batch's material leaves texture unit 2 and a combiner stage free): the fog amount
+; from the vertex's GX screen depth d = z/w + 1 (the projection keeps it equal), as Aurora's shader.cpp:
+;   ze = A / (B - K d) (perspective; A = a * 2^24, B = b, K = 2^(24 - shift)) or a d (orthographic)
+;   F = clamp(ze - c), then linear F, exp 1 - 2^(-8F), exp2 1 - 2^(-8F^2), revexp 2^(-8(1-F)),
+;   revexp2 2^(-8(1-F)^2)
+; It leaves as unit 2's s coordinate, into an 8-texel alpha ramp: a last combiner stage blends to the fog color by it.
 ;
 ; GX lighting (as Aurora's shader.cpp lighting_func, per vertex, in view space):
 ;   lacc = ambient + sum over the channel's lights of color * attn * diff, clamped to 0..1; channel = material * lacc
@@ -28,9 +36,14 @@
 .fvec lights[40]   ; per light: pos, dir, color (masked per part), cosatt, distatt
 .ivec lightloop    ; (lights - 1, 0, 5, 0)
 .bool lit
+.fvec fogp[3]      ; (A, B, K, c), (perspective weight, orthographic weight, a, 0), (reverse, squared, linear, 0)
+.bool fogv         ; per-vertex fog for this batch
+.bool twoset       ; the batch's vertices carry set B (input v4)
 
 .constf consts(1.0, 0.0, 0.00392156862745098, 0.001953125)
 .constf consts2(0.0078740157480315, 0.0, 0.0, 0.0)
+.constf fogk(2.0, -8.0, 0.875, 0.0625)   ; 2, -8, and the ramp's texel mapping s = F * 7/8 + 1/16
+.constf fogk2(0.5, 0.0, 0.0, 0.0)
 .alias ones consts.xxxx
 .alias zeros consts.yyyy
 .alias inv255 consts.zzzz
@@ -47,6 +60,7 @@
 .alias inclr v1
 .alias inrow v2
 .alias inuv v3
+.alias inuv2 v4
 
 .proc main
     ; object -> view with the vertex's position matrix (a0.x = its first row)
@@ -65,16 +79,22 @@
     dp4 r2.w, proj[3], r1
     mov outpos, r2
 
-    ; texture-coordinate sources: A = (uA, vA, 1, 1), B = (uB, vB, 1, 1), position = r0
+    ; texture-coordinate sources: A = (uA, vA, 1, 1), B = (uB, vB, 1, 1), position = r0, normal = (n, 1)
     mul r3.xy, inv512, inuv.xy
     mov r3.zw, ones
-    mov r4.xy, inuv.zw
+    mov r4.xy, zeros
+    ifu twoset
+        mul r4.xy, inv512, inuv2.xy
+    .end
     mov r4.zw, ones
+    mul r11.xyz, inv127, inrow.yzww
+    mov r11.w, ones
 
     ; unit 0
     mul r5, texsrc[0].xxxx, r3
     mad r5, r4, texsrc[0].yyyy, r5
     mad r5, r0, texsrc[0].zzzz, r5
+    mad r5, r11, texsrc[0].wwww, r5
     dp4 r6.x, texmtx[0], r5
     dp4 r6.y, texmtx[1], r5
     dp4 r6.z, texmtx[2], r5
@@ -87,6 +107,7 @@
     mul r5, texsrc[1].xxxx, r3
     mad r5, r4, texsrc[1].yyyy, r5
     mad r5, r0, texsrc[1].zzzz, r5
+    mad r5, r11, texsrc[1].wwww, r5
     dp4 r7.x, texmtx[3], r5
     dp4 r7.y, texmtx[4], r5
     dp4 r7.z, texmtx[5], r5
@@ -99,12 +120,51 @@
     mul r5, texsrc[2].xxxx, r3
     mad r5, r4, texsrc[2].yyyy, r5
     mad r5, r0, texsrc[2].zzzz, r5
+    mad r5, r11, texsrc[2].wwww, r5
     dp4 r8.x, texmtx[6], r5
     dp4 r8.y, texmtx[7], r5
     dp4 r8.z, texmtx[8], r5
     rcp r8.z, r8.z
     mul r8.xy, r8.zz, r8.xy
     mov r8.zw, ones
+
+    ; per-vertex fog: its amount as unit 2's coordinate (r2 = the clip position)
+    ifu fogv
+        rcp r13.x, r2.wwww
+        mul r13.x, r13.xxxx, r2.zzzz
+        add r13.x, ones, r13.xxxx              ; d
+        mul r13.y, fogp[0].zzzz, r13.xxxx      ; K d
+        add r13.y, fogp[0].yyyy, -r13.yyyy     ; B - K d
+        rcp r13.y, r13.yyyy
+        mul r13.y, fogp[0].xxxx, r13.yyyy      ; A / (B - K d)
+        mul r13.y, fogp[1].xxxx, r13.yyyy      ; perspective weight
+        mul r13.z, fogp[1].zzzz, r13.xxxx      ; a d
+        mad r13.y, r13.zzzz, fogp[1].yyyy, r13.yyyy   ; ze
+        add r13.y, -fogp[0].wwww, r13.yyyy     ; ze - c
+        max r13.y, zeros, r13.yyyy
+        min r13.y, ones, r13.yyyy              ; F
+        mul r13.z, fogk.xxxx, r13.yyyy         ; 2F
+        add r13.z, ones, -r13.zzzz             ; 1 - 2F
+        mad r13.z, r13.zzzz, fogp[2].xxxx, r13.yyyy   ; G = F, or 1 - F reversed
+        mul r13.w, r13.zzzz, r13.zzzz
+        add r13.w, r13.wwww, -r13.zzzz
+        mad r13.w, r13.wwww, fogp[2].yyyy, r13.zzzz   ; X = G, or G^2 squared
+        mul r13.w, fogk.yyyy, r13.wwww         ; -8 X
+        ex2 r13.w, r13.wwww                    ; E = 2^(-8 X)
+        mul r14.x, fogk.xxxx, r13.wwww         ; 2E
+        add r14.x, -ones, r14.xxxx             ; 2E - 1
+        add r14.y, ones, -r13.wwww             ; 1 - E
+        mad r14.x, r14.xxxx, fogp[2].xxxx, r14.yyyy   ; 1 - E, or E reversed
+        add r14.z, r13.yyyy, -r14.xxxx
+        mad r14.x, r14.zzzz, fogp[2].zzzz, r14.xxxx   ; F when linear
+        max r14.x, zeros, r14.xxxx
+        min r14.x, ones, r14.xxxx
+        mul r14.x, fogk.zzzz, r14.xxxx
+        add r14.x, fogk.wwww, r14.xxxx         ; the ramp texel
+        mov r14.y, fogk2.xxxx
+        mov r14.zw, ones
+        mov r8, r14
+    .end
     mov outtc2, r8
 
     ; channel color: the material color, times the lighting when the batch is lit

@@ -9,8 +9,13 @@
 // matrix, the projection and the texture-coordinate generators. Batches go to citro3d as indexed triangle lists
 // into per-frame linear-memory buffers; the frame begins at its first draw and ends in Brawl3dsPicaEndFrame.
 // Milestone 4: GX per-vertex lighting of channel COLOR0A0 in the vertex shader (normals from the GX vertex,
-// lights as uniforms, UploadLighting). Not yet: channel COLOR1A1 (drawn as COLOR0A0), fog, indirect textures,
-// viewport/scissor, EFB copies.
+// lights as uniforms, UploadLighting); fog (pica_tev_3ds.cpp); a second texture-coordinate set and coordinates from
+// the normal. A batch that reads two sets uses a 28-byte vertex (PicaVertex2) in the same buffer; all others keep
+// the 24-byte one, so linear memory is spent only where needed.
+// The GX viewport is folded into the projection (a pass drawn into a corner of the EFB lands in the same corner of
+// the screen, and its depth range maps like GX's); an EFB texture copy that clears clears its rectangle with a quad
+// (Brawl3dsPicaClearRect). The copy itself is not made yet (milestone 6): its texture reads what guest memory holds.
+// Not yet: channel COLOR1A1 (drawn as COLOR0A0), indirect textures, the GX scissor, EFB copies.
 
 #include "pica_internal.hpp"
 
@@ -38,12 +43,20 @@ struct PicaVertex {
     int16_t uv[2];        // one texture-coordinate set in 1/512 steps (+-64; MaterialPlan::uvAttr[0])
 };
 static_assert(sizeof(PicaVertex) == 24);
+// The layout of batches that read two texture-coordinate sets: set B after the rest.
+struct PicaVertex2 : PicaVertex {
+    int16_t uv2[2];       // MaterialPlan::uvAttr[1], 1/512 steps
+};
+static_assert(sizeof(PicaVertex2) == 28);
 constexpr float kUvScale = 512.0f;  // gx_m4.v.pica multiplies by 1/512
+// The EFB the game draws into (aurora3ds's configured_fb_size): it maps onto the whole top screen.
+constexpr float kEfbWidth = 640.0f, kEfbHeight = 456.0f;
 constexpr uint32_t kMaxLights = 8;   // gx_m4.v.pica's lights[40]: 5 vectors each
 
 // Linear memory is nearly all guest RAM: these buffers, citro3d's command buffer and the texture staging buffer
 // have to fit in the ~3.5 MiB it leaves (main_3ds.cpp's kLinearHeap).
-constexpr uint32_t kMaxVertices = 78 * 1024;   // per frame; Brawl's match draws up to ~74,400
+constexpr uint32_t kMaxVertices = 78 * 1024;   // per frame at 24 bytes; Brawl's match draws up to ~74,400
+constexpr uint32_t kVertexBytes = kMaxVertices * sizeof(PicaVertex);
 constexpr uint32_t kMaxIndices = 160 * 1024;
 constexpr uint32_t kDisplayFlags =
     GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |
@@ -52,20 +65,29 @@ constexpr uint32_t kDisplayFlags =
 
 bool g_ready = false;
 bool g_failed = false;
+} // namespace
+unsigned brawl3ds_pica::g_debugFlags = 0;
+extern "C" void Brawl3dsPicaSetDebugFlags(unsigned flags) { brawl3ds_pica::g_debugFlags = flags; }
+namespace {
 bool g_frameOpen = false;
 C3D_RenderTarget* g_target = nullptr;
 DVLB_s* g_dvlb = nullptr;
 shaderProgram_s g_program;
 int g_projLoc = -1, g_mtxLoc = -1, g_texMtxLoc = -1, g_texSrcLoc = -1;
 int g_ambLoc = -1, g_lselLoc = -1, g_lightsLoc = -1, g_lightLoopLoc = -1, g_litLoc = -1;
-PicaVertex* g_vertices = nullptr;
+int g_fogpLoc = -1, g_fogvLoc = -1, g_twosetLoc = -1;
+uint8_t* g_vtxBytes = nullptr;  // the frame's vertices, each batch in its layout (PicaVertex or PicaVertex2)
 uint16_t* g_indices = nullptr;
-uint32_t g_vtxUsed = 0, g_idxUsed = 0;
-// The open batch: its first vertex and index in the frame buffers, and its material.
-uint32_t g_batchVtx = 0, g_batchIdx = 0;
+uint32_t g_vtxBytesUsed = 0, g_idxUsed = 0;
+// The open batch: where its vertices start in the vertex buffer, its first index, its vertex count and layout
+// (0: PicaVertex, 1: PicaVertex2), and its material.
+uint32_t g_batchVtxByte = 0, g_batchIdx = 0, g_batchVerts = 0;
+int g_batchLayout = 0;
+int g_curLayout = -1;  // the attribute layout citro3d has
 bool g_batchOpen = false;
 MaterialPlan g_plan;
 uint32_t g_droppedDraws = 0;
+uint32_t g_statClears = 0, g_statClearsSkipped = 0, g_statPartViewport = 0;
 bool g_skipFrame = false;       // OpenFrame gave up on a busy GPU: no drawing until the frame ends
 uint32_t g_gpuStalls = 0;
 bool g_debugFrame = false;  // Brawl3dsPicaDebugNextFrame: log the next frame's first batches
@@ -109,18 +131,22 @@ bool Init()
     g_lightsLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "lights");
     g_lightLoopLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "lightloop");
     g_litLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "lit");
+    g_fogpLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "fogp");
+    g_fogvLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "fogv");
+    g_twosetLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "twoset");
     if (g_projLoc < 0 || g_mtxLoc < 0 || g_texMtxLoc < 0 || g_texSrcLoc < 0 || g_ambLoc < 0 || g_lselLoc < 0 ||
-        g_lightsLoc < 0 || g_lightLoopLoc < 0 || g_litLoc < 0)
+        g_lightsLoc < 0 || g_lightLoopLoc < 0 || g_litLoc < 0 || g_fogpLoc < 0 || g_fogvLoc < 0 ||
+        g_twosetLoc < 0)
         return fail("the shader's uniforms");
-    g_vertices = static_cast<PicaVertex*>(linearAlloc(sizeof(PicaVertex) * kMaxVertices));
-    if (!g_vertices) return fail("the vertex buffer");
+    g_vtxBytes = static_cast<uint8_t*>(linearAlloc(kVertexBytes));
+    if (!g_vtxBytes) return fail("the vertex buffer");
     g_indices = static_cast<uint16_t*>(linearAlloc(sizeof(uint16_t) * kMaxIndices));
     if (!g_indices) return fail("the index buffer");
     std::fprintf(stderr,
                  "[pica] renderer ready: %u vertices, %u indices per frame (%u KiB linear), uniforms %d %d %d %d; "
                  "%u KiB linear, %u KiB VRAM free\n",
                  kMaxVertices, kMaxIndices,
-                 static_cast<unsigned>((sizeof(PicaVertex) * kMaxVertices + 2 * kMaxIndices) >> 10), g_projLoc,
+                 static_cast<unsigned>((kVertexBytes + 2 * kMaxIndices) >> 10), g_projLoc,
                  g_mtxLoc, g_texMtxLoc, g_texSrcLoc, static_cast<unsigned>(linearSpaceFree() >> 10),
                  static_cast<unsigned>(vramSpaceFree() >> 10));
     g_failed = false;
@@ -128,16 +154,35 @@ bool Init()
     return true;
 }
 
-// The state that does not change between batches; set at the start of every frame.
-void ApplyFixedState()
+// The vertex attribute layout: 0 = PicaVertex (four inputs), 1 = PicaVertex2 (set B as a fifth). No fixed attribute:
+// the console's GPU hung on the first draws (2 s every frame) in a build that gave layout 0 set B as a fixed 0 and
+// whose shader wrote texcoord2 twice (one of the two; per-vertex fog was cleared on the console later). The shader
+// reads set B only under its twoset flag. citro3d re-sends the attribute state whenever it is fetched for writing,
+// so it changes only when the layout does.
+inline void SetBoolUniform(int loc, bool on)
 {
-    C3D_BindProgram(&g_program);
+    if (C3D_BoolUnifs[GPU_VERTEX_SHADER] & BIT(loc - 0x68) ? !on : on) C3D_BoolUnifSet(GPU_VERTEX_SHADER, loc, on);
+}
+
+void SetLayout(int layout)
+{
+    if (layout == g_curLayout) return;
     C3D_AttrInfo* attr = C3D_GetAttrInfo();
     AttrInfo_Init(attr);
     AttrInfo_AddLoader(attr, 0, GPU_FLOAT, 3);          // position
     AttrInfo_AddLoader(attr, 1, GPU_UNSIGNED_BYTE, 4);  // channel color
     AttrInfo_AddLoader(attr, 2, GPU_BYTE, 4);           // matrix row, normal x 127
-    AttrInfo_AddLoader(attr, 3, GPU_SHORT, 2);          // texture coordinates x 512 (the shader sees u, v, 0, 1)
+    AttrInfo_AddLoader(attr, 3, GPU_SHORT, 2);          // texture coordinates set A x 512 (the shader sees u, v, 0, 1)
+    if (layout) AttrInfo_AddLoader(attr, 4, GPU_SHORT, 2);  // set B
+    g_curLayout = layout;
+}
+
+// The state that does not change between batches; set at the start of every frame.
+void ApplyFixedState()
+{
+    C3D_BindProgram(&g_program);
+    g_curLayout = -1;
+    SetLayout(0);
     // GX clip-space z runs from -w (near) to 0 (far), which is also the PICA's clip range. citro3d's default depth
     // map (depth = -z/w) makes near 1 and far 0; GX's depth buffer has near 0 and far 1, so the game's compare
     // functions and clear value apply unchanged with depth = z/w + 1.
@@ -175,7 +220,7 @@ bool OpenFrame()
     C3D_FrameDrawOn(g_target);
     ApplyFixedState();
     TexturesBeginFrame();
-    g_vtxUsed = g_idxUsed = 0;
+    g_vtxBytesUsed = g_idxUsed = 0;
     g_batchOpen = false;
     g_frameOpen = true;
     return true;
@@ -187,9 +232,13 @@ void FlushBatch()
     g_batchOpen = false;
     const uint32_t count = g_idxUsed - g_batchIdx;
     if (count == 0 || g_plan.skip) return;
+    SetLayout(g_batchLayout);
     C3D_BufInfo* buf = C3D_GetBufInfo();
     BufInfo_Init(buf);
-    BufInfo_Add(buf, g_vertices + g_batchVtx, sizeof(PicaVertex), 4, 0x3210);
+    if (g_batchLayout)
+        BufInfo_Add(buf, g_vtxBytes + g_batchVtxByte, sizeof(PicaVertex2), 5, 0x43210);
+    else
+        BufInfo_Add(buf, g_vtxBytes + g_batchVtxByte, sizeof(PicaVertex), 4, 0x3210);
     C3D_DrawElements(GPU_TRIANGLES, static_cast<int>(count), C3D_UNSIGNED_SHORT, g_indices + g_batchIdx);
 }
 
@@ -209,11 +258,32 @@ inline void SetVec(int id, const C3D_FVec& v)
 // Uniforms for a batch: the GX projection, position matrices and the texture-coordinate generators of its units.
 void UploadUniforms(const float scaleS[kMaxUnits], const float scaleT[kMaxUnits])
 {
+    // The GX viewport, folded into the projection: GX maps clip space onto the viewport's rectangle of the EFB and
+    // its depth range; the PICA maps it onto the whole screen and depth = z/w + 1 (ApplyFixedState). So x and y are
+    // scaled and moved to where the viewport sits in the 640x456 EFB, and z so that z/w + 1 is GX's screen depth
+    // zfar + (zfar - znear) * z/w. A viewport covering the EFB (any height from 448 to 528) is drawn as the whole
+    // screen.
+    const auto& vp = g_gxState.logicalViewport;
+    float sx = 1, ox = 0, sy = 1, oy = 0;
+    const bool whole = std::fabs(vp.left) < 0.5f && std::fabs(vp.top) < 0.5f && std::fabs(vp.width - kEfbWidth) < 0.5f &&
+                       vp.height >= 448.0f && vp.height <= 528.0f;
+    if (!whole && vp.width > 0 && vp.height > 0) {
+        sx = vp.width / kEfbWidth;
+        ox = (2.0f * vp.left + vp.width) / kEfbWidth - 1.0f;
+        sy = vp.height / kEfbHeight;
+        oy = 1.0f - (2.0f * vp.top + vp.height) / kEfbHeight;
+        ++g_statPartViewport;
+    }
+    const float zn = std::clamp(vp.znear, 0.0f, 1.0f), zf = std::clamp(vp.zfar, 0.0f, 1.0f);
+    const float sz = zf - zn, oz = zf - 1.0f;
     // The GX projection with the top screen's quarter turn folded in: clip (x, y) -> (y, -x), i.e. rows 1 and -0.
     const auto& p = g_gxState.proj;
-    SetVec(g_projLoc + 0, FVec4_New(p.m1[0], p.m1[1], p.m1[2], p.m1[3]));
-    SetVec(g_projLoc + 1, FVec4_New(-p.m0[0], -p.m0[1], -p.m0[2], -p.m0[3]));
-    SetVec(g_projLoc + 2, FVec4_New(p.m2[0], p.m2[1], p.m2[2], p.m2[3]));
+    auto mix = [](const aurora::Vec4<float>& a, float ka, const aurora::Vec4<float>& b, float kb) {
+        return FVec4_New(a[0] * ka + b[0] * kb, a[1] * ka + b[1] * kb, a[2] * ka + b[2] * kb, a[3] * ka + b[3] * kb);
+    };
+    SetVec(g_projLoc + 0, mix(p.m1, sy, p.m3, oy));
+    SetVec(g_projLoc + 1, mix(p.m0, -sx, p.m3, -ox));
+    SetVec(g_projLoc + 2, mix(p.m2, sz, p.m3, oz));
     SetVec(g_projLoc + 3, FVec4_New(p.m3[0], p.m3[1], p.m3[2], p.m3[3]));
     for (u32 i = 0; i < 10 && i < MaxPnMtx; ++i) {
         const auto& m = g_gxState.pnMtx[i].pos;
@@ -222,8 +292,8 @@ void UploadUniforms(const float scaleS[kMaxUnits], const float scaleT[kMaxUnits]
         SetVec(g_mtxLoc + i * 3 + 2, Row(m.m2));
     }
 
-    // Per unit: the source vector's weights (uv set A, uv set B, object position) and the texture matrix, rows
-    // s, t and q (q = 1 for a 2x4 matrix), scaled to the padded PICA texture.
+    // Per unit: the source vector's weights (uv set A, uv set B, object position, object normal) and the texture
+    // matrix, rows s, t and q (q = 1 for a 2x4 matrix), scaled to the padded PICA texture.
     for (int u = 0; u < kMaxUnits; ++u) {
         C3D_FVec s = FVec4_New(1, 0, 0, 0), m0 = FVec4_New(1, 0, 0, 0), m1 = FVec4_New(0, 1, 0, 0),
                  m2 = FVec4_New(0, 0, 0, 1);
@@ -232,8 +302,10 @@ void UploadUniforms(const float scaleS[kMaxUnits], const float scaleT[kMaxUnits]
             const int src = static_cast<int>(tcg.src);
             if (src == GX_TG_POS) {
                 s = FVec4_New(0, 0, 1, 0);
-            } else if (src >= GX_TG_TEX0 && src <= GX_TG_TEX0 + 7) {
-                s = FVec4_New(1, 0, 0, 0);  // the vertex's one texture-coordinate set
+            } else if (src == GX_TG_NRM && !(g_debugFlags & 4)) {
+                s = FVec4_New(0, 0, 0, 1);
+            } else if (src >= GX_TG_TEX0 && src <= GX_TG_TEX0 + 7 && g_plan.unitSet[u] == 1) {
+                s = FVec4_New(0, 1, 0, 0);  // set B
             }
             const bool threeRows = tcg.type == GX_TG_MTX3x4;
             if (tcg.mtx != GX_IDENTITY && tcg.mtx >= GX_TEXMTX0) {
@@ -343,8 +415,8 @@ struct VertexPlan {
     int pnMtxOffset;      // -1 = none
     bool hasPos, hasClr;
     AttrPlan pos, clr;
-    bool hasUv;
-    AttrPlan uv;
+    bool hasUv, hasUv2;
+    AttrPlan uv, uv2;
     bool hasNrm;
     AttrPlan nrm;
 };
@@ -395,6 +467,7 @@ void BuildPlan(GXVtxFmt fmt, bool be, VertexPlan& plan)
         } else if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) {
             a.two = af.cnt == GX_TEX_ST;
             if (g_plan.uvAttr[0] == attr) plan.hasUv = true, plan.uv = a;
+            if (g_plan.uvAttr[1] == attr) plan.hasUv2 = true, plan.uv2 = a;
         }
     }
     plan.size = at;
@@ -408,8 +481,8 @@ inline const uint8_t* AttrValues(const AttrPlan& a, const uint8_t* vtx, bool str
 }
 
 // The positions of one draw, in a loop specialized for their component type.
-template <GXCompType Type>
-void DecodePositions(const VertexPlan& plan, const uint8_t* src, bool streamBe, uint32_t count, PicaVertex* out)
+template <GXCompType Type, class V>
+void DecodePositions(const VertexPlan& plan, const uint8_t* src, bool streamBe, uint32_t count, V* out)
 {
     const AttrPlan& a = plan.pos;
     constexpr uint32_t step = Type == GX_F32 ? 4 : (Type == GX_U16 || Type == GX_S16) ? 2 : 1;
@@ -417,22 +490,25 @@ void DecodePositions(const VertexPlan& plan, const uint8_t* src, bool streamBe, 
     const bool be = a.be;
     for (uint32_t n = 0; n < count; ++n, src += plan.size) {
         const uint8_t* values = AttrValues(a, src, streamBe);
-        PicaVertex& v = out[n];
+        V& v = out[n];
         v.x = LoadComponent(values, Type, scale, be);
         v.y = LoadComponent(values + step, Type, scale, be);
         v.z = a.two ? LoadComponent(values + 2 * step, Type, scale, be) : 0.0f;
     }
 }
 
-void DecodeUvs(const AttrPlan& a, const uint8_t* src, bool streamBe, uint32_t count, uint32_t size, PicaVertex* out)
+// One texture-coordinate set of a draw into `field` (uv or uv2) of each vertex.
+template <class V>
+void DecodeUvs(const AttrPlan& a, const uint8_t* src, bool streamBe, uint32_t count, uint32_t size, V* out,
+               int16_t (V::*field)[2])
 {
     const uint32_t step = a.type == GX_F32 ? 4 : (a.type == GX_U16 || a.type == GX_S16) ? 2 : 1;
     for (uint32_t n = 0; n < count; ++n, src += size) {
         const uint8_t* values = AttrValues(a, src, streamBe);
         const float u = LoadComponent(values, a.type, a.scale, a.be) * kUvScale;
         const float v = a.two ? LoadComponent(values + step, a.type, a.scale, a.be) * kUvScale : 0.0f;
-        out[n].uv[0] = static_cast<int16_t>(std::clamp(u, -32768.0f, 32767.0f));
-        out[n].uv[1] = static_cast<int16_t>(std::clamp(v, -32768.0f, 32767.0f));
+        (out[n].*field)[0] = static_cast<int16_t>(std::clamp(u, -32768.0f, 32767.0f));
+        (out[n].*field)[1] = static_cast<int16_t>(std::clamp(v, -32768.0f, 32767.0f));
     }
 }
 
@@ -531,11 +607,31 @@ void BuildChannel(ChannelPlan& ch)
 
 ChannelPlan g_channel;
 
+// Per-vertex fog (gx_m4.v.pica): the GX fog parameters as uniforms, the ramp on unit 2.
+void UploadVertexFog()
+{
+    const bool on = g_plan.vertexFog && BindFogRamp(2);
+    if (on) {
+        const auto& f = g_gxState.fog;
+        const int type = static_cast<int>(f.type);
+        const bool persp = (type & 8) == 0;
+        const int fn = type & 7;
+        SetVec(g_fogpLoc + 0,
+               FVec4_New(f.aRaw * 16777216.0f, static_cast<float>(f.bMagnitude),
+                         std::ldexp(1.0f, 24 - static_cast<int>(std::min<uint32_t>(f.bShift, 31))), f.c));
+        SetVec(g_fogpLoc + 1, FVec4_New(persp ? 1.0f : 0.0f, persp ? 0.0f : 1.0f, f.aRaw, 0.0f));
+        SetVec(g_fogpLoc + 2, FVec4_New(fn == 6 || fn == 7 ? 1.0f : 0.0f, fn == 5 || fn == 7 ? 1.0f : 0.0f,
+                                        fn <= 3 ? 1.0f : 0.0f, 0.0f));
+    }
+    if (C3D_BoolUnifs[GPU_VERTEX_SHADER] & BIT(g_fogvLoc - 0x68) ? !on : on)
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_fogvLoc, on);
+}
+
 inline int8_t NormalByte(float v) { return static_cast<int8_t>(std::clamp(v * 127.0f, -127.0f, 127.0f)); }
 
 // The normals of one draw, x 127 (their GX fixed-point scale applied).
-void DecodeNormals(const AttrPlan& a, const uint8_t* src, bool streamBe, uint32_t count, uint32_t size,
-                   PicaVertex* out)
+template <class V>
+void DecodeNormals(const AttrPlan& a, const uint8_t* src, bool streamBe, uint32_t count, uint32_t size, V* out)
 {
     const uint32_t step = a.type == GX_F32 ? 4 : (a.type == GX_U16 || a.type == GX_S16) ? 2 : 1;
     for (uint32_t n = 0; n < count; ++n, src += size) {
@@ -546,13 +642,14 @@ void DecodeNormals(const AttrPlan& a, const uint8_t* src, bool streamBe, uint32_
     }
 }
 
-// Decode `count` GX vertices of format `fmt` into the frame's vertex buffer; false when it is full.
-bool DecodeVertices(GXVtxFmt fmt, const uint8_t* src, uint32_t count, bool be)
+// Decode `count` GX vertices of format `fmt` into the frame's vertex buffer as V; false when it is full.
+template <class V>
+bool DecodeVerticesAs(GXVtxFmt fmt, const uint8_t* src, uint32_t count, bool be)
 {
-    if (g_vtxUsed + count > kMaxVertices) return false;
+    if (g_vtxBytesUsed + count * sizeof(V) > kVertexBytes) return false;
     VertexPlan plan;
     BuildPlan(fmt, be, plan);
-    PicaVertex* out = g_vertices + g_vtxUsed;
+    V* out = reinterpret_cast<V*>(g_vtxBytes + g_vtxBytesUsed);
 
     // Channel color.
     const ChannelPlan& ch = g_channel;
@@ -561,7 +658,7 @@ bool DecodeVertices(GXVtxFmt fmt, const uint8_t* src, uint32_t count, bool be)
         for (uint32_t n = 0; n < count; ++n, vtx += plan.size) {
             uint8_t c[4];
             LoadColor(AttrValues(plan.clr, vtx, be), plan.clr.type, plan.clr.be, c);
-            PicaVertex& v = out[n];
+            V& v = out[n];
             v.r = ch.rgbFromVertex ? c[0] : ch.rgb[0];
             v.g = ch.rgbFromVertex ? c[1] : ch.rgb[1];
             v.b = ch.rgbFromVertex ? c[2] : ch.rgb[2];
@@ -573,8 +670,8 @@ bool DecodeVertices(GXVtxFmt fmt, const uint8_t* src, uint32_t count, bool be)
                       b = ch.rgbFromVertex ? 255 : ch.rgb[2], a = ch.alphaFromVertex ? 255 : ch.alpha;
         for (uint32_t n = 0; n < count; ++n) out[n].r = r, out[n].g = g, out[n].b = b, out[n].a = a;
     }
-    // Normals, for a lit batch (GX's default without NRM in the vertex: (1, 0, 0)).
-    if (ch.lit) {
+    // Normals, for a lit batch or coordinates from the normal (GX's default without NRM in the vertex: (1, 0, 0)).
+    if (ch.lit || g_plan.needsNormals) {
         if (plan.hasNrm) {
             DecodeNormals(plan.nrm, src, be, count, plan.size, out);
         } else {
@@ -591,9 +688,16 @@ bool DecodeVertices(GXVtxFmt fmt, const uint8_t* src, uint32_t count, bool be)
     }
     // Texture coordinates.
     if (plan.hasUv) {
-        DecodeUvs(plan.uv, src, be, count, plan.size, out);
+        DecodeUvs<V>(plan.uv, src, be, count, plan.size, out, &V::uv);
     } else {
         for (uint32_t n = 0; n < count; ++n) out[n].uv[0] = out[n].uv[1] = 0;
+    }
+    if constexpr (sizeof(V) == sizeof(PicaVertex2)) {
+        if (plan.hasUv2) {
+            DecodeUvs<V>(plan.uv2, src, be, count, plan.size, out, &V::uv2);
+        } else {
+            for (uint32_t n = 0; n < count; ++n) out[n].uv2[0] = out[n].uv2[1] = 0;
+        }
     }
     // Positions.
     if (plan.hasPos) {
@@ -607,8 +711,16 @@ bool DecodeVertices(GXVtxFmt fmt, const uint8_t* src, uint32_t count, bool be)
     } else {
         for (uint32_t n = 0; n < count; ++n) out[n].x = out[n].y = out[n].z = 0.0f;
     }
-    g_vtxUsed += count;
+    g_vtxBytesUsed += count * sizeof(V);
+    g_batchVerts += count;
     return true;
+}
+
+// In the open batch's layout.
+bool DecodeVertices(GXVtxFmt fmt, const uint8_t* src, uint32_t count, bool be)
+{
+    return g_batchLayout ? DecodeVerticesAs<PicaVertex2>(fmt, src, count, be)
+                         : DecodeVerticesAs<PicaVertex>(fmt, src, count, be);
 }
 
 // Triangle-list indices for `count` vertices of `prim`, relative to `base` (the batch's first vertex).
@@ -653,7 +765,7 @@ void Brawl3dsPicaDraw(GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, 
 {
     if (!OpenFrame()) return;
     FlushBatch();
-    if (g_vtxUsed + vtxCount > kMaxVertices || g_idxUsed + indexCount > kMaxIndices) {
+    if (g_vtxBytesUsed + 8 + vtxCount * sizeof(PicaVertex2) > kVertexBytes || g_idxUsed + indexCount > kMaxIndices) {
         ++g_droppedDraws;
         return;
     }
@@ -667,10 +779,16 @@ void Brawl3dsPicaDraw(GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, 
         if (!BindTexture(u, g_plan.units[u].texMap, scaleS[u], scaleT[u])) ++whiteUnits;
     UploadUniforms(scaleS, scaleT);
     BuildChannel(g_channel);
+    UploadVertexFog();
 
     g_brawl3dsRenderPhase = "vertices";
-    g_batchVtx = g_vtxUsed;
+    g_batchLayout = g_plan.uvAttr[1] >= 0 ? 1 : 0;
+    SetBoolUniform(g_twosetLoc, g_batchLayout == 1);
+    // Every batch starts 8-byte aligned, as it always did with 24-byte vertices (28-byte ones break that).
+    g_vtxBytesUsed = (g_vtxBytesUsed + 7) & ~7u;
+    g_batchVtxByte = g_vtxBytesUsed;
     g_batchIdx = g_idxUsed;
+    g_batchVerts = 0;
     if (!DecodeVertices(fmt, vertices, vtxCount, bigEndian)) {
         ++g_droppedDraws;
         return;
@@ -680,9 +798,12 @@ void Brawl3dsPicaDraw(GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, 
     g_batchOpen = true;
 
     // One frame's debug dump (Brawl3dsPicaDebugNextFrame): the first batches, then the ones whose material may be
-    // drawn wrong (approximated, a texture missing, three or more TEV stages), with their TEV stages.
+    // drawn wrong (approximated, a texture missing, three or more TEV stages, two texture-coordinate sets, coordinates
+    // from normals), with their TEV stages. Kept to 40 batches: each line goes to the SD card, and a 60-batch dump
+    // with every fogged batch made the title's dump frame take 6.4 s on the console.
     ++g_debugSerial;
-    const bool suspect = g_plan.approximated || whiteUnits > 0 || g_gxState.numTevStages >= 3;
+    const bool suspect = g_plan.approximated || whiteUnits > 0 || g_gxState.numTevStages >= 3 ||
+                         g_plan.uvAttr[1] >= 0 || g_plan.needsNormals;
     if (g_debugFrame && (g_debugSerial <= 6 || (suspect && g_debugBatches < 40))) {
         ++g_debugBatches;
         std::fprintf(stderr, "[pica] -- batch #%u of the frame: %s%s%d PICA stages, %d white units\n", g_debugSerial,
@@ -701,17 +822,64 @@ void Brawl3dsPicaDraw(GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, 
                          static_cast<int>(st.tevSwapRas), static_cast<int>(st.tevSwapTex),
                          static_cast<int>(st.indTexMtxId));
         }
-        const PicaVertex& v = g_vertices[g_batchVtx];
+        const PicaVertex& v = *reinterpret_cast<const PicaVertex*>(g_vtxBytes + g_batchVtxByte);
+        // Blending, alpha test and the TEV constants (the look of layout effects depends on them).
+        {
+            const auto& ac = g_gxState.alphaCompare;
+            const auto& k = g_gxState.kcolors;
+            const auto& c = g_gxState.colorRegs;
+            std::fprintf(stderr,
+                         "[pica]   blend %d src %d dst %d, alpha test %d %u %d %d %u, color/alpha update %d/%d; "
+                         "K0-3 %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f; "
+                         "C0-2 %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f\n",
+                         static_cast<int>(g_gxState.blendMode), static_cast<int>(g_gxState.blendFacSrc),
+                         static_cast<int>(g_gxState.blendFacDst), static_cast<int>(ac.comp0), ac.ref0,
+                         static_cast<int>(ac.op), static_cast<int>(ac.comp1), ac.ref1, g_gxState.colorUpdate ? 1 : 0,
+                         g_gxState.alphaUpdate ? 1 : 0, k[0][0], k[0][1], k[0][2], k[0][3], k[1][0], k[1][1],
+                         k[1][2], k[1][3], k[2][0], k[2][1], k[2][2], k[2][3], k[3][0], k[3][1], k[3][2], k[3][3],
+                         c[1][0], c[1][1], c[1][2], c[1][3], c[2][0], c[2][1], c[2][2], c[2][3], c[3][0], c[3][1],
+                         c[3][2], c[3][3]);
+        }
+        // The first vertex's GX screen depth (position matrix, projection, viewport depth range) and the fog there.
+        if (g_plan.fog) {
+            const auto& m = g_gxState.pnMtx[std::min<u32>(static_cast<u32>(v.row) / 3, MaxPnMtx - 1)].pos;
+            const float vx = m.m0[0] * v.x + m.m0[1] * v.y + m.m0[2] * v.z + m.m0[3];
+            const float vy = m.m1[0] * v.x + m.m1[1] * v.y + m.m1[2] * v.z + m.m1[3];
+            const float vz = m.m2[0] * v.x + m.m2[1] * v.y + m.m2[2] * v.z + m.m2[3];
+            const auto& pr = g_gxState.proj;
+            const float cz = pr.m2[0] * vx + pr.m2[1] * vy + pr.m2[2] * vz + pr.m2[3];
+            const float cw = pr.m3[0] * vx + pr.m3[1] * vy + pr.m3[2] * vz + pr.m3[3];
+            const auto& vpz = g_gxState.logicalViewport;
+            const float d = cw != 0.0f ? vpz.zfar + (vpz.zfar - vpz.znear) * cz / cw : -1.0f;
+            const auto& fg = g_gxState.fog;
+            std::fprintf(stderr,
+                         "[pica]   depth %.6f; fog type %d a %g b %u >> %u c %g color %.2f %.2f %.2f: amount %.3f "
+                         "(at 0 %.3f, 0.5 %.3f, 0.99 %.3f, 1 %.3f)",
+                         d, static_cast<int>(fg.type), fg.aRaw, fg.bMagnitude, fg.bShift, fg.c, fg.color[0],
+                         fg.color[1], fg.color[2], FogAmountAt(d), FogAmountAt(0.0f), FogAmountAt(0.5f),
+                         FogAmountAt(0.99f), FogAmountAt(1.0f));
+            if (g_batchLayout) {
+                const auto& v2 = *reinterpret_cast<const PicaVertex2*>(&v);
+                std::fprintf(stderr, ", uv2 (%.3f %.3f)", v2.uv2[0] / kUvScale, v2.uv2[1] / kUvScale);
+            }
+            std::fprintf(stderr, "\n");
+        }
         std::fprintf(stderr,
                      "[pica] batch %u: fmt %d, %u verts, %u indices, tev %u stages, %d units (", g_debugBatches,
                      static_cast<int>(fmt), vtxCount, indexCount, g_gxState.numTevStages, g_plan.unitCount);
         for (int u = 0; u < g_plan.unitCount; ++u) {
             const auto& t = g_gxState.loadedTextures[g_plan.units[u].texMap];
-            std::fprintf(stderr, "%smap %u coord %u %ux%u fmt %u", u ? ", " : "", g_plan.units[u].texMap,
-                         g_plan.units[u].texCoord, t.width(), t.height(), t.format());
+            const auto& tcg = g_gxState.tcgs[g_plan.units[u].texCoord & 7];
+            std::fprintf(stderr, "%smap %u coord %u (src %d mtx %d type %d set %u) %ux%u fmt %u", u ? ", " : "",
+                         g_plan.units[u].texMap, g_plan.units[u].texCoord, static_cast<int>(tcg.src),
+                         static_cast<int>(tcg.mtx), static_cast<int>(tcg.type), g_plan.unitSet[u], t.width(),
+                         t.height(), t.format());
         }
+        const auto& vp = g_gxState.logicalViewport;
+        std::fprintf(stderr, "), viewport %.0f %.0f %.0fx%.0f z %.3f-%.3f, fog %d", vp.left, vp.top, vp.width,
+                     vp.height, vp.znear, vp.zfar, static_cast<int>(g_gxState.fog.type));
         std::fprintf(stderr,
-                     "), uv attrs %d %d, blend %d, z %d/%d/%d, cull %d, skip %d\n"
+                     ", uv attrs %d %d, blend %d, z %d/%d/%d, cull %d, skip %d\n"
                      "[pica]   vertex (%.3f %.3f %.3f) rgba %02x%02x%02x%02x row %u uv (%.3f %.3f)\n",
                      g_plan.uvAttr[0], g_plan.uvAttr[1], static_cast<int>(g_gxState.blendMode),
                      g_gxState.depthCompare ? 1 : 0, static_cast<int>(g_gxState.depthFunc),
@@ -731,14 +899,75 @@ extern "C" void Brawl3dsPicaDebugNextFrame()
 bool Brawl3dsPicaAppend(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, bool bigEndian)
 {
     if (!g_frameOpen || !g_batchOpen) return false;
-    const uint32_t first = g_vtxUsed - g_batchVtx;
-    if (first + vtxCount > 0xFFFF || g_vtxUsed + vtxCount > kMaxVertices || g_idxUsed + vtxCount * 3 > kMaxIndices) {
+    const uint32_t first = g_batchVerts;
+    const uint32_t stride = g_batchLayout ? sizeof(PicaVertex2) : sizeof(PicaVertex);
+    if (first + vtxCount > 0xFFFF || g_vtxBytesUsed + vtxCount * stride > kVertexBytes ||
+        g_idxUsed + vtxCount * 3 > kMaxIndices) {
         ++g_droppedDraws;
         return true;  // dropped, but handled
     }
     if (!DecodeVertices(fmt, vertices, vtxCount, bigEndian)) return true;
     AppendIndices(prim, first, vtxCount);
     return true;
+}
+
+// The clear of an EFB texture copy (GXCopyTex with clear): the copy's rectangle (EFB pixels) takes the copy clear
+// color and depth, as on GX. Brawl's shadow pass draws the fighters in one color into a corner of the EFB, copies
+// that into a texture and clears it; without the clear the mask stayed on screen. A copy of (nearly) the whole
+// screen is not cleared: the copy itself is not made yet, so that would only erase the frame.
+void Brawl3dsPicaClearRect(int x, int y, int w, int h, bool color, bool alpha, bool depth)
+{
+    if (!color && !alpha && !depth) return;
+    if (w <= 0 || h <= 0) return;
+    if (w >= kEfbWidth * 0.9f && h >= kEfbHeight * 0.9f) {
+        ++g_statClearsSkipped;
+        return;
+    }
+    if (!OpenFrame()) return;
+    FlushBatch();
+    g_vtxBytesUsed = (g_vtxBytesUsed + 7) & ~7u;
+    if (g_vtxBytesUsed + 4 * sizeof(PicaVertex) > kVertexBytes || g_idxUsed + 6 > kMaxIndices) {
+        ++g_droppedDraws;
+        return;
+    }
+    ++g_statClears;
+    // The quad in GX clip space (y up), at the clear depth: depth = z + 1 with w = 1, kept off the far plane.
+    const float x0 = 2.0f * static_cast<float>(x) / kEfbWidth - 1.0f;
+    const float x1 = 2.0f * static_cast<float>(x + w) / kEfbWidth - 1.0f;
+    const float y0 = 1.0f - 2.0f * static_cast<float>(y) / kEfbHeight;
+    const float y1 = 1.0f - 2.0f * static_cast<float>(y + h) / kEfbHeight;
+    const float z = std::min(static_cast<float>(g_gxState.clearDepth & 0xFFFFFF) / 16777215.0f - 1.0f, -1.0f / 65536.0f);
+    auto byte = [](float v) { return static_cast<uint8_t>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
+    const auto& cc = g_gxState.clearColor;
+    PicaVertex* v = reinterpret_cast<PicaVertex*>(g_vtxBytes + g_vtxBytesUsed);
+    const float corners[4][2] = {{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}};
+    for (int i = 0; i < 4; ++i) {
+        v[i] = {};
+        v[i].x = corners[i][0], v[i].y = corners[i][1], v[i].z = z;
+        v[i].r = byte(cc[0]), v[i].g = byte(cc[1]), v[i].b = byte(cc[2]), v[i].a = byte(cc[3]);
+    }
+    uint16_t* idx = g_indices + g_idxUsed;
+    idx[0] = 0, idx[1] = 1, idx[2] = 2, idx[3] = 0, idx[4] = 2, idx[5] = 3;
+    // Uniforms: position matrix 0 = identity, the projection only turns the screen (the next batch's
+    // UploadUniforms sets its own again), no lighting.
+    SetVec(g_projLoc + 0, FVec4_New(0, 1, 0, 0));
+    SetVec(g_projLoc + 1, FVec4_New(-1, 0, 0, 0));
+    SetVec(g_projLoc + 2, FVec4_New(0, 0, 1, 0));
+    SetVec(g_projLoc + 3, FVec4_New(0, 0, 0, 1));
+    SetVec(g_mtxLoc + 0, FVec4_New(1, 0, 0, 0));
+    SetVec(g_mtxLoc + 1, FVec4_New(0, 1, 0, 0));
+    SetVec(g_mtxLoc + 2, FVec4_New(0, 0, 1, 0));
+    if (C3D_BoolUnifs[GPU_VERTEX_SHADER] & BIT(g_litLoc - 0x68)) C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_litLoc, false);
+    if (C3D_BoolUnifs[GPU_VERTEX_SHADER] & BIT(g_fogvLoc - 0x68)) C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_fogvLoc, false);
+    SetBoolUniform(g_twosetLoc, false);
+    ApplyClearState(color, alpha, depth);
+    SetLayout(0);
+    C3D_BufInfo* buf = C3D_GetBufInfo();
+    BufInfo_Init(buf);
+    BufInfo_Add(buf, v, sizeof(PicaVertex), 4, 0x3210);
+    C3D_DrawElements(GPU_TRIANGLES, 6, C3D_UNSIGNED_SHORT, idx);
+    g_vtxBytesUsed += 4 * sizeof(PicaVertex);
+    g_idxUsed += 6;
 }
 
 namespace {
@@ -829,8 +1058,13 @@ extern "C" void Brawl3dsPicaWriteStats(std::FILE* f, unsigned frames)
                      "COLOR1A1 (drawn as COLOR0A0)\n",
                      g_statLit, g_statBatches, g_statLit ? static_cast<double>(g_statLights) / g_statLit : 0.0,
                      g_statLitApprox, g_statColor1);
+        std::fprintf(f,
+                     "viewport and copies: %u batches in a part of the screen; %u EFB copy clears drawn, %u skipped "
+                     "(whole screen)\n",
+                     g_statPartViewport, g_statClears, g_statClearsSkipped);
     }
     g_statBatches = g_statLit = g_statLitApprox = g_statLights = g_statColor1 = 0;
+    g_statPartViewport = g_statClears = g_statClearsSkipped = 0;
     WriteTevStats(f, frames);
     WriteTextureStats(f, frames);
 }
@@ -840,7 +1074,7 @@ void Brawl3dsPicaEndFrame()
     g_skipFrame = false;
     if (!g_frameOpen) return;
     FlushBatch();
-    GSPGPU_FlushDataCache(g_vertices, g_vtxUsed * sizeof(PicaVertex));
+    GSPGPU_FlushDataCache(g_vtxBytes, g_vtxBytesUsed);
     GSPGPU_FlushDataCache(g_indices, g_idxUsed * sizeof(uint16_t));
     // A capture asked for after the previous frame: that frame's copy is complete now (C3D_FrameBegin waited).
     TakePendingCapture();

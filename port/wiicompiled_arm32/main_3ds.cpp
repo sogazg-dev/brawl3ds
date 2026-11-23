@@ -126,6 +126,7 @@ extern "C" void Brawl3dsRendererTakeStats(uint64_t* displayListTicks, uint32_t* 
 extern "C" bool Brawl3dsPicaActive();            // aurora3ds/pica_renderer_3ds.cpp
 extern "C" void Brawl3dsPicaCaptureNextFrame(const char* path);
 extern "C" void Brawl3dsPicaWriteCaptures();
+extern "C" void Brawl3dsPicaSetDebugFlags(unsigned flags) __attribute__((weak));  // testing aid: absent in older renderers
 extern "C" void Brawl3dsPicaWriteStats(std::FILE* f, unsigned frames);
 extern "C" uint32_t Brawl3dsPicaTakeDropped();
 extern "C" void Brawl3dsPicaDebugNextFrame();
@@ -719,6 +720,32 @@ extern "C" void Brawl3dsFrameEnd()
     if (g_frames >= 3370 && g_frames <= 3376) Log("frame %u: %u GX draws\n", g_frames, g_frameDraws);
     g_frameDraws = 0;
     // Two captures in a row at the end: the HUD showed on the screen but not in single captures.
+    // Testing aid: sdmc:/3ds/brawl3ds/stop_after.txt holding a capture frame ends the run once that capture is in
+    // memory (two frames later), with its screenshots written: a title-screen check without the whole match.
+    {
+        static int stopAfter = -1;
+        if (stopAfter == -1) {
+            stopAfter = 0;
+            if (std::FILE* f = std::fopen("sdmc:/3ds/brawl3ds/stop_after.txt", "r")) {
+                unsigned n = 0;
+                if (std::fscanf(f, "%u", &n) == 1) stopAfter = static_cast<int>(n);
+                std::fclose(f);
+                if (stopAfter > 0) Log("stop_after.txt: the run ends after the capture at frame %d\n", stopAfter);
+            }
+            if (std::FILE* f = std::fopen("sdmc:/3ds/brawl3ds/debug_flags.txt", "r")) {
+                unsigned flags = 0;
+                if (std::fscanf(f, "%u", &flags) == 1) {
+                    if (Brawl3dsPicaSetDebugFlags) Brawl3dsPicaSetDebugFlags(flags);
+                    Log("debug_flags.txt: renderer testing switches %u\n", flags);
+                }
+                std::fclose(f);
+            }
+        }
+        if (stopAfter > 0 && g_frames == static_cast<uint32_t>(stopAfter) + 2) {
+            Brawl3dsPicaWriteCaptures();
+            FinishRun("stop_after.txt");
+        }
+    }
     if (g_frames == 700 || g_frames == 2000 || g_frames == 2873 || g_frames == 3373 || g_frames == 3374) {
         char path[64];
         std::snprintf(path, sizeof(path), "sdmc:/3ds/brawl3ds/shot_%u.bmp", g_frames);

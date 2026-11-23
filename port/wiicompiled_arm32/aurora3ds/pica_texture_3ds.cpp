@@ -171,6 +171,25 @@ void EnsureWhite()
     g_whiteReady = true;
 }
 
+// Per-vertex fog's ramp: 8x8 A8, alpha = column / 7 (texels in the PICA's 8x8 Z-order tile: x from bits 0, 2, 4).
+C3D_Tex g_fogRamp;
+bool g_fogRampReady = false;
+
+void EnsureFogRamp()
+{
+    if (g_fogRampReady) return;
+    if (!C3D_TexInit(&g_fogRamp, 8, 8, GPU_A8)) return;
+    auto* texels = static_cast<uint8_t*>(g_fogRamp.data);
+    for (uint32_t i = 0; i < 64; ++i) {
+        const uint32_t x = (i & 1) | ((i >> 1) & 2) | ((i >> 2) & 4);
+        texels[i] = static_cast<uint8_t>(x * 255 / 7);
+    }
+    C3D_TexFlush(&g_fogRamp);
+    C3D_TexSetFilter(&g_fogRamp, GPU_LINEAR, GPU_LINEAR);
+    C3D_TexSetWrap(&g_fogRamp, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+    g_fogRampReady = true;
+}
+
 void EvictFor(size_t needed)
 {
     if (g_bytes + needed <= g_budget) return;
@@ -395,6 +414,14 @@ bool BindTexture(int unit, int texMap, float& scaleS, float& scaleT)
     Bind(unit, &e.tex);
     scaleS = e.scaleS;
     scaleT = e.scaleT;
+    return true;
+}
+
+bool BindFogRamp(int unit)
+{
+    EnsureFogRamp();
+    if (!g_fogRampReady) return false;
+    Bind(unit, &g_fogRamp);
     return true;
 }
 

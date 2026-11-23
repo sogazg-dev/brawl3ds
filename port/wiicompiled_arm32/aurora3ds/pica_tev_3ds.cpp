@@ -11,6 +11,16 @@
 // shape allows). A value from an older stage than the previous one is read through the combiner buffer when its
 // update flags allow it. Whatever does not fit (more than six stages, buffer conflicts, comparison ops, a divide by
 // two without a spare stage) is approximated and counted.
+//
+// Materials too big for the PICA: with more than six PICA stages (or more than three textures), GX stages that only
+// add a layer onto the previous result (highlights, rim light, glow: prev = prev + ...) are dropped, last first,
+// until it fits; only then is the end cut off. A fourth texture reads as a neutral constant (0 where the stage adds
+// onto a register, else 1) instead of another unit's texture.
+//
+// Fog (GXSetFog): the PICA's fog unit with a 128-entry table over the fragment depth, which this renderer keeps
+// equal to GX's screen depth (pica_renderer_3ds.cpp folds the viewport's depth range into the projection); the
+// table holds 1 - GX's fog amount from Aurora's formula (shader.cpp) for each depth. Fog range adjustment is not
+// applied.
 
 #include "pica_internal.hpp"
 
@@ -69,7 +79,8 @@ struct Compiler {
 
 // Statistics (WriteTevStats).
 uint64_t g_statMaterials = 0, g_statApprox = 0, g_statTruncated = 0, g_statStagesSum = 0, g_statGxStagesSum = 0;
-uint64_t g_statUnitOverflow = 0, g_statCullAll = 0;
+uint64_t g_statUnitOverflow = 0, g_statCullAll = 0, g_statReduced = 0, g_statDropped = 0, g_statFog = 0;
+uint64_t g_statTwoSets = 0, g_statNormalSrc = 0, g_statOtherSrc = 0, g_statVertexFog = 0;
 int g_statMaxStages = 0;
 
 bool IsConstValue(const Opnd& o, int n, float v)
@@ -260,6 +271,8 @@ Opnd KonstAlpha(GXTevKAlphaSel sel)
 
 struct StageContext {
     int unit = -1;            // PICA unit of this stage's texture, -1 = none
+    bool overflow = false;    // the stage's texture did not get a unit: it reads as a neutral constant
+    float overflowRgb = 1, overflowAlpha = 1;
     bool rasZero = false;     // GX_COLOR_ZERO / no channel
     TevSwap rasSwap, texSwap;
 };
@@ -277,6 +290,7 @@ Opnd ColorArg(const Compiler& cc, const TevStage& st, const StageContext& sc, GX
     case GX_CC_A2: return RegOpnd(cc, kRgb, 3, true);
     case GX_CC_TEXC:
     case GX_CC_TEXA: {
+        if (sc.overflow) return ConstOpnd(sc.overflowRgb, sc.overflowRgb, sc.overflowRgb);
         if (sc.unit < 0) return ConstOpnd(1, 1, 1);
         Opnd o;
         o.kind = Opnd::kSource;
@@ -308,6 +322,7 @@ Opnd AlphaArg(const Compiler& cc, const TevStage& st, const StageContext& sc, GX
     case GX_CA_A1: return RegOpnd(cc, kAlpha, 2, true);
     case GX_CA_A2: return RegOpnd(cc, kAlpha, 3, true);
     case GX_CA_TEXA: {
+        if (sc.overflow) return ConstOpnd(sc.overflowAlpha, 0, 0);
         if (sc.unit < 0) return ConstOpnd(1, 0, 0);
         Opnd o;
         o.kind = Opnd::kSource;
@@ -556,6 +571,85 @@ C3D_TexEnv g_lastEnv[kMaxPicaStages];
 bool g_haveLastEnv[kMaxPicaStages] = {};
 int g_lastBufMask[2] = {-1, -1};
 
+// Fog: what the PICA has now (-1 = unknown), and the parameters its table was built from.
+int g_fogOn = -1;
+struct FogKey {
+    int type;
+    float a, c;
+    uint32_t bMagnitude, bShift;
+    bool operator==(const FogKey& o) const { return std::memcmp(this, &o, sizeof(*this)) == 0; }
+};
+FogKey g_fogKey;
+bool g_haveFogKey = false;
+uint32_t g_fogColor = 0xFFFFFFFF;
+C3D_FogLut g_fogLut;
+
+// GX's fog amount (0 = none, 1 = the fog color) at screen depth `d` (0 near, 1 far), as Aurora's shader.cpp.
+float FogAmount(float d, const FogKey& f)
+{
+    const auto z = static_cast<uint32_t>(std::lround(std::clamp(d, 0.0f, 1.0f) * 16777216.0f));
+    float ze;
+    if ((f.type & 8) == 0) {  // perspective
+        const float den = static_cast<float>(f.bMagnitude) - static_cast<float>(z >> std::min<uint32_t>(f.bShift, 31));
+        ze = den != 0.0f ? f.a * 16777216.0f / den : 1e30f;
+    } else {
+        ze = f.a * static_cast<float>(z) / 16777216.0f;
+    }
+    float t = Clamp01(ze - f.c);
+    switch (f.type) {
+    case GX_FOG_PERSP_EXP:
+    case GX_FOG_ORTHO_EXP: t = 1.0f - std::exp2(-8.0f * t); break;
+    case GX_FOG_PERSP_EXP2:
+    case GX_FOG_ORTHO_EXP2: t = 1.0f - std::exp2(-8.0f * t * t); break;
+    case GX_FOG_PERSP_REVEXP:
+    case GX_FOG_ORTHO_REVEXP: t = std::exp2(-8.0f * (1.0f - t)); break;
+    case GX_FOG_PERSP_REVEXP2:
+    case GX_FOG_ORTHO_REVEXP2: t = std::exp2(-8.0f * (1.0f - t) * (1.0f - t)); break;
+    default: break;  // linear
+    }
+    return Clamp01(t);
+}
+
+void ApplyFog(MaterialPlan& plan)
+{
+    const auto& f = g_gxState.fog;
+    const bool on = plan.fog && !plan.vertexFog;  // the PICA's fog table
+    if (plan.fog) ++g_statFog;
+    if (plan.vertexFog) ++g_statVertexFog;
+    if (on) {
+        const FogKey key{static_cast<int>(f.type), f.aRaw, f.c, f.bMagnitude, f.bShift};
+        if (!g_haveFogKey || !(key == g_fogKey)) {
+            // The PICA blends lut * color + (1 - lut) * fog color: the table holds 1 - GX's amount, then the
+            // differences to the next entry. A jump within one entry (Brawl's perspective fog goes from none to full
+            // in the last 1/2000 of the depth range, near its 1 / (b - z) pole) cannot be followed: interpolating
+            // across it fogged the whole last 1/128 of the depth range, most of a 3D scene's background. Such an
+            // entry keeps its starting value.
+            float data[256];
+            float prev = 1.0f - FogAmount(0.0f, key);
+            for (int i = 0; i < 128; ++i) {
+                const float next = 1.0f - FogAmount(static_cast<float>(i + 1) / 128.0f, key);
+                data[i] = prev;
+                data[128 + i] = std::fabs(next - prev) <= 0.25f ? next - prev : 0.0f;
+                prev = next;
+            }
+            FogLut_FromArray(&g_fogLut, data);
+            C3D_FogLutBind(&g_fogLut);
+            g_fogKey = key;
+            g_haveFogKey = true;
+        }
+        auto byte = [](float v) { return static_cast<uint32_t>(Clamp01(v) * 255.0f + 0.5f); };
+        const uint32_t color = byte(f.color[0]) | byte(f.color[1]) << 8 | byte(f.color[2]) << 16;
+        if (color != g_fogColor) {
+            C3D_FogColor(color);
+            g_fogColor = color;
+        }
+    }
+    if (g_fogOn != (on ? 1 : 0)) {
+        C3D_FogGasMode(on ? GPU_FOG : GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
+        g_fogOn = on ? 1 : 0;
+    }
+}
+
 void ApplyPixelState(MaterialPlan& plan)
 {
     FragmentState fs;
@@ -633,30 +727,57 @@ void ApplyPixelState(MaterialPlan& plan)
     if (all || fs.cull != last.cull) C3D_CullFace(static_cast<GPU_CULLMODE>(fs.cull));
     g_lastFragment = fs;
     g_haveLastFragment = true;
+    ApplyFog(plan);
 }
-} // namespace
 
-void ApplyMaterial(MaterialPlan& plan)
+bool UsesTexture(const TevStage& st)
 {
-    plan = {};
-    Compiler cc;
+    auto ct = [](GXTevColorArg x) { return x == GX_CC_TEXC || x == GX_CC_TEXA; };
+    const auto& cp = st.colorPass;
+    const auto& ap = st.alphaPass;
+    return ct(cp.a) || ct(cp.b) || ct(cp.c) || ct(cp.d) || ap.a == GX_CA_TEXA || ap.b == GX_CA_TEXA ||
+           ap.c == GX_CA_TEXA || ap.d == GX_CA_TEXA;
+}
+
+// A GX stage that only adds a layer onto the previous result in both halves (prev = prev + ...), which can be
+// dropped when the material does not fit.
+bool IsAdditiveLayer(const TevStage& st)
+{
+    const auto& co = st.colorOp;
+    const auto& ao = st.alphaOp;
+    const bool colorAdds = co.op == GX_TEV_ADD && co.outReg == GX_TEVPREV && st.colorPass.d == GX_CC_CPREV &&
+                           co.scale == GX_CS_SCALE_1 && co.bias == GX_TB_ZERO;
+    const bool alphaPasses = ao.outReg == GX_TEVPREV && st.alphaPass.d == GX_CA_APREV &&
+                             ((ao.op == GX_TEV_ADD && ao.scale == GX_CS_SCALE_1 && ao.bias == GX_TB_ZERO) ||
+                              (st.alphaPass.a == GX_CA_ZERO && st.alphaPass.b == GX_CA_ZERO));
+    return colorAdds && alphaPasses;
+}
+
+struct CompileOutcome {
+    int total = 0;              // PICA stages needed (before any cut)
+    bool unitOverflow = false;  // a texture found no unit
+};
+
+// Compiles the GX stages not in `skip` into `cc`, assigning texture units in `plan`.
+CompileOutcome CompileStages(Compiler& cc, MaterialPlan& plan, uint32_t skip)
+{
+    CompileOutcome out;
+    plan.unitCount = 0;
+    for (auto& u : plan.units) u = {};
     for (int r = 0; r < 4; ++r) {
         const auto& reg = g_gxState.colorRegs[r];
         for (int i = 0; i < 3; ++i) cc.regs[kRgb][r].c[i] = Clamp01(reg[i]);
         cc.regs[kAlpha][r].c[0] = Clamp01(reg[3]);
     }
-
     const int stages = std::min<int>(g_gxState.numTevStages, MaxTevStages);
     for (int s = 0; s < stages; ++s) {
+        if (skip & (1u << s)) continue;
         const TevStage& st = g_gxState.tevStages[s];
         StageContext sc;
-        const auto usesTex = [&] {
-            const auto& c = st.colorPass;
-            const auto& a = st.alphaPass;
-            auto ct = [](GXTevColorArg x) { return x == GX_CC_TEXC || x == GX_CC_TEXA; };
-            return ct(c.a) || ct(c.b) || ct(c.c) || ct(c.d) || a.a == GX_CA_TEXA || a.b == GX_CA_TEXA ||
-                   a.c == GX_CA_TEXA || a.d == GX_CA_TEXA;
-        }();
+        const auto& cp = st.colorPass;
+        const auto& ap = st.alphaPass;
+        auto ct = [](GXTevColorArg x) { return x == GX_CC_TEXC || x == GX_CC_TEXA; };
+        const bool usesTex = UsesTexture(st);
         const int texMap = static_cast<int>(st.texMapId);
         if (usesTex && texMap >= 0 && texMap < static_cast<int>(MaxTextures) && st.texCoordId != GX_TEXCOORD_NULL) {
             for (int u = 0; u < plan.unitCount; ++u)
@@ -667,8 +788,11 @@ void ApplyMaterial(MaterialPlan& plan)
                     plan.units[sc.unit].texMap = static_cast<uint8_t>(texMap);
                     plan.units[sc.unit].texCoord = static_cast<uint8_t>(st.texCoordId);
                 } else {
-                    sc.unit = 0;
-                    ++g_statUnitOverflow;
+                    // No unit left: neutral for a layer added onto a register (0), else 1.
+                    sc.overflow = true;
+                    sc.overflowRgb = (cp.d <= GX_CC_A2 && !ct(cp.d)) ? 0.0f : 1.0f;
+                    sc.overflowAlpha = ap.d <= GX_CA_A2 ? 0.0f : 1.0f;
+                    out.unitOverflow = true;
                     cc.approximated = true;
                 }
             }
@@ -677,8 +801,6 @@ void ApplyMaterial(MaterialPlan& plan)
         sc.rasSwap = g_gxState.tevSwapTable[st.tevSwapRas & 3];
         sc.texSwap = g_gxState.tevSwapTable[st.tevSwapTex & 3];
 
-        const auto& cp = st.colorPass;
-        const auto& ap = st.alphaPass;
         // Both halves read the registers as they were before this stage.
         const Opnd ca = ColorArg(cc, st, sc, cp.a), cb = ColorArg(cc, st, sc, cp.b), ccc = ColorArg(cc, st, sc, cp.c),
                    cd = ColorArg(cc, st, sc, cp.d);
@@ -689,9 +811,81 @@ void ApplyMaterial(MaterialPlan& plan)
     }
     Finish(cc, kRgb);
     Finish(cc, kAlpha);
+    out.total = std::max(cc.prog[kRgb].count, cc.prog[kAlpha].count);
+    return out;
+}
+} // namespace
+
+float FogAmountAt(float d)
+{
+    const auto& f = g_gxState.fog;
+    return FogAmount(d, FogKey{static_cast<int>(f.type), f.aRaw, f.c, f.bMagnitude, f.bShift});
+}
+
+void ApplyClearState(bool color, bool alpha, bool depth)
+{
+    C3D_TexEnv env;
+    C3D_TexEnvInit(&env);
+    C3D_TexEnvSrc(&env, C3D_Both, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
+    C3D_TexEnvFunc(&env, C3D_Both, GPU_REPLACE);
+    C3D_SetTexEnv(0, &env);
+    for (int i = 1; i < kMaxPicaStages; ++i) {
+        C3D_TexEnvInit(&env);  // REPLACE(PREVIOUS)
+        C3D_SetTexEnv(i, &env);
+    }
+    C3D_TexEnvBufUpdate(C3D_RGB, 0);
+    C3D_TexEnvBufUpdate(C3D_Alpha, 0);
+    C3D_AlphaTest(false, GPU_ALWAYS, 0);
+    C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
+    int mask = 0;
+    if (color) mask |= GPU_WRITE_RED | GPU_WRITE_GREEN | GPU_WRITE_BLUE;
+    if (alpha) mask |= GPU_WRITE_ALPHA;
+    if (depth) mask |= GPU_WRITE_DEPTH;
+    C3D_DepthTest(true, GPU_ALWAYS, static_cast<GPU_WRITEMASK>(mask));
+    C3D_CullFace(GPU_CULL_NONE);
+    C3D_FogGasMode(GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
+    // All of the above differs from what the caches remember: the next material sends its state again.
+    g_haveLastFragment = false;
+    for (bool& have : g_haveLastEnv) have = false;
+    g_lastBufMask[kRgb] = g_lastBufMask[kAlpha] = -1;
+    g_fogOn = -1;
+}
+
+void ApplyMaterial(MaterialPlan& plan)
+{
+    plan = {};
+    Compiler cc;
+    const int stages = std::min<int>(g_gxState.numTevStages, MaxTevStages);
+    CompileOutcome outcome = CompileStages(cc, plan, 0);
+    if (outcome.total > kMaxPicaStages || outcome.unitOverflow) {
+        // Too big: drop additive layers, last first, until it fits (dropped stages also free their texture units).
+        uint32_t skip = 0;
+        int dropped = 0;
+        for (int s = stages - 1; s > 0 && (outcome.total > kMaxPicaStages || outcome.unitOverflow); --s) {
+            const TevStage& st = g_gxState.tevStages[s];
+            if (!IsAdditiveLayer(st)) continue;
+            // With only too many textures, a stage without one frees nothing.
+            if (outcome.total <= kMaxPicaStages && !UsesTexture(st)) continue;
+            skip |= 1u << s;
+            ++dropped;
+            cc = Compiler{};
+            outcome = CompileStages(cc, plan, skip);
+        }
+        if (dropped) {
+            ++g_statReduced;
+            g_statDropped += static_cast<uint64_t>(dropped);
+            cc.approximated = true;
+        }
+    }
+    if (outcome.unitOverflow) ++g_statUnitOverflow;
+    const int needed = outcome.total;
+    // Fog per vertex where unit 2 and one combiner stage are free (see gx_m4.v.pica); else the PICA's fog table.
+    // debug_flags.txt: 1 turns fog off, 16 keeps to the PICA's fog table.
+    plan.fog = g_gxState.fog.type != GX_FOG_NONE && !(g_debugFlags & 1);
+    plan.vertexFog = plan.fog && !(g_debugFlags & 16) && plan.unitCount <= 2 && needed < kMaxPicaStages;
 
     // Zip the two halves into PICA stages.
-    int total = std::max(cc.prog[kRgb].count, cc.prog[kAlpha].count);
+    int total = needed + (plan.vertexFog ? 1 : 0);
     if (total > kMaxPicaStages) {
         ++g_statTruncated;
         cc.approximated = true;
@@ -714,6 +908,16 @@ void ApplyMaterial(MaterialPlan& plan)
                 }
             }
         } commit{i, env};
+        if (plan.vertexFog && i == needed) {
+            // rgb = lerp(previous, fog color, ramp alpha); alpha passes.
+            C3D_TexEnvSrc(env, C3D_RGB, GPU_CONSTANT, GPU_PREVIOUS, GPU_TEXTURE2);
+            C3D_TexEnvOpRgb(env, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_ALPHA);
+            C3D_TexEnvFunc(env, C3D_RGB, GPU_INTERPOLATE);
+            const auto& fc = g_gxState.fog.color;
+            const float rgb[3] = {fc[0], fc[1], fc[2]};
+            C3D_TexEnvColor(env, PackConst(rgb, 1.0f));
+            continue;
+        }
         if (i >= total) continue;  // REPLACE(PREVIOUS)
         float rgb[3] = {1, 1, 1};
         float alpha = 1;
@@ -745,18 +949,38 @@ void ApplyMaterial(MaterialPlan& plan)
         g_lastBufMask[kAlpha] = cc.bufferMask[kAlpha] & 0xF;
     }
 
-    // The texture coordinates the units read: their GX texgen sources among TEX0..TEX7, at most two.
+    // The texture coordinates the units read: their GX texgen sources among TEX0..TEX7 (at most two sets: A and
+    // B), the position or the normal.
+    bool otherSrc = false;
     for (int u = 0; u < plan.unitCount; ++u) {
         const auto& tcg = g_gxState.tcgs[plan.units[u].texCoord & 7];
         const int src = static_cast<int>(tcg.src);
         if (src >= GX_TG_TEX0 && src <= GX_TG_TEX0 + 7) {
             const int attr = GX_VA_TEX0 + (src - GX_TG_TEX0);
-            if (plan.uvAttr[0] == attr || plan.uvAttr[1] == attr) continue;
-            if (plan.uvAttr[0] < 0) plan.uvAttr[0] = attr;
-            else if (plan.uvAttr[1] < 0) plan.uvAttr[1] = attr;
-            else cc.approximated = true;
+            int set = plan.uvAttr[0] == attr ? 0 : plan.uvAttr[1] == attr ? 1 : -1;
+            if (set < 0) {
+                if (plan.uvAttr[0] < 0) {
+                    plan.uvAttr[0] = attr;
+                    set = 0;
+                } else if (plan.uvAttr[1] < 0 && !(g_debugFlags & 2)) {
+                    plan.uvAttr[1] = attr;
+                    set = 1;
+                } else {
+                    cc.approximated = true;
+                    set = 0;
+                }
+            }
+            plan.unitSet[u] = static_cast<uint8_t>(set);
+        } else if (src == GX_TG_NRM && !(g_debugFlags & 4)) {
+            plan.needsNormals = true;
+        } else if (src != GX_TG_POS) {
+            otherSrc = true;  // binormal, tangent, colors, another unit's result: read as set A
+            cc.approximated = true;
         }
     }
+    if (plan.uvAttr[1] >= 0) ++g_statTwoSets;
+    if (plan.needsNormals) ++g_statNormalSrc;
+    if (otherSrc) ++g_statOtherSrc;
 
     ApplyPixelState(plan);
 
@@ -775,12 +999,19 @@ void WriteTevStats(std::FILE* f, unsigned frames)
     const double mats = g_statMaterials ? static_cast<double>(g_statMaterials) : 1.0;
     if (f) std::fprintf(f,
                  "materials: %.0f per frame, %.2f GX TEV stages -> %.2f PICA stages on average (most %d); "
-                 "%.1f%% approximated, %llu over 6 stages, %llu over 3 textures, %llu cull-all\n",
+                 "%.1f%% approximated, %llu over 6 stages, %llu over 3 textures, %llu cull-all\n"
+                 "large materials: %llu fitted by dropping %llu additive stages; texture coordinates: %llu batches "
+                 "with two sets, %llu from normals, %llu from other sources; fog: %llu batches, %llu per vertex\n",
                  g_statMaterials / div, g_statGxStagesSum / mats, g_statStagesSum / mats, g_statMaxStages,
                  100.0 * g_statApprox / mats, static_cast<unsigned long long>(g_statTruncated),
-                 static_cast<unsigned long long>(g_statUnitOverflow), static_cast<unsigned long long>(g_statCullAll));
+                 static_cast<unsigned long long>(g_statUnitOverflow), static_cast<unsigned long long>(g_statCullAll),
+                 static_cast<unsigned long long>(g_statReduced), static_cast<unsigned long long>(g_statDropped),
+                 static_cast<unsigned long long>(g_statTwoSets), static_cast<unsigned long long>(g_statNormalSrc),
+                 static_cast<unsigned long long>(g_statOtherSrc), static_cast<unsigned long long>(g_statFog),
+                 static_cast<unsigned long long>(g_statVertexFog));
     g_statMaterials = g_statApprox = g_statTruncated = g_statStagesSum = g_statGxStagesSum = 0;
-    g_statUnitOverflow = g_statCullAll = 0;
+    g_statUnitOverflow = g_statCullAll = g_statReduced = g_statDropped = g_statFog = 0;
+    g_statTwoSets = g_statNormalSrc = g_statOtherSrc = g_statVertexFog = 0;
     g_statMaxStages = 0;
 }
 

@@ -1,8 +1,9 @@
 # Brawl 3DS port — handoff context
 
-Everything a new session needs to continue the work. State as of 2026-11-22, on branch
-`feature/phase0-arm11-bringup` (repo `C:\Users\SOgaz\.t3\projects\brawl3ds`). The lighting commit is `7299e0a`;
-the history was rewritten, so older notes that say `b8fe233` mean the same commit.
+Everything a new session needs to continue the work. State as of 2026-11-23, on branch
+`feature/phase0-arm11-bringup` (repo `C:\Users\SOgaz\.t3\projects\brawl3ds`). The lighting commit is `7299e0a`
+(older notes that say `b8fe233` mean the same commit); milestone 4 (fog, second texture-coordinate set, viewport, EFB
+copy clears, large materials) is the commit after this note's update.
 
 ## 0. Mandatory rules for every session (read first)
 
@@ -65,8 +66,13 @@ without being asked again.
   `C:\Users\SOgaz\brawl3ds-work\brawl3ds-before-rewrite.bundle` (local only).
 - **GitHub:** https://github.com/sogazg-dev/brawl3ds (remote `origin`), with branches
   `feature/phase0-arm11-bringup` and `master`. Both are pushed and tracking.
-- Azahar uses the **software renderer**, which the user set by hand. It is needed for screenshots read back by
-  the CPU.
+- **Azahar graphics API: OpenGL.** The Software renderer draws random speckle over Brawl's frames (worse with fog).
+  It is not a code bug (the committed renderer speckles there too) and cost a whole session; judge pictures with
+  OpenGL or on the console. The in-game `shot_*.bmp` captures read the framebuffer on the CPU, which once needed the
+  Software renderer: check that they still show the picture with OpenGL before relying on them.
+- **Azahar does not reproduce console GPU hangs.** A build that ran fine there hung the New 3DS GPU on its first
+  draws (every frame hit the renderer's 2 s GPU timeout: 0.5 fps on the safety screen). Try new GPU configuration
+  on the console early.
 - The user tests on Azahar and on a real **New 3DS XL** and sends back `headless.log`, `profile.txt` and the
   `shot_*.bmp` files.
 - The user installs the **CIA** (`release-headless\brawl3ds-headless.cia`), not the .3dsx. **Always repackage
@@ -106,7 +112,13 @@ Pop-Location
 python C:\Users\SOgaz\.t3\projects\brawl3ds\tools\package_headless.py --build C:/Users/SOgaz/brawl3ds-work/headless-build --wiicompiled C:/Users/SOgaz/brawl3ds-work/BrawlRecompiled/wiicompiled --blobs C:/Users/SOgaz/brawl3ds-work/sd/3ds/brawl3ds/blobs --out C:/Users/SOgaz/brawl3ds-work/release-headless
 ```
 
-- `scripts\cycle.ps1` in brawl3ds-work runs a cycle in Azahar, including the save copy.
+- `scripts\cycle.ps1` in brawl3ds-work runs a cycle in Azahar, including the save copy (`-NoRun` only builds and
+  packages; `-Seconds N` sets the time limit, 2700 for a whole match).
+- **Testing files on the SD card** (`sdmc:/3ds/brawl3ds/`, read at the first frame; no file = normal run):
+  - `stop_after.txt` with a capture frame (700, 2000, 2873): the run ends two frames later and writes its
+    screenshots. A title check takes ~5 min in Azahar instead of ~25.
+  - `debug_flags.txt`, added up: `1` fog off, `16` fog only through the PICA fog table, `2` the second
+    texture-coordinate set read as the first, `4` coordinates from normals read as the first set.
 - Script edits: write the Python file with the Write tool, then run it. Bash heredocs break on apostrophes, and
   `\n` inside Python strings becomes a real newline in C `fprintf` strings.
 
@@ -150,6 +162,8 @@ python C:\Users\SOgaz\.t3\projects\brawl3ds\tools\package_headless.py --build C:
 | + Aurora front end, counting back end | 262.5 |
 | + PICA renderer, untextured | 273 |
 | + Textures/TEV (M3) | ~326 (3.1 fps) |
+| + Lighting (M4 first pass, `7299e0a`) | 348.8 (2.9 fps) |
+| + Fog, second UV set, viewport, copy clears (M4) | **365.6** (2.7 fps) |
 
 **Where the time goes (no-renderer profile):**
 - ~63 ms nw4r g3d drawing.
@@ -157,7 +171,7 @@ python C:\Users\SOgaz\.t3\projects\brawl3ds\tools\package_headless.py --build C:
 - ~90 ms game logic and animation.
 
 **Renderer costs:**
-- GXCallDisplayList ~67 ms/frame.
+- GXCallDisplayList 138 ms/frame with milestone 4 (121.6 with lighting only; ~67 before textures).
 - Brawl emits ~11,500 GX draws/frame (555 batches after state merging) and ~69–74K vertices.
 
 **Ideas for the big gains (30 fps needs ~6×):**
@@ -176,11 +190,24 @@ python C:\Users\SOgaz\.t3\projects\brawl3ds\tools\package_headless.py --build C:
 | `pica_tev_3ds.cpp` | GX TEV to PICA combiners (≤6 stages); alpha test, blend, depth, cull |
 | `pica_texture_3ds.cpp` | VRAM texture cache (LRU, ~5 MiB), GX_TextureCopy uploads (≤8/frame), halving above 128 texels |
 | `gx_texture_decode.cpp` | our GX texture decoders (all formats incl. CMPR) into a 1 MiB scratch buffer |
-| `gx_m4.v.pica` | vertex shader: transform, texgen for 3 units, GX lighting |
+| `gx_m4.v.pica` | vertex shader: transform, texgen for 3 units (sets A/B, position, normal), GX lighting, per-vertex fog |
 
 ### Key decisions
 
 - **Vertex layout (24 B):** pos float3, rgba u8 (material color), s8 row + s8 normal×127 ×3, uv s16×2 at 1/512.
+  Batches that read two texture-coordinate sets use a 28-byte vertex (set B appended, a fifth shader input read only
+  under the `twoset` flag) in the same buffer; batch starts stay 8-byte aligned.
+- **No fixed vertex attributes, no output written twice in the shader:** the console's GPU hung with them.
+- **Viewport:** folded into the projection (x/y onto its place in the 640x456 EFB, z onto its depth range); a
+  viewport covering the EFB (heights 448-528; Brawl's is 640x480) is the whole screen. Brawl's shadow pass draws into a
+  512x512 viewport in the corner.
+- **EFB copies:** only a texture copy's clear is drawn (a quad over the copy rectangle, `Brawl3dsPicaClearRect`); a
+  copy of (nearly) the whole screen is not cleared. The copy itself is still milestone 6.
+- **Fog:** per vertex in the shader (GX's formula from Aurora, from the vertex's screen depth), passed as unit 2's
+  coordinate into an 8x8 alpha ramp and blended in an extra last combiner stage; needs unit 2 and one stage free,
+  else the PICA fog table. The table alone cannot follow Brawl's fog: its perspective fog goes from none to full in
+  the last 1/2000 of the depth range (the 1/(b - z) pole), inside the table's last entry. Brawl leaves fog on for 2D
+  screens too (zero there).
 - **Top screen:**
   - It is set to BGR8, single-buffered, at renderer start. consoleInit had left it RGB565, which showed the frame
     as smeared copies.
@@ -205,17 +232,15 @@ python C:\Users\SOgaz\.t3\projects\brawl3ds\tools\package_headless.py --build C:
 2. ✅ Untextured geometry.
 3. ✅ Textures, TEV, blend, depth, cull. The HUD, percentages, portraits and stage background show correctly on
    the console and in Azahar.
-4. ⏳ **Lighting, fog, more TEV.** First pass committed in `b8fe233` (**not yet tested**):
-   - GX per-vertex lighting of COLOR0A0 in the shader: ambient + up to 8 lights; spot/spec/none attenuation;
-     none/sign/clamp diffuse.
-   - The normal goes through the position matrix and is normalized.
-   - Far lights are scaled to 1e6 because 24-bit floats overflow.
-   - A `lighting:` line in the match summary counts lit batches, lights each, approximations and COLOR1A1 users.
-   - Still to do in this milestone:
-     - COLOR1A1 (drawn as COLOR0A0 now; the PICA has one vertex color, so fragment lighting may be needed).
-     - Fog.
-     - A second UV set.
-     - Materials with more than 6 combiner stages or more than 3 textures.
+4. ✅ **Lighting, fog, more TEV** (console-tested 2026-11-23, all 9 steps, 0 GPU stalls):
+   - GX per-vertex lighting of COLOR0A0 in the shader (`7299e0a`): ambient + up to 8 lights; spot/spec/none
+     attenuation; none/sign/clamp diffuse; the normal goes through the position matrix; far lights scaled to 1e6.
+   - Fog per vertex (98% of fogged batches), second texture-coordinate set, coordinates from normals, viewport,
+     EFB copy clears (the red silhouettes are gone).
+   - Large materials: a fourth texture reads as a neutral constant; over six PICA stages, additive layers are
+     dropped first (never triggered in the demo match: 10 materials over 6 stages, ~4 draws a frame over 3 textures).
+   - Not done: COLOR1A1 (drawn as COLOR0A0; ~9 batches a frame), fog range adjustment, the title's "L" of BRAWL and
+     the flame behind it (under investigation).
 5. The GX side on the second core.
 6. EFB copies (GXCopyTex render-to-texture, and its clear) and the rest.
    - **The red fighter silhouettes** come from Brawl's shadow pass. It draws the fighters in one color, then an
@@ -225,16 +250,13 @@ python C:\Users\SOgaz\.t3\projects\brawl3ds\tools\package_headless.py --build C:
 
 ## 8. Open items and next steps
 
-1. **The user is testing `b8fe233`** (new CIA built 2026-11-22 22:08). Check:
-   - Shading on the fighters and stage: not too dark or blown out.
-   - The `lighting:` line in headless.log.
-   - The frame time against ~326 ms.
-   - The screenshots.
-2. Then fog, COLOR1A1 handling (according to the stats), the second UV set and larger TEV setups.
+1. **Title screen:** the "L" of BRAWL and the red flame behind it are missing (the flame showed when both of its
+   textures read set A, so its second set or its blending is suspect; the debug dump now lists blend factors and
+   TEV constants per batch).
+2. **Milestone 5:** the GX side on the second core (138 ms/frame in GXCallDisplayList).
 3. A post-match STALL: at frame 3814 (scMemoryChange) the guest sat at lr 80023BB4 for 100+ s. The run finished.
    Investigate later.
-4. Milestone 5 (second core) is the biggest performance lever on the renderer side.
-5. Deprioritised:
+4. Deprioritised:
    - The exit error.
    - The black screen when START is pressed during steps 2–4.
    - The scBoot SD/save stall seen in early runs (fixed by disabling the shadow copy).

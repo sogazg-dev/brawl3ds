@@ -7,8 +7,8 @@
 //   - pipeline_ref keeps every distinct pipeline config in a table and returns its index;
 //   - push_draw_command records the draw. Milestone 1 only counts draws and vertices (Brawl3dsRenderStats); the
 //     PICA200 draw path (vertex decode on the CPU, citro3d) replaces the counting in milestone 2;
-//   - texture objects, EFB copies, frame interpolation and window/VI sizing are inert or fixed to the 400x240 top
-//     screen.
+//   - texture objects, frame interpolation and window/VI sizing are inert or fixed to the 400x240 top screen; of an
+//     EFB copy only its clear is drawn (resolve_pass).
 // Aurora is MIT licensed (Copyright (c) 2022 Luke Street); this file is new code against its interfaces.
 
 #include "gfx/clear.hpp"
@@ -47,6 +47,7 @@ void Brawl3dsPicaDraw(GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, 
                       uint32_t indexCount, bool bigEndian);
 bool Brawl3dsPicaAppend(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, bool bigEndian);
 void Brawl3dsPicaEndFrame();
+void Brawl3dsPicaClearRect(int x, int y, int w, int h, bool color, bool alpha, bool depth);
 
 namespace {
 constexpr uint32_t kTopWidth = 400;
@@ -269,9 +270,15 @@ gx::DrawData* get_last_draw_command()
 TextureHandle new_render_texture(uint32_t, uint32_t, u32, const char*) noexcept { return {}; }
 TextureHandle new_conv_texture(uint32_t, uint32_t, u32, const char*) noexcept { return {}; }
 bool add_resolve_patch(const TextureHandle&, TextureHandle, uint32_t, uint32_t, uint32_t, uint32_t) { return false; }
-void resolve_pass(TextureHandle, ClipRect, bool, bool, bool, Vec4<float>, float, GXTexFmt, const Vec4<float>*, bool,
-                  const std::array<u32, 3>*, bool, float, bool, bool, bool)
+// An EFB copy. The copy itself is not made yet (milestone 6); a texture copy's clear is (Brawl3dsPicaClearRect).
+// GXCopyDisp (no source rectangle) ends the frame: the next one starts with a full clear anyway.
+void resolve_pass(TextureHandle, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth, Vec4<float>, float,
+                  GXTexFmt, const Vec4<float>* sourceRectPixels, bool, const std::array<u32, 3>*, bool, float, bool,
+                  bool, bool)
 {
+    if (!sourceRectPixels) return;
+    if (clearColor || clearAlpha || clearDepth)
+        Brawl3dsPicaClearRect(rect.x, rect.y, rect.width, rect.height, clearColor, clearAlpha, clearDepth);
 }
 
 namespace depth_peek {
