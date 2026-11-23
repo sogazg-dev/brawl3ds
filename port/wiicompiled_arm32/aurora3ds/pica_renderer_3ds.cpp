@@ -87,7 +87,7 @@ int g_curLayout = -1;  // the attribute layout citro3d has
 bool g_batchOpen = false;
 MaterialPlan g_plan;
 uint32_t g_droppedDraws = 0;
-uint32_t g_statClears = 0, g_statClearsSkipped = 0, g_statPartViewport = 0;
+uint32_t g_statClears = 0, g_statClearsSkipped = 0, g_statPartViewport = 0, g_statPostMtx = 0, g_statPostNormalize = 0;
 bool g_skipFrame = false;       // OpenFrame gave up on a busy GPU: no drawing until the frame ends
 uint32_t g_gpuStalls = 0;
 bool g_debugFrame = false;  // Brawl3dsPicaDebugNextFrame: log the next frame's first batches
@@ -293,7 +293,7 @@ void UploadUniforms(const float scaleS[kMaxUnits], const float scaleT[kMaxUnits]
     }
 
     // Per unit: the source vector's weights (uv set A, uv set B, object position, object normal) and the texture
-    // matrix, rows s, t and q (q = 1 for a 2x4 matrix), scaled to the padded PICA texture.
+    // matrix, rows s, t and q (q = 1 for a 2x4 matrix), scaled onto the PICA texture (1 since textures are stretched).
     for (int u = 0; u < kMaxUnits; ++u) {
         C3D_FVec s = FVec4_New(1, 0, 0, 0), m0 = FVec4_New(1, 0, 0, 0), m1 = FVec4_New(0, 1, 0, 0),
                  m2 = FVec4_New(0, 0, 0, 1);
@@ -315,6 +315,23 @@ void UploadUniforms(const float scaleS[kMaxUnits], const float scaleT[kMaxUnits]
                 if (threeRows) m2 = Row(m.m2);
             } else if (threeRows) {
                 m2 = FVec4_New(0, 0, 1, 0);
+            }
+            // GX's dual texture transform: with it on, the post-transform matrix takes (s, t, q of the first matrix,
+            // 1) (q = 1 for a 2x4 matrix): folded into the rows here. A 2x4 generator keeps q = 1 (Aurora outputs its
+            // s, t undivided). Normalizing in between is not done (counted).
+            if ((g_gxState.dualTex & 1u) && tcg.postMtx != GX_PTIDENTITY && tcg.postMtx >= GX_PTTEXMTX0) {
+                const auto& p = g_gxState.ptTexMtxs[std::min<u32>((tcg.postMtx - GX_PTTEXMTX0) / 3, MaxPTTexMtx - 1)];
+                const C3D_FVec a = m0, b = m1, c = m2;
+                auto fold = [&](const aurora::Vec4<float>& r) {
+                    return FVec4_New(r[0] * a.x + r[1] * b.x + r[2] * c.x, r[0] * a.y + r[1] * b.y + r[2] * c.y,
+                                     r[0] * a.z + r[1] * b.z + r[2] * c.z,
+                                     r[0] * a.w + r[1] * b.w + r[2] * c.w + r[3]);
+                };
+                m0 = fold(p.m0);
+                m1 = fold(p.m1);
+                if (threeRows) m2 = fold(p.m2);
+                ++g_statPostMtx;
+                if (tcg.normalize) ++g_statPostNormalize;
             }
             for (int c = 0; c < 4; ++c) m0.c[c] *= scaleS[u], m1.c[c] *= scaleT[u];
         }
@@ -870,10 +887,13 @@ void Brawl3dsPicaDraw(GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, 
         for (int u = 0; u < g_plan.unitCount; ++u) {
             const auto& t = g_gxState.loadedTextures[g_plan.units[u].texMap];
             const auto& tcg = g_gxState.tcgs[g_plan.units[u].texCoord & 7];
-            std::fprintf(stderr, "%smap %u coord %u (src %d mtx %d type %d set %u) %ux%u fmt %u", u ? ", " : "",
-                         g_plan.units[u].texMap, g_plan.units[u].texCoord, static_cast<int>(tcg.src),
-                         static_cast<int>(tcg.mtx), static_cast<int>(tcg.type), g_plan.unitSet[u], t.width(),
-                         t.height(), t.format());
+            std::fprintf(stderr,
+                         "%smap %u coord %u (src %d mtx %d post %d%s%s type %d set %u) %ux%u fmt %u wrap %d/%d",
+                         u ? ", " : "", g_plan.units[u].texMap, g_plan.units[u].texCoord, static_cast<int>(tcg.src),
+                         static_cast<int>(tcg.mtx), static_cast<int>(tcg.postMtx),
+                         (g_gxState.dualTex & 1u) ? " dual" : "", tcg.normalize ? " norm" : "",
+                         static_cast<int>(tcg.type), g_plan.unitSet[u], t.width(), t.height(), t.format(),
+                         static_cast<int>(t.wrap_s()), static_cast<int>(t.wrap_t()));
         }
         const auto& vp = g_gxState.logicalViewport;
         std::fprintf(stderr, "), viewport %.0f %.0f %.0fx%.0f z %.3f-%.3f, fog %d", vp.left, vp.top, vp.width,
@@ -1060,11 +1080,11 @@ extern "C" void Brawl3dsPicaWriteStats(std::FILE* f, unsigned frames)
                      g_statLitApprox, g_statColor1);
         std::fprintf(f,
                      "viewport and copies: %u batches in a part of the screen; %u EFB copy clears drawn, %u skipped "
-                     "(whole screen)\n",
-                     g_statPartViewport, g_statClears, g_statClearsSkipped);
+                     "(whole screen); %u texture units with a post-transform matrix (%u normalized, not applied)\n",
+                     g_statPartViewport, g_statClears, g_statClearsSkipped, g_statPostMtx, g_statPostNormalize);
     }
     g_statBatches = g_statLit = g_statLitApprox = g_statLights = g_statColor1 = 0;
-    g_statPartViewport = g_statClears = g_statClearsSkipped = 0;
+    g_statPartViewport = g_statClears = g_statClearsSkipped = g_statPostMtx = g_statPostNormalize = 0;
     WriteTevStats(f, frames);
     WriteTextureStats(f, frames);
 }

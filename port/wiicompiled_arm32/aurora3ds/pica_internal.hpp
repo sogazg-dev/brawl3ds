@@ -54,7 +54,7 @@ float FogAmountAt(float d);
 
 // pica_texture_3ds.cpp: bind GX texture map `texMap` to PICA unit `unit`; false when it has no usable texture
 // (the unit then samples a 8x8 white texture). `scaleS/T` receive the factors that map GX texture coordinates
-// onto the power-of-two PICA texture (1 unless the GX texture had to be padded).
+// onto the PICA texture (1: textures are stretched to their power-of-two size, not padded).
 bool BindTexture(int unit, int texMap, float& scaleS, float& scaleT);
 void TexturesBeginFrame();
 // Per-vertex fog: the 8x8 alpha ramp on `unit`; false when it could not be made.

@@ -1,8 +1,12 @@
 // GX textures on the PICA200 (renderer milestone 3): the texture a GX texture map points at is decoded once
 // (gx_texture_decode.cpp: any GX format, palettes included, to linear RGBA8 in one persistent scratch buffer),
-// halved above 128 texels, packed into the PICA format closest to the source (LA4/LA8 for intensity formats,
-// RGB565, RGBA5551, RGBA4, RGBA8) in the PICA's 8x8 Morton-order tiles, and kept in VRAM until a frame that does
-// not use it needs the space.
+// halved above 128 texels, stretched to the PICA's power-of-two size, packed into the PICA format closest to the
+// source (LA4/LA8 for intensity formats, RGB565, RGBA5551, RGBA4, RGBA8) in the PICA's 8x8 Morton-order tiles, and
+// kept in VRAM until a frame that does not use it needs the space.
+//
+// Stretched, not padded: a padded texture with scaled coordinates is right only for coordinates inside 0..1. GX
+// repeats (and clamps at) the texture's own edge, the PICA the padded one's: the title's flame mask (96x64,
+// repeating, coordinates from 1.01) sampled the padding and the flame behind "Brawl" disappeared.
 
 #include "pica_internal.hpp"
 
@@ -49,7 +53,7 @@ struct TexEntry {
     C3D_Tex tex;
     uint32_t bytes = 0;
     uint32_t lastUsedFrame = 0;
-    float scaleS = 1.0f, scaleT = 1.0f;  // GX size / PICA size
+    float scaleS = 1.0f, scaleT = 1.0f;  // coordinate scale onto the PICA texture (1: textures are stretched)
     bool valid = false;                  // false: decoding failed, the unit gets the white texture
 };
 
@@ -81,19 +85,49 @@ inline uint32_t Morton(uint32_t x, uint32_t y)
     return (x & 1) | (y & 1) << 1 | (x & 2) << 1 | (y & 2) << 2 | (x & 4) << 2 | (y & 4) << 3;
 }
 
-// Packs linear RGBA8 (w x h) into a PICA texture of W x H in `fmt`, padding with the edge texels.
+// Where output texel i of n samples m source texels (bilinear, texel centres matched): taps i0, i1 and the weight of
+// i1 in 1/256.
+struct Tap {
+    uint16_t i0, i1, f;
+};
+inline Tap MakeTap(uint32_t i, uint32_t n, uint32_t m)
+{
+    if (n == m) return {static_cast<uint16_t>(i), static_cast<uint16_t>(i), 0};
+    const int32_t pos = static_cast<int32_t>(((2 * i + 1) * m * 128) / n) - 128;  // ((i + 0.5) * m / n - 0.5) * 256
+    const uint32_t p = static_cast<uint32_t>(std::max(pos, 0));
+    const uint32_t i0 = std::min(p >> 8, m - 1);
+    return {static_cast<uint16_t>(i0), static_cast<uint16_t>(std::min(i0 + 1, m - 1)), static_cast<uint16_t>(p & 255)};
+}
+
+// Packs linear RGBA8 (w x h) into a PICA texture of W x H in `fmt`, stretched to fill it (bilinear; a plain copy
+// where the sizes match).
 void PackTiled(const uint8_t* rgba, uint32_t w, uint32_t h, uint32_t W, uint32_t H, GPU_TEXCOLOR fmt, uint8_t* out)
 {
     const uint32_t bpp = fmt == GPU_RGBA8 ? 4 : (fmt == GPU_LA4 ? 1 : 2);
+    static Tap xTaps[1024];
+    for (uint32_t x = 0; x < W && x < 1024; ++x) xTaps[x] = MakeTap(x, W, w);
     // The PICA samples t = 0 from the last row in memory and t = 1 from the first, GX t = 0 from its first row:
-    // memory row y holds GX row H - 1 - y (rows past the GX height repeat its last row). Unflipped, every texture
-    // of the safety screen showed upside down.
+    // memory row y holds GX row H - 1 - y. Unflipped, every texture of the safety screen showed upside down.
     for (uint32_t y = 0; y < H; ++y) {
-        const uint32_t gxRow = H - 1 - y;
-        const uint8_t* row = rgba + static_cast<size_t>(std::min(gxRow, h - 1)) * w * 4;
+        const Tap ty = MakeTap(H - 1 - y, H, h);
+        const uint8_t* row0 = rgba + static_cast<size_t>(ty.i0) * w * 4;
+        const uint8_t* row1 = rgba + static_cast<size_t>(ty.i1) * w * 4;
         const uint32_t tileRow = (y >> 3) * (W >> 3);
         for (uint32_t x = 0; x < W; ++x) {
-            const uint8_t* p = row + std::min(x, w - 1) * 4;
+            const Tap tx = xTaps[x];
+            const uint8_t* p00 = row0 + tx.i0 * 4;
+            uint8_t p[4];
+            if (tx.f == 0 && ty.f == 0) {
+                std::memcpy(p, p00, 4);
+            } else {
+                const uint8_t *p01 = row0 + tx.i1 * 4, *p10 = row1 + tx.i0 * 4, *p11 = row1 + tx.i1 * 4;
+                const uint32_t fx = tx.f, fy = ty.f;
+                for (int c = 0; c < 4; ++c) {
+                    const uint32_t top = p00[c] * (256 - fx) + p01[c] * fx;
+                    const uint32_t bottom = p10[c] * (256 - fx) + p11[c] * fx;
+                    p[c] = static_cast<uint8_t>((top * (256 - fy) + bottom * fy + 32768) >> 16);
+                }
+            }
             const uint32_t at = ((tileRow + (x >> 3)) * 64 + Morton(x & 7, y & 7)) * bpp;
             const uint32_t r = p[0], g = p[1], b = p[2], a = p[3];
             switch (fmt) {
@@ -308,9 +342,8 @@ CreateResult Create(const GXTexObj_& obj, const GXTlutObj_* tlut, TexEntry& e)
     ++g_uploadsThisFrame;
 
     e.bytes = static_cast<uint32_t>(bytes);
-    // GX size over the padded size; halving keeps the ratio.
-    e.scaleS = static_cast<float>(w) / static_cast<float>(W);
-    e.scaleT = static_cast<float>(h) / static_cast<float>(H);
+    // Stretched to the PICA size: GX coordinates apply unchanged.
+    e.scaleS = e.scaleT = 1.0f;
     g_bytes += bytes;
     g_statPeakBytes = std::max(g_statPeakBytes, g_bytes);
     g_statUploadBytes += bytes;

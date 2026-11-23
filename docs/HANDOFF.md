@@ -239,8 +239,11 @@ python C:\Users\SOgaz\.t3\projects\brawl3ds\tools\package_headless.py --build C:
      EFB copy clears (the red silhouettes are gone).
    - Large materials: a fourth texture reads as a neutral constant; over six PICA stages, additive layers are
      dropped first (never triggered in the demo match: 10 materials over 6 stages, ~4 draws a frame over 3 textures).
-   - Not done: COLOR1A1 (drawn as COLOR0A0; ~9 batches a frame), fog range adjustment, the title's "L" of BRAWL and
-     the flame behind it (under investigation).
+   - GX's dual texture transform (post-transform matrices, folded into the texture matrix rows on the CPU): Brawl's
+     whole title layout uses it; without it the flame behind "Brawl" and its "L" were missing. Normalizing before
+     the post matrix is not applied (counted in headless.log).
+   - Textures are stretched to their power-of-two size, not padded (padding is wrong for repeating textures).
+   - Not done: COLOR1A1 (drawn as COLOR0A0; ~9 batches a frame), fog range adjustment.
 5. The GX side on the second core.
 6. EFB copies (GXCopyTex render-to-texture, and its clear) and the rest.
    - **The red fighter silhouettes** come from Brawl's shadow pass. It draws the fighters in one color, then an
@@ -250,13 +253,10 @@ python C:\Users\SOgaz\.t3\projects\brawl3ds\tools\package_headless.py --build C:
 
 ## 8. Open items and next steps
 
-1. **Title screen:** the "L" of BRAWL and the red flame behind it are missing (the flame showed when both of its
-   textures read set A, so its second set or its blending is suspect; the debug dump now lists blend factors and
-   TEV constants per batch).
-2. **Milestone 5:** the GX side on the second core (138 ms/frame in GXCallDisplayList).
-3. A post-match STALL: at frame 3814 (scMemoryChange) the guest sat at lr 80023BB4 for 100+ s. The run finished.
+1. **Milestone 5:** the GX side on the second core (138 ms/frame in GXCallDisplayList).
+2. A post-match STALL: at frame 3814 (scMemoryChange) the guest sat at lr 80023BB4 for 100+ s. The run finished.
    Investigate later.
-4. Deprioritised:
+3. Deprioritised:
    - The exit error.
    - The black screen when START is pressed during steps 2–4.
    - The scBoot SD/save stall seen in early runs (fixed by disabling the shadow copy).
