@@ -53,6 +53,9 @@ and the regular heap gives the room (the 4.7 MB per-link module copy is gone sin
    vertices. Measures the parse cost on hardware.
 2. Untextured geometry on the top screen (vertex colors), checked in Azahar, which renders PICA.
 3. Textures and the common TEV setups, alpha test/blend/depth, culling.
-4. Lighting, fog, more TEV.
+4. Lighting, fog, more TEV. Lighting first pass: GX per-vertex lighting of channel COLOR0A0 in the vertex
+   shader (`gx_m4.v.pica`): normals packed into the 24-byte vertex (x127, beside the matrix row), up to 8 lights
+   as uniforms, the GX spot/specular/no attenuation and none/sign/clamp diffuse models. The normal uses the
+   position matrix, normalized. Not yet: COLOR1A1 (drawn as COLOR0A0), fog.
 5. The GX side on a second core.
 6. EFB copies and the rest.

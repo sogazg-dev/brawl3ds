@@ -1,0 +1,164 @@
+; Renderer milestone 4 vertex shader: GX transform, per-vertex GX lighting of channel COLOR0A0, three
+; texture-coordinate generators.
+; Inputs: position (object space); the channel's material color (0-255: the vertex color or the material
+; register); the GX matrix row of the vertex's position matrix (PNMTXIDX: 0, 3, ..., 27, or the current matrix)
+; with the object-space normal (x127); one texture-coordinate set (u, v in 1/512 steps; set B, from the loader's
+; (z, w) = (0, 1), is unused: its weights are 0).
+; Uniforms: the GX projection (4 rows, pre-rotated for the 240x400 portrait framebuffer: rows 1, -0, 2, 3), the 10
+; GX position matrices (3 rows each), per texture unit a source selector (weights of set A, set B and the object
+; position) and a texture matrix (rows s, t, q; q = (0, 0, 0, 1) for a 2x4 GX matrix); for lighting the ambient
+; color, the batch's light model and up to 8 lights.
+;
+; GX lighting (as Aurora's shader.cpp lighting_func, per vertex, in view space):
+;   lacc = ambient + sum over the channel's lights of color * attn * diff, clamped to 0..1; channel = material * lacc
+;   ldir = normalize(light.pos - pos), dist = |light.pos - pos|
+;   GX_AF_SPOT: c = max(0, ldir . light.dir), attn = max(0, cosatt . (1, c, c^2) / distatt . (1, dist, dist^2))
+;   GX_AF_SPEC: c = n . ldir >= 0 ? max(0, n . light.dir) : 0, attn = max(0, cosatt . (1, c, c^2) / distatt . (1, c, c^2))
+;   GX_AF_NONE: attn = 1 (the CPU passes cosatt = distatt = (1, 0, 0) with the spot model)
+;   GX_DF_NONE: diff = 1, GX_DF_SIGN: n . ldir, GX_DF_CLAMP: max(0, n . ldir)
+; The normal comes from the position matrix (normalized: uniform scale drops out; GX uses the separate normal
+; matrix, equal to it up to scale for rotations and uniform scaling).
+
+.fvec proj[4]
+.fvec posmtx[30]
+.fvec texmtx[9]
+.fvec texsrc[3]
+.fvec amb          ; rgb: COLOR0 ambient, a: ALPHA0 ambient (1 for an unlit part)
+.fvec lsel         ; (spec model 0/1, diffuse uses n.l 0/1, floor of n.l: 0 clamp, -2 sign, 0)
+.fvec lights[40]   ; per light: pos, dir, color (masked per part), cosatt, distatt
+.ivec lightloop    ; (lights - 1, 0, 5, 0)
+.bool lit
+
+.constf consts(1.0, 0.0, 0.00392156862745098, 0.001953125)
+.constf consts2(0.0078740157480315, 0.0, 0.0, 0.0)
+.alias ones consts.xxxx
+.alias zeros consts.yyyy
+.alias inv255 consts.zzzz
+.alias inv512 consts.wwww
+.alias inv127 consts2.xxxx
+
+.out outpos position
+.out outclr color
+.out outtc0 texcoord0
+.out outtc1 texcoord1
+.out outtc2 texcoord2
+
+.alias inpos v0
+.alias inclr v1
+.alias inrow v2
+.alias inuv v3
+
+.proc main
+    ; object -> view with the vertex's position matrix (a0.x = its first row)
+    mova a0.x, inrow.x
+    mov r0.xyz, inpos
+    mov r0.w, ones
+    dp4 r1.x, posmtx[a0.x], r0
+    dp4 r1.y, posmtx[a0.x+1], r0
+    dp4 r1.z, posmtx[a0.x+2], r0
+    mov r1.w, ones
+
+    ; view -> clip
+    dp4 r2.x, proj[0], r1
+    dp4 r2.y, proj[1], r1
+    dp4 r2.z, proj[2], r1
+    dp4 r2.w, proj[3], r1
+    mov outpos, r2
+
+    ; texture-coordinate sources: A = (uA, vA, 1, 1), B = (uB, vB, 1, 1), position = r0
+    mul r3.xy, inv512, inuv.xy
+    mov r3.zw, ones
+    mov r4.xy, inuv.zw
+    mov r4.zw, ones
+
+    ; unit 0
+    mul r5, texsrc[0].xxxx, r3
+    mad r5, r4, texsrc[0].yyyy, r5
+    mad r5, r0, texsrc[0].zzzz, r5
+    dp4 r6.x, texmtx[0], r5
+    dp4 r6.y, texmtx[1], r5
+    dp4 r6.z, texmtx[2], r5
+    rcp r6.z, r6.z
+    mul r6.xy, r6.zz, r6.xy
+    mov r6.zw, ones
+    mov outtc0, r6
+
+    ; unit 1
+    mul r5, texsrc[1].xxxx, r3
+    mad r5, r4, texsrc[1].yyyy, r5
+    mad r5, r0, texsrc[1].zzzz, r5
+    dp4 r7.x, texmtx[3], r5
+    dp4 r7.y, texmtx[4], r5
+    dp4 r7.z, texmtx[5], r5
+    rcp r7.z, r7.z
+    mul r7.xy, r7.zz, r7.xy
+    mov r7.zw, ones
+    mov outtc1, r7
+
+    ; unit 2
+    mul r5, texsrc[2].xxxx, r3
+    mad r5, r4, texsrc[2].yyyy, r5
+    mad r5, r0, texsrc[2].zzzz, r5
+    dp4 r8.x, texmtx[6], r5
+    dp4 r8.y, texmtx[7], r5
+    dp4 r8.z, texmtx[8], r5
+    rcp r8.z, r8.z
+    mul r8.xy, r8.zz, r8.xy
+    mov r8.zw, ones
+    mov outtc2, r8
+
+    ; channel color: the material color, times the lighting when the batch is lit
+    mul r12, inv255, inclr
+    ifu lit
+        ; view-space normal
+        mul r2.xyz, inv127, inrow.yzww
+        mov r2.w, zeros
+        dp3 r3.x, posmtx[a0.x], r2
+        dp3 r3.y, posmtx[a0.x+1], r2
+        dp3 r3.z, posmtx[a0.x+2], r2
+        dp3 r3.w, r3, r3
+        rsq r3.w, r3.w
+        mul r3.xyz, r3.wwww, r3
+        mov r10.x, ones          ; r10 = (1, 0): constants as a temp (one uniform per instruction)
+        mov r10.y, zeros
+        mov r4, amb              ; lacc
+        for lightloop
+            add r5.xyz, lights[aL], -r1
+            dp3 r5.w, r5, r5             ; dist^2
+            rsq r6.x, r5.wwww            ; 1 / dist
+            mul r5.xyz, r6.xxxx, r5      ; ldir
+            rcp r6.y, r6.xxxx            ; dist
+            dp3 r6.z, r3, r5             ; n . ldir
+            dp3 r7.x, lights[aL+1], r5   ; ldir . dir
+            dp3 r7.y, lights[aL+1], r3   ; n . dir
+            max r7.xy, zeros, r7         ; spot cosine, max(0, n . dir)
+            sge r7.z, r6.zzzz, r10.yyyy  ; n . ldir >= 0
+            mul r7.y, r7.zzzz, r7.yyyy   ; spec cosine
+            add r7.w, r7.yyyy, -r7.xxxx
+            mad r7.w, r7.wwww, lsel.xxxx, r7.xxxx   ; c = spot or spec cosine
+            add r8.x, r7.wwww, -r6.yyyy
+            mad r8.x, r8.xxxx, lsel.xxxx, r6.yyyy   ; the distance term's variable: dist (spot) or c (spec)
+            mov r9.x, r10.xxxx
+            mov r9.y, r7.wwww
+            mul r9.z, r7.wwww, r7.wwww
+            dp3 r9.w, lights[aL+3], r9   ; cosatt . (1, c, c^2)
+            mov r9.y, r8.xxxx
+            mul r9.z, r8.xxxx, r8.xxxx
+            dp3 r9.y, lights[aL+4], r9   ; distatt . (1, d, d^2)
+            rcp r9.y, r9.yyyy
+            mul r9.w, r9.wwww, r9.yyyy
+            max r9.w, zeros, r9.wwww     ; attn
+            max r6.z, lsel.zzzz, r6.zzzz ; n . ldir with its floor
+            add r6.z, r6.zzzz, -r10.xxxx
+            mad r6.z, r6.zzzz, lsel.yyyy, r10.xxxx  ; diff: 1 or n . ldir
+            mul r6.z, r9.wwww, r6.zzzz
+            mul r5, lights[aL+2], r6.zzzz
+            add r4, r4, r5
+        .end
+        max r4, zeros, r4
+        min r4, ones, r4
+        mul r12, r12, r4
+    .end
+    mov outclr, r12
+    end
+.end

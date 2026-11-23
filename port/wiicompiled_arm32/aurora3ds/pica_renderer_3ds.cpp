@@ -5,20 +5,23 @@
 // triangle-list indices) plus the unchanged-state draws appended to it (brawl3ds_append_draw). At a batch's start
 // the GX state is translated (ApplyMaterial), its textures bound (pica_texture_3ds.cpp) and the GX matrices
 // uploaded. Each GX vertex is decoded on the CPU from the current vertex format into position, channel color,
-// matrix row and up to two texture-coordinate sets; the vertex shader (gx_m3.v.pica) applies the GX position
+// matrix row and up to two texture-coordinate sets; the vertex shader (gx_m4.v.pica) applies the GX position
 // matrix, the projection and the texture-coordinate generators. Batches go to citro3d as indexed triangle lists
 // into per-frame linear-memory buffers; the frame begins at its first draw and ends in Brawl3dsPicaEndFrame.
-// Not yet: lighting (the channel color is approximated), fog, indirect textures, viewport/scissor, EFB copies.
+// Milestone 4: GX per-vertex lighting of channel COLOR0A0 in the vertex shader (normals from the GX vertex,
+// lights as uniforms, UploadLighting). Not yet: channel COLOR1A1 (drawn as COLOR0A0), fog, indirect textures,
+// viewport/scissor, EFB copies.
 
 #include "pica_internal.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
-extern "C" const unsigned char brawl3ds_gx_m3_shbin[];
-extern "C" const unsigned int brawl3ds_gx_m3_shbin_size;
+extern "C" const unsigned char brawl3ds_gx_m4_shbin[];
+extern "C" const unsigned int brawl3ds_gx_m4_shbin_size;
 
 // What the renderer is doing, for main_3ds.cpp's stall report (heartbeat thread).
 extern "C" const char* volatile g_brawl3dsRenderPhase = "not started";
@@ -29,14 +32,14 @@ using namespace brawl3ds_pica;
 
 struct PicaVertex {
     float x, y, z;
-    uint8_t r, g, b, a;   // the GX channel color (COLOR0A0)
-    uint8_t row;          // GX matrix row of the position matrix (0, 3, ..., 27)
-    uint8_t pad;
+    uint8_t r, g, b, a;   // the material color of GX channel COLOR0A0 (the shader applies the lighting)
+    int8_t row;           // GX matrix row of the position matrix (0, 3, ..., 27)
+    int8_t n[3];          // object-space normal x 127 (lit batches only)
     int16_t uv[2];        // one texture-coordinate set in 1/512 steps (+-64; MaterialPlan::uvAttr[0])
-    uint8_t pad2[2];
 };
 static_assert(sizeof(PicaVertex) == 24);
-constexpr float kUvScale = 512.0f;  // gx_m3.v.pica multiplies by 1/512
+constexpr float kUvScale = 512.0f;  // gx_m4.v.pica multiplies by 1/512
+constexpr uint32_t kMaxLights = 8;   // gx_m4.v.pica's lights[40]: 5 vectors each
 
 // Linear memory is nearly all guest RAM: these buffers, citro3d's command buffer and the texture staging buffer
 // have to fit in the ~3.5 MiB it leaves (main_3ds.cpp's kLinearHeap).
@@ -54,6 +57,7 @@ C3D_RenderTarget* g_target = nullptr;
 DVLB_s* g_dvlb = nullptr;
 shaderProgram_s g_program;
 int g_projLoc = -1, g_mtxLoc = -1, g_texMtxLoc = -1, g_texSrcLoc = -1;
+int g_ambLoc = -1, g_lselLoc = -1, g_lightsLoc = -1, g_lightLoopLoc = -1, g_litLoc = -1;
 PicaVertex* g_vertices = nullptr;
 uint16_t* g_indices = nullptr;
 uint32_t g_vtxUsed = 0, g_idxUsed = 0;
@@ -91,8 +95,8 @@ bool Init()
     g_target = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
     if (!g_target) return fail("the render target");
     C3D_RenderTargetSetOutput(g_target, GFX_TOP, GFX_LEFT, kDisplayFlags);
-    g_dvlb = DVLB_ParseFile(reinterpret_cast<u32*>(const_cast<unsigned char*>(brawl3ds_gx_m3_shbin)),
-                            brawl3ds_gx_m3_shbin_size);
+    g_dvlb = DVLB_ParseFile(reinterpret_cast<u32*>(const_cast<unsigned char*>(brawl3ds_gx_m4_shbin)),
+                            brawl3ds_gx_m4_shbin_size);
     if (!g_dvlb) return fail("the shader");
     shaderProgramInit(&g_program);
     shaderProgramSetVsh(&g_program, &g_dvlb->DVLE[0]);
@@ -100,6 +104,14 @@ bool Init()
     g_mtxLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "posmtx");
     g_texMtxLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "texmtx");
     g_texSrcLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "texsrc");
+    g_ambLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "amb");
+    g_lselLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "lsel");
+    g_lightsLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "lights");
+    g_lightLoopLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "lightloop");
+    g_litLoc = shaderInstanceGetUniformLocation(g_program.vertexShader, "lit");
+    if (g_projLoc < 0 || g_mtxLoc < 0 || g_texMtxLoc < 0 || g_texSrcLoc < 0 || g_ambLoc < 0 || g_lselLoc < 0 ||
+        g_lightsLoc < 0 || g_lightLoopLoc < 0 || g_litLoc < 0)
+        return fail("the shader's uniforms");
     g_vertices = static_cast<PicaVertex*>(linearAlloc(sizeof(PicaVertex) * kMaxVertices));
     if (!g_vertices) return fail("the vertex buffer");
     g_indices = static_cast<uint16_t*>(linearAlloc(sizeof(uint16_t) * kMaxIndices));
@@ -124,7 +136,7 @@ void ApplyFixedState()
     AttrInfo_Init(attr);
     AttrInfo_AddLoader(attr, 0, GPU_FLOAT, 3);          // position
     AttrInfo_AddLoader(attr, 1, GPU_UNSIGNED_BYTE, 4);  // channel color
-    AttrInfo_AddLoader(attr, 2, GPU_UNSIGNED_BYTE, 2);  // matrix row (+ padding)
+    AttrInfo_AddLoader(attr, 2, GPU_BYTE, 4);           // matrix row, normal x 127
     AttrInfo_AddLoader(attr, 3, GPU_SHORT, 2);          // texture coordinates x 512 (the shader sees u, v, 0, 1)
     // GX clip-space z runs from -w (near) to 0 (far), which is also the PICA's clip range. citro3d's default depth
     // map (depth = -z/w) makes near 1 and far 0; GX's depth buffer has near 0 and far 1, so the game's compare
@@ -333,6 +345,8 @@ struct VertexPlan {
     AttrPlan pos, clr;
     bool hasUv;
     AttrPlan uv;
+    bool hasNrm;
+    AttrPlan nrm;
 };
 
 void BuildPlan(GXVtxFmt fmt, bool be, VertexPlan& plan)
@@ -375,6 +389,9 @@ void BuildPlan(GXVtxFmt fmt, bool be, VertexPlan& plan)
         } else if (attr == GX_VA_CLR0) {
             plan.hasClr = true;
             plan.clr = a;
+        } else if (attr == GX_VA_NRM) {  // the normal is the first three components (NBT: of the first index)
+            plan.hasNrm = true;
+            plan.nrm = a;
         } else if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) {
             a.two = af.cnt == GX_TEX_ST;
             if (g_plan.uvAttr[0] == attr) plan.hasUv = true, plan.uv = a;
@@ -419,23 +436,19 @@ void DecodeUvs(const AttrPlan& a, const uint8_t* src, bool streamBe, uint32_t co
     }
 }
 
-// The GX channel COLOR0A0 for this batch: material (or vertex) color times the lighting. Lighting is milestone 4:
-// until then a lit channel is its ambient plus half of each enabled light's color, without direction.
+// The GX channel COLOR0A0 for this batch: its material color goes into the vertices (from the vertex color or the
+// material register); its lighting, when enabled, into the shader's uniforms (UploadLighting).
 struct ChannelPlan {
     bool rgbFromVertex, alphaFromVertex;
-    uint32_t rgbMul[3], alphaMul;  // 0..256 fixed point
-    uint8_t rgb[3], alpha;          // material color (register source)
+    uint8_t rgb[3], alpha;  // material color (register source)
+    bool lit;               // the shader lights the batch: the vertices need normals
 };
+
+// Lighting statistics for the match summary.
+uint32_t g_statBatches = 0, g_statLit = 0, g_statLitApprox = 0, g_statLights = 0, g_statColor1 = 0;
 
 void BuildChannel(ChannelPlan& ch)
 {
-    auto light = [](const ColorChannelConfig& cfg, const ColorChannelState& st, int c) {
-        if (!cfg.lightingEnabled) return 1.0f;
-        float v = st.ambColor[c];
-        for (u32 i = 0; i < GX::MaxLights; ++i)
-            if (st.lightMask.test(i)) v += 0.5f * g_gxState.lights[i].color[c];
-        return std::clamp(v, 0.0f, 1.0f);
-    };
     auto byte = [](float v) { return static_cast<uint8_t>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
     const auto& cc = g_gxState.colorChannelConfig[0];  // GX_COLOR0
     const auto& cs = g_gxState.colorChannelState[0];
@@ -444,15 +457,94 @@ void BuildChannel(ChannelPlan& ch)
     const bool none = g_gxState.numChans == 0;
     ch.rgbFromVertex = !none && cc.matSrc == GX_SRC_VTX;
     ch.alphaFromVertex = !none && ac.matSrc == GX_SRC_VTX;
-    for (int c = 0; c < 3; ++c) {
-        ch.rgb[c] = none ? 255 : byte(cs.matColor[c]);
-        ch.rgbMul[c] = none ? 256 : static_cast<uint32_t>(light(cc, cs, c) * 256.0f);
-    }
+    for (int c = 0; c < 3; ++c) ch.rgb[c] = none ? 255 : byte(cs.matColor[c]);
     ch.alpha = none ? 255 : byte(as.matColor[3]);
-    ch.alphaMul = none ? 256 : static_cast<uint32_t>(light(ac, as, 3) * 256.0f);
+    const bool litRgb = !none && cc.lightingEnabled, litAlpha = !none && ac.lightingEnabled;
+    ch.lit = litRgb || litAlpha;
+    ++g_statBatches;
+    for (u32 s = 0; s < g_gxState.numTevStages && s < MaxTevStages; ++s)
+        if (g_gxState.tevStages[s].channelId == GX_COLOR1A1) {
+            ++g_statColor1;
+            break;
+        }
+    if (C3D_BoolUnifs[GPU_VERTEX_SHADER] & BIT(g_litLoc - 0x68) ? !ch.lit : ch.lit)
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, g_litLoc, ch.lit);
+    if (!ch.lit) return;
+    ++g_statLit;
+
+    // The light model: COLOR0's, or ALPHA0's when only the alpha is lit. Both lit with different models (or an
+    // ambient from the vertex color) is drawn approximately.
+    const ColorChannelConfig& cfg = litRgb ? cc : ac;
+    if ((litRgb && litAlpha && (cc.diffFn != ac.diffFn || cc.attnFn != ac.attnFn)) ||
+        (litRgb && cc.ambSrc == GX_SRC_VTX) || (litAlpha && ac.ambSrc == GX_SRC_VTX))
+        ++g_statLitApprox;
+    const bool spec = cfg.attnFn == GX_AF_SPEC;
+    const bool useDot = cfg.diffFn != GX_DF_NONE;
+    SetVec(g_lselLoc, FVec4_New(spec ? 1.0f : 0.0f, useDot ? 1.0f : 0.0f, cfg.diffFn == GX_DF_SIGN ? -2.0f : 0.0f, 0));
+    // Ambient, 1 for a part that is not lit (with its lights' color 0 there, lacc = 1: the material alone).
+    SetVec(g_ambLoc, FVec4_New(litRgb ? cs.ambColor[0] : 1.0f, litRgb ? cs.ambColor[1] : 1.0f,
+                               litRgb ? cs.ambColor[2] : 1.0f, litAlpha ? as.ambColor[3] : 1.0f));
+    uint32_t n = 0;
+    for (u32 i = 0; i < GX::MaxLights && n < kMaxLights; ++i) {
+        const bool inRgb = litRgb && cs.lightMask.test(i), inAlpha = litAlpha && as.lightMask.test(i);
+        if (!inRgb && !inAlpha) continue;
+        const Light& l = g_gxState.lights[i];
+        const int at = g_lightsLoc + static_cast<int>(n) * 5;
+        // A light placed "at infinity" (directional lights sit ~1e18 away) overflows the shader's 24-bit floats
+        // (max ~9e18) in the squared distance: brought in to 1e6, which keeps its direction from the scene.
+        float px = l.pos[0], py = l.pos[1], pz = l.pos[2];
+        const float far = std::max({std::fabs(px), std::fabs(py), std::fabs(pz)});
+        if (far > 1e6f) {
+            const float k = 1e6f / far;
+            px *= k, py *= k, pz *= k;
+        }
+        SetVec(at + 0, FVec4_New(px, py, pz, 0));
+        SetVec(at + 1, FVec4_New(l.dir[0], l.dir[1], l.dir[2], 0));
+        SetVec(at + 2, FVec4_New(inRgb ? l.color[0] : 0.0f, inRgb ? l.color[1] : 0.0f, inRgb ? l.color[2] : 0.0f,
+                                 inAlpha ? l.color[3] : 0.0f));
+        if (cfg.attnFn == GX_AF_NONE) {
+            SetVec(at + 3, FVec4_New(1, 0, 0, 0));
+            SetVec(at + 4, FVec4_New(1, 0, 0, 0));
+        } else {
+            SetVec(at + 3, FVec4_New(l.cosAtt[0], l.cosAtt[1], l.cosAtt[2], 0));
+            float k0 = l.distAtt[0], k1 = l.distAtt[1], k2 = l.distAtt[2];
+            if (spec && useDot) {  // GX normalizes the specular distance coefficients for a lit diffuse
+                const float len = std::sqrt(k0 * k0 + k1 * k1 + k2 * k2);
+                if (len > 0) k0 /= len, k1 /= len, k2 /= len;
+            }
+            SetVec(at + 4, FVec4_New(k0, k1, k2, 0));
+        }
+        ++n;
+    }
+    g_statLights += n;
+    if (n == 0) {  // the loop runs at least once: one light that adds nothing
+        SetVec(g_lightsLoc + 0, FVec4_New(0, 0, 0, 0));
+        SetVec(g_lightsLoc + 2, FVec4_New(0, 0, 0, 0));
+        SetVec(g_lightsLoc + 3, FVec4_New(1, 0, 0, 0));
+        SetVec(g_lightsLoc + 4, FVec4_New(1, 0, 0, 0));
+        n = 1;
+    }
+    const C3D_IVec loop = IVec_Pack(n - 1, 0, 5, 0);
+    if (C3D_IVUnif[GPU_VERTEX_SHADER][g_lightLoopLoc - 0x60] != loop)
+        C3D_IVUnifSet(GPU_VERTEX_SHADER, g_lightLoopLoc, n - 1, 0, 5, 0);
 }
 
 ChannelPlan g_channel;
+
+inline int8_t NormalByte(float v) { return static_cast<int8_t>(std::clamp(v * 127.0f, -127.0f, 127.0f)); }
+
+// The normals of one draw, x 127 (their GX fixed-point scale applied).
+void DecodeNormals(const AttrPlan& a, const uint8_t* src, bool streamBe, uint32_t count, uint32_t size,
+                   PicaVertex* out)
+{
+    const uint32_t step = a.type == GX_F32 ? 4 : (a.type == GX_U16 || a.type == GX_S16) ? 2 : 1;
+    for (uint32_t n = 0; n < count; ++n, src += size) {
+        const uint8_t* values = AttrValues(a, src, streamBe);
+        out[n].n[0] = NormalByte(LoadComponent(values, a.type, a.scale, a.be));
+        out[n].n[1] = NormalByte(LoadComponent(values + step, a.type, a.scale, a.be));
+        out[n].n[2] = NormalByte(LoadComponent(values + 2 * step, a.type, a.scale, a.be));
+    }
+}
 
 // Decode `count` GX vertices of format `fmt` into the frame's vertex buffer; false when it is full.
 bool DecodeVertices(GXVtxFmt fmt, const uint8_t* src, uint32_t count, bool be)
@@ -470,24 +562,31 @@ bool DecodeVertices(GXVtxFmt fmt, const uint8_t* src, uint32_t count, bool be)
             uint8_t c[4];
             LoadColor(AttrValues(plan.clr, vtx, be), plan.clr.type, plan.clr.be, c);
             PicaVertex& v = out[n];
-            v.r = static_cast<uint8_t>(((ch.rgbFromVertex ? c[0] : ch.rgb[0]) * ch.rgbMul[0]) >> 8);
-            v.g = static_cast<uint8_t>(((ch.rgbFromVertex ? c[1] : ch.rgb[1]) * ch.rgbMul[1]) >> 8);
-            v.b = static_cast<uint8_t>(((ch.rgbFromVertex ? c[2] : ch.rgb[2]) * ch.rgbMul[2]) >> 8);
-            v.a = static_cast<uint8_t>(((ch.alphaFromVertex ? c[3] : ch.alpha) * ch.alphaMul) >> 8);
+            v.r = ch.rgbFromVertex ? c[0] : ch.rgb[0];
+            v.g = ch.rgbFromVertex ? c[1] : ch.rgb[1];
+            v.b = ch.rgbFromVertex ? c[2] : ch.rgb[2];
+            v.a = ch.alphaFromVertex ? c[3] : ch.alpha;
         }
     } else {
-        const uint8_t r = static_cast<uint8_t>((ch.rgb[0] * ch.rgbMul[0]) >> 8);
-        const uint8_t g = static_cast<uint8_t>((ch.rgb[1] * ch.rgbMul[1]) >> 8);
-        const uint8_t b = static_cast<uint8_t>((ch.rgb[2] * ch.rgbMul[2]) >> 8);
-        const uint8_t a = static_cast<uint8_t>((ch.alpha * ch.alphaMul) >> 8);
+        // A vertex color source without CLR0 in the vertex: GX reads white.
+        const uint8_t r = ch.rgbFromVertex ? 255 : ch.rgb[0], g = ch.rgbFromVertex ? 255 : ch.rgb[1],
+                      b = ch.rgbFromVertex ? 255 : ch.rgb[2], a = ch.alphaFromVertex ? 255 : ch.alpha;
         for (uint32_t n = 0; n < count; ++n) out[n].r = r, out[n].g = g, out[n].b = b, out[n].a = a;
+    }
+    // Normals, for a lit batch (GX's default without NRM in the vertex: (1, 0, 0)).
+    if (ch.lit) {
+        if (plan.hasNrm) {
+            DecodeNormals(plan.nrm, src, be, count, plan.size, out);
+        } else {
+            for (uint32_t n = 0; n < count; ++n) out[n].n[0] = 127, out[n].n[1] = out[n].n[2] = 0;
+        }
     }
     // Matrix row.
     if (plan.pnMtxOffset >= 0) {
         const uint8_t* vtx = src + plan.pnMtxOffset;
-        for (uint32_t n = 0; n < count; ++n, vtx += plan.size) out[n].row = *vtx;
+        for (uint32_t n = 0; n < count; ++n, vtx += plan.size) out[n].row = static_cast<int8_t>(*vtx);
     } else {
-        const uint8_t row = static_cast<uint8_t>(g_gxState.currentPnMtx * 3);
+        const int8_t row = static_cast<int8_t>(g_gxState.currentPnMtx * 3);
         for (uint32_t n = 0; n < count; ++n) out[n].row = row;
     }
     // Texture coordinates.
@@ -723,7 +822,15 @@ extern "C" void Brawl3dsPicaWriteCaptures()
 // Material and texture statistics for the match summary (headless.log).
 extern "C" void Brawl3dsPicaWriteStats(std::FILE* f, unsigned frames)
 {
-    if (f) std::fprintf(f, "GPU stalls (frames not drawn after 2 s of waiting): %u\n", g_gpuStalls);
+    if (f) {
+        std::fprintf(f, "GPU stalls (frames not drawn after 2 s of waiting): %u\n", g_gpuStalls);
+        std::fprintf(f,
+                     "lighting: %u of %u batches lit (%.1f lights each), %u lit approximately, %u read channel "
+                     "COLOR1A1 (drawn as COLOR0A0)\n",
+                     g_statLit, g_statBatches, g_statLit ? static_cast<double>(g_statLights) / g_statLit : 0.0,
+                     g_statLitApprox, g_statColor1);
+    }
+    g_statBatches = g_statLit = g_statLitApprox = g_statLights = g_statColor1 = 0;
     WriteTevStats(f, frames);
     WriteTextureStats(f, frames);
 }
