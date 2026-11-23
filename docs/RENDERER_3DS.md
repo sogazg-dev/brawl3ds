@@ -90,3 +90,12 @@ citro3d clears the GPU queue on HOME (`APTHOOK_ONSUSPEND`), and failures reporte
 
 Either way the frame end waits for the worker (GXDrawDone semantics) at first; overlapping the next frame's game
 logic needs the staging arena double-buffered and is a later step.
+
+**Chosen first step: the back end, without snapshots** (`bc50feb`). The console profile (2026-11-23) puts the render
+phase at 242 of 364 ms per match frame and GXCallDisplayList at ~133-138 ms; earlier runs bound Aurora's share to
+~50 ms, so the back end is ~85-90 ms. Instead of copying GX state per draw, the game thread keeps translating it
+(materials, uniforms, vertex reading plans) and records the citro3d-level changes it already tracked (combiner
+stages, fragment state, fog, uniform vectors, texture objects) and the draws into a command ring; the worker on
+core 2 does the heavy part (texture decode and upload, vertex decode, the GPU command buffer). Appended draws'
+vertices are copied into the ring (they can sit in the runtime's FIFO buffer); full draws' stay in Aurora's arena
+until the frame-end drain.

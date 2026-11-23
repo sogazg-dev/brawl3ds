@@ -509,9 +509,9 @@ bool InitGpu()
     g_indices = static_cast<uint16_t*>(linearAlloc(sizeof(uint16_t) * kMaxIndices));
     if (!g_indices) return fail("the index buffer");
     std::fprintf(stderr,
-                 "[pica] renderer ready on core %d: %u vertices, %u indices per frame (%u KiB linear); %u KiB linear, "
+                 "[pica] renderer ready: %u vertices, %u indices per frame (%u KiB linear); %u KiB linear, "
                  "%u KiB VRAM free\n",
-                 svcGetProcessorID(), kMaxVertices, kMaxIndices,
+                 kMaxVertices, kMaxIndices,
                  static_cast<unsigned>((kVertexBytes + 2 * kMaxIndices) >> 10),
                  static_cast<unsigned>(linearSpaceFree() >> 10), static_cast<unsigned>(vramSpaceFree() >> 10));
     g_failed = false;

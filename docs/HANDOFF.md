@@ -253,7 +253,13 @@ python C:\Users\SOgaz\.t3\projects\brawl3ds\tools\package_headless.py --build C:
 
 ## 8. Open items and next steps
 
-1. **Milestone 5:** the GX side on the second core (138 ms/frame in GXCallDisplayList).
+1. **Milestone 5 (first step `bc50feb`, Azahar-tested, awaiting the console):** the PICA back end runs on a worker
+   thread on core 2 (pica_renderer_3ds.cpp): the game thread translates the GX state and records only changes and
+   draws into a 2 MiB command ring; the worker owns citro3d (textures, vertex decoding, command buffer, submission);
+   the frame end waits for it. `debug_flags.txt` 32 runs everything on the game thread (A/B comparison).
+   headless.log's "GPU work" line gives the worker's busy time and the game thread's waits. Next: the console
+   numbers; then overlap the worker with the next frame (double-buffer Aurora's staging arena) or move Aurora's
+   front end too (design in docs/RENDERER_3DS.md).
 2. A post-match STALL: at frame 3814 (scMemoryChange) the guest sat at lr 80023BB4 for 100+ s. The run finished.
    Investigate later.
 3. Deprioritised:
