@@ -633,19 +633,19 @@ void ApplyFog(MaterialPlan& plan)
                 prev = next;
             }
             FogLut_FromArray(&g_fogLut, data);
-            C3D_FogLutBind(&g_fogLut);
+            RecFogLut(g_fogLut);
             g_fogKey = key;
             g_haveFogKey = true;
         }
         auto byte = [](float v) { return static_cast<uint32_t>(Clamp01(v) * 255.0f + 0.5f); };
         const uint32_t color = byte(f.color[0]) | byte(f.color[1]) << 8 | byte(f.color[2]) << 16;
         if (color != g_fogColor) {
-            C3D_FogColor(color);
+            RecFogColor(color);
             g_fogColor = color;
         }
     }
     if (g_fogOn != (on ? 1 : 0)) {
-        C3D_FogGasMode(on ? GPU_FOG : GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
+        RecFogMode(on);
         g_fogOn = on ? 1 : 0;
     }
 }
@@ -707,24 +707,12 @@ void ApplyPixelState(MaterialPlan& plan)
     const FragmentState& last = g_lastFragment;
     const bool all = !g_haveLastFragment;
     if (all || fs.alphaTest != last.alphaTest || fs.alphaFunc != last.alphaFunc || fs.alphaRef != last.alphaRef)
-        C3D_AlphaTest(fs.alphaTest, static_cast<GPU_TESTFUNC>(fs.alphaFunc), fs.alphaRef);
-    if (all || fs.blendKind != last.blendKind || fs.src != last.src || fs.dst != last.dst || fs.logicOp != last.logicOp) {
-        switch (fs.blendKind) {
-        case 1:
-            C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, static_cast<GPU_BLENDFACTOR>(fs.src),
-                           static_cast<GPU_BLENDFACTOR>(fs.dst), static_cast<GPU_BLENDFACTOR>(fs.src),
-                           static_cast<GPU_BLENDFACTOR>(fs.dst));
-            break;
-        case 2:
-            C3D_AlphaBlend(GPU_BLEND_REVERSE_SUBTRACT, GPU_BLEND_REVERSE_SUBTRACT, GPU_ONE, GPU_ONE, GPU_ONE, GPU_ONE);
-            break;
-        case 3: C3D_ColorLogicOp(static_cast<GPU_LOGICOP>(fs.logicOp)); break;
-        default: C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO); break;
-        }
-    }
+        RecAlphaTest(fs.alphaTest, static_cast<GPU_TESTFUNC>(fs.alphaFunc), fs.alphaRef);
+    if (all || fs.blendKind != last.blendKind || fs.src != last.src || fs.dst != last.dst || fs.logicOp != last.logicOp)
+        RecBlend(fs.blendKind, fs.src, fs.dst, fs.logicOp);
     if (all || fs.depthFunc != last.depthFunc || fs.writeMask != last.writeMask)
-        C3D_DepthTest(true, static_cast<GPU_TESTFUNC>(fs.depthFunc), static_cast<GPU_WRITEMASK>(fs.writeMask));
-    if (all || fs.cull != last.cull) C3D_CullFace(static_cast<GPU_CULLMODE>(fs.cull));
+        RecDepthTest(static_cast<GPU_TESTFUNC>(fs.depthFunc), fs.writeMask);
+    if (all || fs.cull != last.cull) RecCull(static_cast<GPU_CULLMODE>(fs.cull));
     g_lastFragment = fs;
     g_haveLastFragment = true;
     ApplyFog(plan);
@@ -828,22 +816,21 @@ void ApplyClearState(bool color, bool alpha, bool depth)
     C3D_TexEnvInit(&env);
     C3D_TexEnvSrc(&env, C3D_Both, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
     C3D_TexEnvFunc(&env, C3D_Both, GPU_REPLACE);
-    C3D_SetTexEnv(0, &env);
+    RecTexEnv(0, env);
     for (int i = 1; i < kMaxPicaStages; ++i) {
         C3D_TexEnvInit(&env);  // REPLACE(PREVIOUS)
-        C3D_SetTexEnv(i, &env);
+        RecTexEnv(i, env);
     }
-    C3D_TexEnvBufUpdate(C3D_RGB, 0);
-    C3D_TexEnvBufUpdate(C3D_Alpha, 0);
-    C3D_AlphaTest(false, GPU_ALWAYS, 0);
-    C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
+    RecTexEnvBufUpdate(0, 0);
+    RecAlphaTest(false, GPU_ALWAYS, 0);
+    RecBlend(0, GPU_ONE, GPU_ZERO, 0);
     int mask = 0;
     if (color) mask |= GPU_WRITE_RED | GPU_WRITE_GREEN | GPU_WRITE_BLUE;
     if (alpha) mask |= GPU_WRITE_ALPHA;
     if (depth) mask |= GPU_WRITE_DEPTH;
-    C3D_DepthTest(true, GPU_ALWAYS, static_cast<GPU_WRITEMASK>(mask));
-    C3D_CullFace(GPU_CULL_NONE);
-    C3D_FogGasMode(GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
+    RecDepthTest(GPU_ALWAYS, mask);
+    RecCull(GPU_CULL_NONE);
+    RecFogMode(false);
     // All of the above differs from what the caches remember: the next material sends its state again.
     g_haveLastFragment = false;
     for (bool& have : g_haveLastEnv) have = false;
@@ -895,14 +882,14 @@ void ApplyMaterial(MaterialPlan& plan)
         C3D_TexEnv envStorage;
         C3D_TexEnv* env = &envStorage;
         C3D_TexEnvInit(env);
-        // Given to citro3d (which marks it dirty and re-emits it) only when it differs from the last one.
+        // Recorded for citro3d (which marks it dirty and re-emits it) only when it differs from the last one.
         struct Commit {
             int i;
             C3D_TexEnv* env;
             ~Commit()
             {
                 if (!g_haveLastEnv[i] || std::memcmp(&g_lastEnv[i], env, sizeof(C3D_TexEnv)) != 0) {
-                    C3D_SetTexEnv(i, env);
+                    RecTexEnv(i, *env);
                     g_lastEnv[i] = *env;
                     g_haveLastEnv[i] = true;
                 }
@@ -943,8 +930,7 @@ void ApplyMaterial(MaterialPlan& plan)
         C3D_TexEnvColor(env, PackConst(rgb, alpha));
     }
     if (g_lastBufMask[kRgb] != (cc.bufferMask[kRgb] & 0xF) || g_lastBufMask[kAlpha] != (cc.bufferMask[kAlpha] & 0xF)) {
-        C3D_TexEnvBufUpdate(C3D_RGB, cc.bufferMask[kRgb] & 0xF);
-        C3D_TexEnvBufUpdate(C3D_Alpha, cc.bufferMask[kAlpha] & 0xF);
+        RecTexEnvBufUpdate(cc.bufferMask[kRgb] & 0xF, cc.bufferMask[kAlpha] & 0xF);
         g_lastBufMask[kRgb] = cc.bufferMask[kRgb] & 0xF;
         g_lastBufMask[kAlpha] = cc.bufferMask[kAlpha] & 0xF;
     }

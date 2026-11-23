@@ -52,10 +52,23 @@ void ApplyClearState(bool color, bool alpha, bool depth);
 // GX's fog amount (0..1) at screen depth `d` with the current fog state (for the debug dump).
 float FogAmountAt(float d);
 
-// pica_texture_3ds.cpp: bind GX texture map `texMap` to PICA unit `unit`; false when it has no usable texture
-// (the unit then samples a 8x8 white texture). `scaleS/T` receive the factors that map GX texture coordinates
-// onto the PICA texture (1: textures are stretched to their power-of-two size, not padded).
-bool BindTexture(int unit, int texMap, float& scaleS, float& scaleT);
+// pica_renderer_3ds.cpp: citro3d state as pica_tev_3ds.cpp sets it, recorded on the game thread and applied by the
+// GPU worker on core 2 (or at once, without the worker). Only changes are recorded (the callers keep what they
+// last set). Blend kinds: 0 replace, 1 blend (src/dst factors), 2 subtract, 3 logic op.
+void RecTexEnv(int stage, const C3D_TexEnv& env);
+void RecTexEnvBufUpdate(int rgbMask, int alphaMask);
+void RecAlphaTest(bool on, GPU_TESTFUNC func, int ref);
+void RecBlend(int kind, int src, int dst, int logicOp);
+void RecDepthTest(GPU_TESTFUNC func, int writeMask);
+void RecCull(GPU_CULLMODE mode);
+void RecFogMode(bool on);
+void RecFogColor(uint32_t color);
+void RecFogLut(const C3D_FogLut& lut);
+
+// pica_texture_3ds.cpp (GPU worker only): bind GX texture object `obj` (with its palette, if paletted) to PICA unit
+// `unit`; false when it has no usable texture (the unit then samples a 8x8 white texture). Textures are stretched
+// to their power-of-two size, so GX coordinates apply unchanged.
+bool BindTextureObj(int unit, const GXTexObj_& obj, const GXTlutObj_* tlut);
 void TexturesBeginFrame();
 // Per-vertex fog: the 8x8 alpha ramp on `unit`; false when it could not be made.
 bool BindFogRamp(int unit);

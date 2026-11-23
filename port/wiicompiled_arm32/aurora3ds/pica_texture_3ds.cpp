@@ -390,21 +390,16 @@ void TexturesBeginFrame()
     }
 }
 
-bool BindTexture(int unit, int texMap, float& scaleS, float& scaleT)
+bool BindTextureObj(int unit, const GXTexObj_& obj, const GXTlutObj_* tlut)
 {
-    scaleS = scaleT = 1.0f;
     EnsureWhite();
     ++g_statBinds;
-    if (texMap < 0 || texMap >= static_cast<int>(MaxTextures)) {
+    if (!obj.data) {  // no texture map (or none loaded): white
         ++g_statWhite;
         if (g_whiteReady) Bind(unit, &g_white);
         return false;
     }
-    const GXTexObj_& obj = g_gxState.loadedTextures[texMap];
     const uint32_t fmt = obj.format();
-    const bool paletted = fmt == GX_TF_C4 || fmt == GX_TF_C8 || fmt == GX_TF_C14X2;
-    const GXTlutObj_* tlut = nullptr;
-    if (paletted && static_cast<uint32_t>(obj.tlut) < MaxTluts) tlut = &g_gxState.loadedTluts[obj.tlut];
 
     TexKey key{};
     key.data = obj.data;
@@ -445,8 +440,6 @@ bool BindTexture(int unit, int texMap, float& scaleS, float& scaleT)
                          : GPU_LINEAR);
     C3D_TexSetWrap(&e.tex, Wrap(obj.wrap_s()), Wrap(obj.wrap_t()));
     Bind(unit, &e.tex);
-    scaleS = e.scaleS;
-    scaleT = e.scaleT;
     return true;
 }
 
