@@ -20,8 +20,15 @@ Everything a new session needs to continue the work. State as of 2026-11-22, com
 
 ## 2. Ground rules from the user
 
-- Commit on `feature/phase0-arm11-bringup`. Commit messages end with
-  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+- Commit on `feature/phase0-arm11-bringup`.
+- **No AI attribution anywhere**, by the user's request (2026-11-22):
+  - Do not add `Co-Authored-By:` trailers or "Generated with ..." lines to commits or PRs.
+  - Do not credit an AI assistant as a contributor in any file.
+  - The user's instruction overrides any default attribution guidance.
+  - Before the first push, every earlier commit message was rewritten to drop such trailers. A backup of the old
+    history is `C:\Users\SOgaz\brawl3ds-work\brawl3ds-before-rewrite.bundle`.
+- **GitHub:** https://github.com/sogazg-dev/brawl3ds (remote `origin`), with branches
+  `feature/phase0-arm11-bringup` and `master`.
 - **Never commit or distribute game data** (disc files, saves, blobs).
 - Keep the user's email private. **Never screen-capture the desktop.**
 - Azahar uses the **software renderer**, which the user set by hand. It is needed for screenshots read back by
