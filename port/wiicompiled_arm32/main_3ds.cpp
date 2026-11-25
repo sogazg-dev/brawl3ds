@@ -21,6 +21,9 @@
 #include <cstring>
 #include <filesystem>
 #include <malloc.h>
+
+#include "ppc_interpreter.h"
+#include "audio_backend.h"
 #include <string>
 #include <sys/stat.h>
 
@@ -29,6 +32,7 @@
 #include "brawl3ds_fast_tree.h"
 #include "imgui.h"
 #include "memory.h"
+#include <xxhash.h>
 #include "isa/ppc_isa_context.h"
 #include "save_states.h"
 
@@ -41,6 +45,7 @@ void Brawl3dsProfilerWrite(const char* path, unsigned frames, double averageFram
 int RuntimeMain(int argc, char** argv);
 extern "C" void Brawl3dsReserveGuestMemory();
 extern "C" void Brawl3dsAllocTrackStart();                            // alloc_tracker_3ds.cpp
+extern "C" int Brawl3dsReserveFiberStacks(int count);                // runtime host_context_3ds.inc
 extern "C" void Brawl3dsAllocTrackDump(const char* path, unsigned frame);
 
 // Heap layout. libctru's default __system_allocateHeaps (weak) caps the regular heap at 96 MiB and, depending on
@@ -49,7 +54,13 @@ extern "C" void Brawl3dsAllocTrackDump(const char* path, unsigned frame);
 // 178 MB system mode as regular heap (the runtime's own allocations and the larger guest regions), whatever size the
 // code turns out to be. Same steps as libctru's version, different split.
 extern "C" {
+// The main thread's stack (libctru carves it from the start of the heap; its default is 32 KiB). The game's main
+// thread runs on it: the VS demo reaches ~28 KiB deep, the end-of-match countdown went past 32 KiB and wrote below
+// the heap. The other guest threads' fibers have 256 KiB (fiber_manager.cpp); the same here.
+u32 __stacksize__ = 256 * 1024;
 u32 __ctru_heap_size = 0;
+u8* g_brawl3dsPackArena = nullptr;
+u32 g_brawl3dsPackArenaSize = 0;
 u32 __ctru_linear_heap_size = 0;
 extern u32 __ctru_heap;
 extern u32 __ctru_linear_heap;
@@ -69,6 +80,9 @@ void __system_allocateHeaps(void)
     // step 4. The renderer fits in the ~3.5 MiB guest RAM leaves: pica_renderer_3ds.cpp.)
     constexpr u32 kLinearHeap = 42u * 1024u * 1024u;
     constexpr u32 kRegularHeapMax = 96u * 1024u * 1024u;  // the kernel's heap window at 0x08000000
+    // A match's fighters and stage are 1.5-4 MiB of translated code; moving the fighters' and stages' cold
+    // functions out of the executable (tools/depromote_modules.py) freed 2.8 MiB of it.
+    constexpr u32 kPackArena = 10u * 1024u * 1024u;
 
     Handle limits = 0;
     if (R_FAILED(svcGetResourceLimit(&limits, CUR_PROCESS_HANDLE))) svcBreak(USERBREAK_PANIC);
@@ -99,8 +113,12 @@ void __system_allocateHeaps(void)
     mappableInit(OS_MAP_AREA_BEGIN, OS_MAP_AREA_END);
     __ctru_heap_size = heap;
     __ctru_linear_heap_size = linear;
+    // The top of the mapping is the code packs' arena (code_packs_3ds.cpp), outside malloc's heap: taken from it
+    // later, megabytes in one piece left the heap without a 256 KiB block for a thread stack.
+    g_brawl3dsPackArenaSize = heap > (64u << 20) ? kPackArena : 0;
+    g_brawl3dsPackArena = reinterpret_cast<u8*>(__ctru_heap) + heap - g_brawl3dsPackArenaSize;
     fake_heap_start = reinterpret_cast<char*>(__ctru_heap);
-    fake_heap_end = fake_heap_start + heap;
+    fake_heap_end = fake_heap_start + heap - g_brawl3dsPackArenaSize;
 }
 }
 
@@ -128,6 +146,8 @@ extern "C" void Brawl3dsPicaCaptureNextFrame(const char* path);
 extern "C" void Brawl3dsPicaWriteCaptures();
 extern "C" void Brawl3dsPicaSetDebugFlags(unsigned flags) __attribute__((weak));  // testing aid: absent in older renderers
 extern "C" void Brawl3dsPicaWriteStats(std::FILE* f, unsigned frames);
+extern "C" void Brawl3dsPicaTakeWindowStats(double* busyMs, double* waitMs, uint32_t* wakeups);
+extern "C" void Brawl3dsPicaTakeCpStats(double* cpMs, uint32_t* syncs, double* syncMs);
 extern "C" uint32_t Brawl3dsPicaTakeDropped();
 extern "C" void Brawl3dsPicaDebugNextFrame();
 extern "C" const char* volatile g_brawl3dsRenderPhase;  // aurora3ds/pica_renderer_3ds.cpp
@@ -137,6 +157,19 @@ extern "C" void Brawl3dsZonesWrite(std::FILE* f, unsigned frames);
 uint64_t g_matchSum = 0, g_matchWork = 0, g_matchMax = 0;
 uint32_t g_matchOver16 = 0, g_matchOver33 = 0;
 std::string g_scene;
+
+// Play mode (the playable build): the 3DS buttons drive GameCube controller port 1, nothing is scripted and the run
+// does not stop at the demo match. Chosen at start-up: the play CIA's title (unique ID 0xBB3D3) or a
+// sdmc:/3ds/brawl3ds/play.txt file (for the .3dsx and for tests with the headless title).
+bool g_play = false;
+extern "C" unsigned char g_brawl3dsGxTiming;
+uint64_t g_interpretedCalls = 0;  // calls into functions this build left out (Brawl3ds_NotLinked)
+uint32_t g_interpretedLogged = 0;
+}  // namespace
+void Brawl3dsInterpProfileWrite();
+namespace {
+unsigned g_renderEveryUser = 0;  // play mode's render frame skip: 0 automatic, else draw 1 game frame in N
+double g_renderedFrameMs = 0;    // recent time of the game frames that were drawn (for the automatic skip)
 
 double TicksToMs(uint64_t ticks) { return static_cast<double>(ticks) * 1000.0 / SYSCLOCK_ARM11; }
 
@@ -293,6 +326,40 @@ void DrawStatusLocked(const char* warning)
     constexpr u32 kWhite = 0xFFFFFF, kGrey = 0xA0A0A0, kGreen = 0x40D040, kYellow = 0xFFD040, kRed = 0xFF5050;
     char a[24], b[24];
 
+    if (g_play && g_frames > 0) {
+        PutText(fb, 1, 1, "Brawl3DS (playable test build)", kGreen);
+        if (!g_scene.empty()) PrintAt(fb, 1, 3, kGrey, "scene %s   frame %u", g_scene.c_str(), g_frames);
+        PrintAt(fb, 1, 9, kGrey, "interpreted: %llu calls, %llu M instr.",
+                static_cast<unsigned long long>(g_interpretedCalls),
+                static_cast<unsigned long long>(PpcInterpreter::InstructionCount() / 1000000u));
+        if (g_recentFrameMs > 0) {
+            // Brawl computes 60 game frames a second: the share of that this console reaches is the game's speed.
+            const double gameFps = 1000.0 / g_recentFrameMs;
+            PrintAt(fb, 1, 5, kWhite, "game speed %3.0f%%  (%.1f of 60 frames/s)", gameFps * 100.0 / 60.0, gameFps);
+            PrintAt(fb, 1, 6, kWhite, "frame time %.0f ms", g_recentFrameMs);
+        }
+        if (g_renderEveryUser) {
+            PrintAt(fb, 1, 8, kWhite, "pictures: 1 game frame in %u", g_renderEveryUser);
+        } else {
+            PutText(fb, 1, 8, "pictures: automatic", kWhite);
+        }
+        PutText(fb, 1, 11, "GameCube controller, port 1:", kGrey);
+        PutText(fb, 1, 12, " A B X Y START D-pad as printed", kGrey);
+        PutText(fb, 1, 13, " L R shoulder buttons, ZL/ZR = Z", kGrey);
+        PutText(fb, 1, 14, " Circle Pad = stick, C-Stick = C", kGrey);
+        PutText(fb, 1, 17, "SELECT + D-pad up/down: pictures", kGrey);
+        PutText(fb, 1, 18, " (fewer pictures = faster game)", kGrey);
+        PutText(fb, 1, 19, "SELECT + START: quit", kGrey);
+        if (warning) PutText(fb, 1, 23, warning, kRed);
+        gfxFlushBuffers();
+        if (Brawl3dsPicaActive()) {
+            gfxScreenSwapBuffers(GFX_BOTTOM, false);
+        } else {
+            gfxSwapBuffers();
+        }
+        return;
+    }
+
     PutText(fb, 1, 1, "brawl3ds headless test (diagnostic)", kGrey);
     PrintAt(fb, 1, 3, kWhite, "Step %d of %d:", g_step + 1, kStepCount);
     PutText(fb, 1, 4, kSteps[g_step].name, g_step == kStepMatch ? kGreen : kYellow);
@@ -427,11 +494,150 @@ extern "C" void __appExit(void);
     std::fflush(stderr);
     if (g_log) std::fclose(g_log);
     g_log = nullptr;
+    if (g_play) {
+        // The playable build leaves through a restart of the console: this application runs in the New 3DS's
+        // 178 MB mode, and ending the process (below) left the HOME Menu with "An error has occurred" on real
+        // hardware whatever was shut down first. The restart takes a few seconds and shows no error. If the
+        // request is refused the old path follows.
+        AudioBackend::Instance().Shutdown();
+        if (R_SUCCEEDED(APT_HardwareResetAsync())) {
+            for (;;) svcSleepThread(100000000LL);
+        }
+    }
     gfxExit();
     __appExit();
     svcExitProcess();
     for (;;) {
     }
+}
+
+// The sound follows the game's speed (audio_backend_3ds.cpp): 1 at 60 game frames a second.
+extern "C" float Brawl3dsAudioSpeed()
+{
+    return g_recentFrameMs > 0 ? static_cast<float>((1000.0 / 60.0) / g_recentFrameMs) : 1.0f;
+}
+bool g_audioOff = false;  // debug_flags.txt 1024
+
+// Fingerprints of the game's memory, to prove on the PC that a change (a native function, a renderer shortcut) left
+// the game's behaviour alone: sdmc:/3ds/brawl3ds/det_hash.txt holds "<every> [<dump frame> ...]". Every <every>
+// frames one line goes to det_hash_out.txt: the frame, then one 32-bit hash per MiB of MEM1 (24), MEM2 (54) and the
+// module homes (12). At a dump frame the three regions are written whole (mem_<frame>_<region>.bin).
+// tools/det_compare.py compares two runs. Off (no file): one fopen at the first frame.
+void DetHashFrame() {
+    static int every = -1;
+    static uint32_t dumps[8];
+    static unsigned dumpCount = 0;
+    static std::FILE* out = nullptr;
+    if (every == -1) {
+        every = 0;
+        if (std::FILE* f = std::fopen("sdmc:/3ds/brawl3ds/det_hash.txt", "r")) {
+            unsigned n = 0;
+            if (std::fscanf(f, "%u", &n) == 1) every = static_cast<int>(n);
+            while (dumpCount < 8 && std::fscanf(f, "%u", &n) == 1) dumps[dumpCount++] = n;
+            std::fclose(f);
+            if (every > 0) out = std::fopen("sdmc:/3ds/brawl3ds/det_hash_out.txt", "w");
+            Log("det_hash.txt: memory hashes every %d frames, %u dump(s)\n", every, dumpCount);
+        }
+    }
+    if (every <= 0) return;
+    struct Region {
+        const char* name;
+        uint32_t base;
+        size_t size;
+    };
+    static const Region regions[] = {{"mem1", Memory::kMem1CachedBase, Memory::kMem1Size},
+                                     {"mem2", Memory::kMem2CachedBase, Memory::kMem2Size},
+                                     {"homes", Memory::kModuleHomesBase, Memory::kModuleHomesSize}};
+    if (out && g_frames % static_cast<uint32_t>(every) == 0) {
+        std::fprintf(out, "%u", g_frames);
+        for (const Region& r : regions) {
+            const uint8_t* p = Memory::GetPointer(r.base, 4);
+            for (size_t at = 0; at < r.size; at += 1u << 20) {
+                std::fprintf(out, " %08x", static_cast<unsigned>(XXH3_64bits(p + at, 1u << 20)));
+            }
+        }
+        std::fputc('\n', out);
+        std::fflush(out);
+    }
+    for (unsigned i = 0; i < dumpCount; ++i) {
+        if (dumps[i] != g_frames) continue;
+        for (const Region& r : regions) {
+            char path[64];
+            std::snprintf(path, sizeof(path), "sdmc:/3ds/brawl3ds/mem_%u_%s.bin", g_frames, r.name);
+            if (std::FILE* f = std::fopen(path, "wb")) {
+                std::fwrite(Memory::GetPointer(r.base, 4), 1, r.size, f);
+                std::fclose(f);
+            }
+        }
+        Log("det_hash.txt: memory written at frame %u\n", g_frames);
+    }
+}
+extern "C" int Brawl3dsAudioWanted() { return g_play && !g_audioOff; }
+
+// Can this process run code it wrote itself? Translated code for one fighter or stage is 0.2-1.6 MiB and the whole
+// game's does not fit (~95 MiB), so the plan is to load a module's translated code from the SD card when the game
+// links that module: that needs memory made executable at run time (svcControlProcessMemory). One page, one
+// function that returns 42. The steps are written to sdmc:/3ds/brawl3ds/exec_probe.txt as they happen, so a
+// crash in the middle leaves "calling" there, and the probe is not repeated while that file exists.
+void ExecProbe()
+{
+    const char* path = "sdmc:/3ds/brawl3ds/exec_probe.txt";
+    if (std::FILE* old = std::fopen(path, "r")) {
+        char line[160] = "";
+        std::fgets(line, sizeof(line), old);
+        std::fclose(old);
+        Log("exec probe: done before, result: %s", line[0] ? line : "(empty)\n");
+        return;
+    }
+    const auto state = [path](const char* text) {
+        if (std::FILE* f = std::fopen(path, "w")) {
+            std::fputs(text, f);
+            std::fclose(f);
+        }
+    };
+    state("started\n");
+    auto* page = static_cast<u32*>(memalign(0x1000, 0x1000));
+    if (!page) {
+        state("failed: no memory\n");
+        return;
+    }
+    page[0] = 0xE3A0002Au;  // mov r0, #42
+    page[1] = 0xE12FFF1Eu;  // bx lr
+    Handle self = CUR_PROCESS_HANDLE;
+    const Result dup = svcDuplicateHandle(&self, CUR_PROCESS_HANDLE);
+    if (R_FAILED(dup)) self = CUR_PROCESS_HANDLE;
+    const Result flush = svcFlushProcessDataCache(self, reinterpret_cast<u32>(page), 0x1000);
+    Result protect = svcControlProcessMemory(self, reinterpret_cast<u32>(page), 0, 0x1000, MEMOP_PROT,
+                                             MEMPERM_READ | MEMPERM_EXECUTE);
+    int perm = 5;
+    if (R_FAILED(protect)) {
+        protect = svcControlProcessMemory(self, reinterpret_cast<u32>(page), 0, 0x1000, MEMOP_PROT,
+                                          MEMPERM_READ | MEMPERM_WRITE | MEMPERM_EXECUTE);
+        perm = 7;
+    }
+    Log("exec probe: page %08lX, handle %08lX (duplicate %08lX), flush %08lX, protect r%sx %08lX\n",
+        static_cast<unsigned long>(reinterpret_cast<u32>(page)), static_cast<unsigned long>(self),
+        static_cast<unsigned long>(dup), static_cast<unsigned long>(flush), perm == 7 ? "w" : "-",
+        static_cast<unsigned long>(protect));
+    char text[120];
+    if (R_FAILED(protect)) {
+        std::snprintf(text, sizeof(text), "failed: protect %08lX (flush %08lX, duplicate %08lX)\n",
+                      static_cast<unsigned long>(protect), static_cast<unsigned long>(flush),
+                      static_cast<unsigned long>(dup));
+        state(text);
+        Log("exec probe: %s", text);
+    } else {
+        state("calling (if this is still here, the call crashed)\n");
+        if (g_log) std::fflush(g_log);
+        const int value = reinterpret_cast<int (*)()>(page)();
+        std::snprintf(text, sizeof(text), "%s: the page returned %d (permissions %d)\n", value == 42 ? "ok" : "wrong",
+                      value, perm);
+        state(text);
+        Log("exec probe: %s", text);
+        svcControlProcessMemory(self, reinterpret_cast<u32>(page), 0, 0x1000, MEMOP_PROT, MEMPERM_READ | MEMPERM_WRITE);
+    }
+    if (self != CUR_PROCESS_HANDLE) svcCloseHandle(self);
+    // The page is not freed: a block that changed protection and back is left alone.
 }
 
 // The end of a normal run, called from the game's own frame (main thread): results are written, then the process
@@ -512,12 +718,31 @@ void WriteWindow()
 {
     if (g_windowFrames == 0) return;
     const double avg = TicksToMs(g_windowSum) / g_windowFrames;
+    double gpuBusy = 0, gpuWait = 0;
+    uint32_t gpuWakeups = 0;
+    Brawl3dsPicaTakeWindowStats(&gpuBusy, &gpuWait, &gpuWakeups);
+    double cpMs = 0, cpSyncMs = 0;
+    uint32_t cpSyncs = 0;
+    Brawl3dsPicaTakeCpStats(&cpMs, &cpSyncs, &cpSyncMs);
+    const struct mallinfo heap = mallinfo();
+    static uint64_t lastInterpCalls = 0, lastInterpInstr = 0;
+    const uint64_t interpInstr = PpcInterpreter::InstructionCount();
+    if (g_interpretedCalls != lastInterpCalls) {
+        Log("interpreted since the last line: %llu calls, %llu instructions\n",
+            static_cast<unsigned long long>(g_interpretedCalls - lastInterpCalls),
+            static_cast<unsigned long long>(interpInstr - lastInterpInstr));
+        lastInterpCalls = g_interpretedCalls;
+        lastInterpInstr = interpInstr;
+        if (g_play) Brawl3dsInterpProfileWrite();  // with every window that interpreted something
+    }
     Log("frame %6u  scene %-16s  avg %6.2f ms (game %6.2f)  min %6.2f  max %6.2f  ~%4.1f fps  malloc %d KiB"
-        "  draws %llu verts %llu\n",
+        " (free %d)  draws %llu verts %llu  gpu worker %.1f ms (cp %.1f), wait %.1f ms, wakes %.0f, syncs %.1f (%.1f ms)\n",
         g_frames, g_scene.c_str(), avg, TicksToMs(g_windowWork) / g_windowFrames, TicksToMs(g_windowMin),
-        TicksToMs(g_windowMax), avg > 0 ? 1000.0 / avg : 0.0, mallinfo().uordblks >> 10,
+        TicksToMs(g_windowMax), avg > 0 ? 1000.0 / avg : 0.0, heap.uordblks >> 10, heap.fordblks >> 10,
         static_cast<unsigned long long>(g_windowDraws / g_windowFrames),
-        static_cast<unsigned long long>(g_windowVerts / g_windowFrames));
+        static_cast<unsigned long long>(g_windowVerts / g_windowFrames), gpuBusy / g_windowFrames,
+        cpMs / g_windowFrames, gpuWait / g_windowFrames, static_cast<double>(gpuWakeups) / g_windowFrames,
+        static_cast<double>(cpSyncs) / g_windowFrames, cpSyncMs / g_windowFrames);
     g_windowDraws = g_windowVerts = 0;
     g_windowSum = g_windowWork = g_windowMax = 0;
     g_windowMin = UINT64_MAX;
@@ -685,13 +910,273 @@ extern "C" void Brawl3dsFatal(const char* what)
 }
 
 // Every translated function the build left out (tools/select_translated_code.py) calls this.
+//
+// The whole game's translated code (~95 MiB) does not fit beside the Wii's RAM, so the build links the functions
+// the VS demo runs and leaves the rest as stubs. Those run in the runtime's PowerPC interpreter
+// (ppc_interpreter.cpp: the function's own guest code, still in guest memory, until it returns; its calls go back
+// through the dispatch tables, into translated code where there is some). Slower by far, but everything the demo
+// does not reach (menus, other fighters and stages) runs at all. The log names the functions and counts the
+// instructions: the busiest are the ones to add to the translated set.
+// The pre-linker's cross-module veneers (gen3ds/trampolines_3ds.cpp, tools/gen_trampoline_table.py): their bytes are
+// not in guest memory, so the interpreter cannot run them; each is a jump to its target through r12 and ctr.
+extern "C" const uint32_t g_brawl3dsTrampolineCount;
+extern "C" const uint32_t g_brawl3dsTrampolines[][2];
+static uint32_t TrampolineTarget(uint32_t address)
+{
+    uint32_t lo = 0, hi = g_brawl3dsTrampolineCount;
+    while (lo < hi) {
+        const uint32_t mid = (lo + hi) / 2;
+        if (g_brawl3dsTrampolines[mid][0] < address) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < g_brawl3dsTrampolineCount && g_brawl3dsTrampolines[lo][0] == address ? g_brawl3dsTrampolines[lo][1] : 0;
+}
+
+// The interpreted functions' calls and own instructions, by address (open addressing; a full table drops the rest).
+extern "C" void (*Brawl3dsPackFunction(uint32_t guest))(CpuContext*);
+extern "C" void Brawl3dsPacksInit();
+extern "C" void Brawl3dsPacksSceneChange(int leavingMatch);
+
+struct InterpProfileEntry {
+    uint32_t address, calls;
+    uint64_t instructions;
+};
+constexpr uint32_t kInterpProfileSlots = 8192;
+static InterpProfileEntry g_interpProfile[kInterpProfileSlots];
+
+static void InterpProfileAdd(uint32_t address, uint64_t instructions, uint32_t calls = 1)
+{
+    uint32_t slot = ((address >> 2) * 2654435761u) >> 19;  // 13 bits
+    for (uint32_t probe = 0; probe < 64; ++probe, slot = (slot + 1) & (kInterpProfileSlots - 1)) {
+        InterpProfileEntry& e = g_interpProfile[slot];
+        if (e.address == address || e.address == 0) {
+            e.address = address;
+            e.calls += calls;
+            e.instructions += instructions;
+            return;
+        }
+    }
+}
+
+// sdmc:/3ds/brawl3ds/interp_profile.txt: "<address> <calls> <own instructions>", the costliest first
+// (tools/promote_functions.py reads it). Written with the frame-time windows in play mode (every 600 frames and at
+// scene changes). It adds up over the sessions: the
+// file already there is read in first (delete it to start over, e.g. with a new build).
+void Brawl3dsInterpProfileWrite()
+{
+    static bool merged = false;
+    if (!merged) {
+        merged = true;
+        if (std::FILE* old = std::fopen("sdmc:/3ds/brawl3ds/interp_profile.txt", "r")) {
+            unsigned long address = 0, calls = 0;
+            unsigned long long instructions = 0;
+            while (std::fscanf(old, "%lx %lu %llu", &address, &calls, &instructions) == 3)
+                InterpProfileAdd(static_cast<uint32_t>(address), instructions, static_cast<uint32_t>(calls));
+            std::fclose(old);
+        }
+    }
+    static InterpProfileEntry* sorted[kInterpProfileSlots];
+    uint32_t count = 0;
+    for (auto& e : g_interpProfile)
+        if (e.address) sorted[count++] = &e;
+    if (count == 0) return;
+    std::sort(sorted, sorted + count, [](const InterpProfileEntry* a, const InterpProfileEntry* b) {
+        return a->instructions + 40ull * a->calls > b->instructions + 40ull * b->calls;
+    });
+    std::FILE* f = std::fopen("sdmc:/3ds/brawl3ds/interp_profile.txt", "w");
+    if (!f) return;
+    for (uint32_t i = 0; i < count; ++i)
+        std::fprintf(f, "%08lX %lu %llu\n", static_cast<unsigned long>(sorted[i]->address),
+                     static_cast<unsigned long>(sorted[i]->calls),
+                     static_cast<unsigned long long>(sorted[i]->instructions));
+    std::fclose(f);
+}
+
 extern "C" void Brawl3ds_NotLinked(uint32_t guestAddress, CpuContext* ctx)
 {
+    if (ctx) {
+        if (const uint32_t target = TrampolineTarget(guestAddress)) {
+            ctx->gpr[12] = target;
+            ctx->ctr = target;
+            InvokeIndirectJump(target, ctx);
+            return;
+        }
+    }
+    // A fighter's or stage's function: from its code pack, loaded now if this is the module's first call
+    // (code_packs_3ds.cpp).
+    if (ctx) {
+        if (void (*packed)(CpuContext*) = Brawl3dsPackFunction(guestAddress)) {
+            packed(ctx);
+            return;
+        }
+    }
+    if (ctx && PpcInterpreter::CanRun(guestAddress)) {
+        ++g_interpretedCalls;
+        // The host stack going lower than it ever has (the heap's first block is a stack: an overflow there writes
+        // below the heap): each new low, a kilobyte at a time, names the guest call that made it.
+        static uintptr_t lowestSp = ~static_cast<uintptr_t>(0);
+        const uintptr_t sp = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+        if (sp + 1024 < lowestSp) {
+            lowestSp = sp;
+            std::fprintf(stderr, "[interp] host sp %08lX: guest function %08lX from lr=%08lX, guest sp %08lX\n",
+                         static_cast<unsigned long>(sp), static_cast<unsigned long>(guestAddress),
+                         static_cast<unsigned long>(ctx->lr), static_cast<unsigned long>(ctx->gpr[1]));
+        }
+        if (g_interpretedLogged < 400) {
+            ++g_interpretedLogged;
+            std::fprintf(stderr, "[interp] guest function %08lX (not linked) called from lr=%08lX\n",
+                         static_cast<unsigned long>(guestAddress), static_cast<unsigned long>(ctx->lr));
+        }
+        // What each interpreted function costs (its own instructions: the interpreter counts a call's when it
+        // returns, the calls it made first): interp_profile.txt names the ones to add to the translated set.
+        static uint64_t childInstr = 0;
+        const uint64_t before = PpcInterpreter::InstructionCount(), outerChildren = childInstr;
+        childInstr = 0;
+        PpcInterpreter::Run(ctx, guestAddress);
+        const uint64_t inclusive = PpcInterpreter::InstructionCount() - before;
+        InterpProfileAdd(guestAddress, inclusive > childInstr ? inclusive - childInstr : 0);
+        childInstr = outerChildren + inclusive;
+        return;
+    }
     char detail[200];
     std::snprintf(detail, sizeof(detail),
                   "guest function %08lX is not in this build\n(called from guest lr=%08lX; add its module to --keep)",
                   static_cast<unsigned long>(guestAddress), static_cast<unsigned long>(ctx ? ctx->lr : 0));
     StopWithMessage("Code not linked", detail);
+}
+
+// Render frame skip (performance test, debug_flags.txt 128: draw 1 game frame in 2; 256: 1 in 4): in the match the
+// game's render phase (gfTaskScheduler::renderPre and ::render, wrapped with -Wl,--wrap in port/headless/
+// CMakeLists.txt) runs only every Nth game frame; the game logic runs every frame. The skipped frames show the last
+// picture. The match average then reads as logic + render / N.
+unsigned g_renderEvery = 1;
+bool g_skipRender = false;
+uint64_t g_skippedRenders = 0;
+extern "C" void __real_func_8002E79C(CpuContext* ctx);  // renderPre__15gfTaskSchedulerFv
+extern "C" void __real_func_8002E844(CpuContext* ctx);  // render__15gfTaskSchedulerFv
+extern "C" void __wrap_func_8002E79C(CpuContext* ctx)
+{
+    unsigned every = g_scene == "scMelee" ? g_renderEvery : 1;
+    if (g_play) {
+        // Automatic: a drawn frame that takes over 60 ms gives up every second picture, over 150 ms two of three
+        // (the game's logic, which sets its speed, then gets most of the time).
+        every = g_renderEveryUser ? g_renderEveryUser : g_renderedFrameMs > 150 ? 3 : g_renderedFrameMs > 60 ? 2 : 1;
+    }
+    g_skipRender = every > 1 && (g_frames % every) != 0;
+    if (g_skipRender) {
+        ++g_skippedRenders;
+        return;
+    }
+    __real_func_8002E79C(ctx);
+}
+extern "C" void __wrap_func_8002E844(CpuContext* ctx)
+{
+    if (g_skipRender) return;
+    __real_func_8002E844(ctx);
+}
+
+// Play mode: is this the playable build (hle/input/pad.cpp, wii_remote_input.cpp and settings_overlay.cpp ask).
+extern "C" bool Brawl3dsPlayMode()
+{
+    return g_play;
+}
+
+// Play mode: the 3DS buttons as a GameCube controller (hle/input/pad.cpp fills port 1 with it at every PADRead).
+// A B X Y START and the D-pad are themselves, L and R the shoulder buttons (full analog), ZL or ZR is Z, the Circle
+// Pad is the control stick and the New 3DS C-Stick the C-stick. SELECT is this port's own key: with START it ends
+// the program, with D-pad up/down it changes the render frame skip (automatic, 1 in 1 ... 1 in 6).
+// buttons: PADStatus bits. sticks: stick x, y, C-stick x, y. triggers: left, right.
+//
+// Testing aid: sdmc:/3ds/brawl3ds/play_script.txt, lines of "<game frame> <frames held> <PADStatus buttons, hex>
+// [stick x] [stick y]", adds those presses to the controller (menus can be driven in an emulator without a
+// keyboard). The scene line of headless.log shows where they led.
+struct PlayScriptEvent {
+    uint32_t start, frames;
+    uint16_t buttons;
+    int8_t stickX, stickY;
+};
+PlayScriptEvent g_playScript[96];
+unsigned g_playScriptCount = 0;
+
+void LoadPlayScript()
+{
+    std::FILE* f = std::fopen("sdmc:/3ds/brawl3ds/play_script.txt", "r");
+    if (!f) return;
+    char line[96];
+    while (g_playScriptCount < 96 && std::fgets(line, sizeof(line), f)) {
+        unsigned start = 0, frames = 0, buttons = 0;
+        int x = 0, y = 0;
+        unsigned skip = 0;  // "skip N": draw 1 game frame in N (a long test gets to the end sooner)
+        if (std::sscanf(line, "skip %u", &skip) == 1) {
+            g_renderEveryUser = skip;
+            continue;
+        }
+        if (std::sscanf(line, "%u %u %x %d %d", &start, &frames, &buttons, &x, &y) >= 3) {
+            g_playScript[g_playScriptCount++] = {start, frames, static_cast<uint16_t>(buttons),
+                                                 static_cast<int8_t>(x), static_cast<int8_t>(y)};
+        }
+    }
+    std::fclose(f);
+    Log("play_script.txt: %u scripted press(es)\n", g_playScriptCount);
+}
+
+extern "C" bool Brawl3dsReadPad(uint16_t* buttons, int8_t* sticks, uint8_t* triggers)
+{
+    if (!g_play) return false;
+    static bool scriptLoaded = false;
+    if (!scriptLoaded) {
+        scriptLoaded = true;
+        LoadPlayScript();
+    }
+    hidScanInput();
+    const u32 held = hidKeysHeld(), down = hidKeysDown();
+    *buttons = 0;
+    sticks[0] = sticks[1] = sticks[2] = sticks[3] = 0;
+    triggers[0] = triggers[1] = 0;
+    if (held & KEY_SELECT) {
+        if (down & KEY_START) FinishRun("SELECT + START");
+        if (down & KEY_DUP) g_renderEveryUser = g_renderEveryUser >= 6 ? 6 : g_renderEveryUser + 1;
+        if (down & KEY_DDOWN) g_renderEveryUser = g_renderEveryUser ? g_renderEveryUser - 1 : 0;
+        return true;  // the controller at rest while SELECT is held
+    }
+    uint16_t b = 0;
+    if (held & KEY_A) b |= 0x0100;
+    if (held & KEY_B) b |= 0x0200;
+    if (held & KEY_X) b |= 0x0400;
+    if (held & KEY_Y) b |= 0x0800;
+    if (held & KEY_START) b |= 0x1000;
+    if (held & KEY_DLEFT) b |= 0x0001;
+    if (held & KEY_DRIGHT) b |= 0x0002;
+    if (held & KEY_DDOWN) b |= 0x0004;
+    if (held & KEY_DUP) b |= 0x0008;
+    if (held & (KEY_ZL | KEY_ZR)) b |= 0x0010;
+    if (held & KEY_R) b |= 0x0020, triggers[1] = 255;
+    if (held & KEY_L) b |= 0x0040, triggers[0] = 255;
+    *buttons = b;
+    // The Circle Pad reports about +-155 at its edge; a GameCube stick about +-100.
+    circlePosition circle{};
+    hidCircleRead(&circle);
+    auto axis = [](int v) {
+        v = v * 100 / 140;
+        if (v > -12 && v < 12) v = 0;  // dead zone
+        return static_cast<int8_t>(v > 105 ? 105 : v < -105 ? -105 : v);
+    };
+    sticks[0] = axis(circle.dx);
+    sticks[1] = axis(circle.dy);
+    if (held & KEY_CSTICK_RIGHT) sticks[2] = 90;
+    if (held & KEY_CSTICK_LEFT) sticks[2] = -90;
+    if (held & KEY_CSTICK_UP) sticks[3] = 90;
+    if (held & KEY_CSTICK_DOWN) sticks[3] = -90;
+    for (unsigned i = 0; i < g_playScriptCount; ++i) {
+        const PlayScriptEvent& e = g_playScript[i];
+        if (e.buttons == 0xFFFF) continue;  // a screenshot request (Brawl3dsFrameEnd), not a press
+        if (g_frames >= e.start && g_frames < e.start + e.frames) {
+            *buttons |= e.buttons;
+            if (e.stickX) sticks[0] = e.stickX;
+            if (e.stickY) sticks[1] = e.stickY;
+        }
+    }
+    return true;
 }
 
 extern "C" bool Brawl3dsExitRequested()
@@ -714,10 +1199,29 @@ extern "C" void Brawl3dsFrameEnd()
     Brawl3dsRendererEndFrame();  // the frame's PICA draws are submitted; the back end's staging is done with
     g_droppedDraws += Brawl3dsPicaTakeDropped();
     // The frame before each capture also logs its first batches to stderr.txt (decoded vertex, where it lands).
-    if (g_frames == 699 || g_frames == 1999 || g_frames == 2872) Brawl3dsPicaDebugNextFrame();
+    if (!g_play && (g_frames == 699 || g_frames == 1999 || g_frames == 2872)) Brawl3dsPicaDebugNextFrame();
+    if (g_play) {
+        // play_script.txt lines with buttons FFFF: a screenshot of that game frame (shot_<frame>.bmp), written three
+        // frames later (the copy is taken at the next frame's end).
+        for (unsigned i = 0; i < g_playScriptCount; ++i) {
+            const PlayScriptEvent& e = g_playScript[i];
+            if (e.buttons != 0xFFFF) continue;
+            if (g_frames == e.start) {
+                char path[64];
+                std::snprintf(path, sizeof(path), "sdmc:/3ds/brawl3ds/shot_%u.bmp", g_frames);
+                Brawl3dsPicaCaptureNextFrame(path);
+            } else if (g_frames == e.start + 3) {
+                Brawl3dsPicaWriteCaptures();
+            }
+        }
+    }
+    if (!g_skipRender) {
+        const double ms = TicksToMs(total);
+        g_renderedFrameMs = g_renderedFrameMs == 0 ? ms : g_renderedFrameMs * 0.9 + ms * 0.1;
+    }
     // Top-screen captures for checking the picture: the safety screen, the title screen, two match frames.
     // Frames around the last capture: their draw counts (does the HUD come every other frame?).
-    if (g_frames >= 3370 && g_frames <= 3376) Log("frame %u: %u GX draws\n", g_frames, g_frameDraws);
+    if (!g_play && g_frames >= 3370 && g_frames <= 3376) Log("frame %u: %u GX draws\n", g_frames, g_frameDraws);
     g_frameDraws = 0;
     // Two captures in a row at the end: the HUD showed on the screen but not in single captures.
     // Testing aid: sdmc:/3ds/brawl3ds/stop_after.txt holding a capture frame ends the run once that capture is in
@@ -737,6 +1241,10 @@ extern "C" void Brawl3dsFrameEnd()
                 if (std::fscanf(f, "%u", &flags) == 1) {
                     if (Brawl3dsPicaSetDebugFlags) Brawl3dsPicaSetDebugFlags(flags);
                     Log("debug_flags.txt: renderer testing switches %u\n", flags);
+                    g_renderEvery = (flags & 256) ? 4 : (flags & 128) ? 2 : 1;
+                    g_brawl3dsGxTiming = (flags & 512) ? 1 : 0;  // the game thread's GX timers (headless.log)
+                    g_audioOff = (flags & 1024) != 0;  // no sound (the DSP is not opened)
+                    if (g_renderEvery > 1) Log("render frame skip: the match draws 1 game frame in %u\n", g_renderEvery);
                 }
                 std::fclose(f);
             }
@@ -746,7 +1254,8 @@ extern "C" void Brawl3dsFrameEnd()
             FinishRun("stop_after.txt");
         }
     }
-    if (g_frames == 700 || g_frames == 2000 || g_frames == 2873 || g_frames == 3373 || g_frames == 3374) {
+    if (!g_play &&
+        (g_frames == 700 || g_frames == 2000 || g_frames == 2873 || g_frames == 3373 || g_frames == 3374)) {
         char path[64];
         std::snprintf(path, sizeof(path), "sdmc:/3ds/brawl3ds/shot_%u.bmp", g_frames);
         Brawl3dsPicaCaptureNextFrame(path);  // kept in memory, written with the results
@@ -772,6 +1281,12 @@ extern "C" void Brawl3dsFrameEnd()
             sbrk(0), static_cast<unsigned long>(__ctru_linear_heap),
             static_cast<unsigned long>(__ctru_linear_heap + __ctru_linear_heap_size));
     }
+    DetHashFrame();
+    // Guest-thread stacks set aside while the heap still has room (the title movie's reader thread once found
+    // no 256 KiB block and never ran): past the boot peak, so the disc index and the renderer's ring came first.
+    if (g_frames == 2) Log("fiber stacks set aside: %d of 4 (256 KiB each)\n", Brawl3dsReserveFiberStacks(4));
+    if (g_frames == 60) Brawl3dsPacksInit();
+    if (g_frames == 3 && g_play) ExecProbe();
     if (g_frames == 10) Brawl3dsAllocTrackStart();
     if (g_frames == 60) Brawl3dsAllocTrackDump("sdmc:/3ds/brawl3ds/leaks.txt", g_frames);
 
@@ -780,7 +1295,8 @@ extern "C" void Brawl3dsFrameEnd()
         WriteWindow();
         Log("-- scene %s -> %s at frame %u\n", g_scene.empty() ? "(none)" : g_scene.c_str(), scene.c_str(), g_frames);
         // The demo match is ~1,141 frames (it ends before the 1,800-frame cap): leaving scMelee ends the measurement.
-        const bool matchEnded = g_scene == "scMelee" && g_matchFrames > 0 && g_step == kStepMatch;
+        Brawl3dsPacksSceneChange(g_scene == "scMelee" ? 1 : 0);
+        const bool matchEnded = !g_play && g_scene == "scMelee" && g_matchFrames > 0 && g_step == kStepMatch;
         g_scene = scene;
         if (g_scene == "scMelee") Brawl3dsPicaWriteStats(nullptr, 0);  // the match statistics start here
         if (matchEnded) {
@@ -798,7 +1314,7 @@ extern "C" void Brawl3dsFrameEnd()
 
     // Stall watchdog: a frame-based step running far past the PC build's frame count is waiting for something that
     // will not come (in this unattended build, usually a prompt that wants a button press).
-    if (kSteps[g_step].pcFrames && g_step != kStepMatch) {
+    if (!g_play && kSteps[g_step].pcFrames && g_step != kStepMatch) {
         const uint32_t stepFrames = g_frames - g_stepFrameStart;
         const uint32_t limit = kSteps[g_step].pcFrames * 2 + 600;
         if (stepFrames == limit) {
@@ -815,9 +1331,9 @@ extern "C" void Brawl3dsFrameEnd()
     g_windowWork += work;
     g_windowMin = total < g_windowMin ? total : g_windowMin;
     g_windowMax = total > g_windowMax ? total : g_windowMax;
-    if (++g_windowFrames >= (g_scene == "scMelee" ? 60u : 10u)) WriteWindow();  // finer before the match: memory growth
+    if (++g_windowFrames >= (g_play ? 600u : g_scene == "scMelee" ? 60u : 10u)) WriteWindow();  // finer before the match: memory growth
 
-    if (g_scene == "scMelee") {
+    if (g_scene == "scMelee" && !g_play) {
         if (g_matchFrames == 0) {
             Brawl3dsProfilerSetRecording(true);  // profile.txt: the match only
             Brawl3dsZonesReset();                // and Aurora's zone timers
@@ -840,11 +1356,13 @@ extern "C" void Brawl3dsFrameEnd()
     // Keep the console responsive (HOME menu, sleep, power button) and let START end the run.
     if ((g_frames & 7u) == 0) {
         if (!aptMainLoop()) FinishRun("the system asked the program to close");
-        hidScanInput();
-        if (hidKeysDown() & KEY_START) {
-            WriteWindow();
-            WriteMatchSummary();
-            FinishRun("START was pressed");
+        if (!g_play) {  // play mode reads the buttons at the game's own controller polls (Brawl3dsReadPad)
+            hidScanInput();
+            if (hidKeysDown() & KEY_START) {
+                WriteWindow();
+                WriteMatchSummary();
+                FinishRun("START was pressed");
+            }
         }
         DrawStatus();
     }
@@ -883,14 +1401,34 @@ int main(int, char**)
 
     bool isNew = false;
     APT_CheckNew3DS(&isNew);
-    std::printf("brawl3ds headless timing build\n\n");
-    Log("brawl3ds headless timing build\nconsole: %s 3DS, APPLICATION region %lu MiB, free at start %lu MiB\n",
-        isNew ? "New" : "Old", static_cast<unsigned long>(osGetMemRegionSize(MEMREGION_APPLICATION) >> 20),
+    {
+        u64 programId = 0;
+        struct stat playFile {};
+        g_play = (R_SUCCEEDED(APT_GetProgramID(&programId)) && ((programId >> 8) & 0xFFFFFu) == 0xBB3D3u) ||
+                 stat("sdmc:/3ds/brawl3ds/play.txt", &playFile) == 0;
+    }
+    if (g_play) {
+        std::printf("Brawl3DS (playable test build)\n\n"
+                    "Starting: about 20 seconds of loading\n"
+                    "before the first picture.\n\n"
+                    "Controls (GameCube controller, port 1):\n"
+                    " A B X Y START D-pad as printed\n"
+                    " L R, ZL or ZR = Z\n"
+                    " Circle Pad = stick, C-Stick = C-stick\n\n"
+                    "SELECT + D-pad up/down: draw fewer or\n"
+                    " more pictures (fewer = faster game)\n"
+                    "SELECT + START: quit\n\n"
+                    "Log: sdmc:/3ds/brawl3ds/headless.log\n\n");
+    }
+    if (!g_play) std::printf("brawl3ds headless timing build\n\n");
+    Log("brawl3ds %s build\nconsole: %s 3DS, APPLICATION region %lu MiB, free at start %lu MiB\n",
+        g_play ? "playable" : "headless timing", isNew ? "New" : "Old",
+        static_cast<unsigned long>(osGetMemRegionSize(MEMREGION_APPLICATION) >> 20),
         static_cast<unsigned long>(osGetMemRegionFree(MEMREGION_APPLICATION) >> 20));
     Log("heaps: regular %lu MiB, linear %lu MiB (linear free %lu KiB)\n",
         static_cast<unsigned long>(__ctru_heap_size >> 20), static_cast<unsigned long>(__ctru_linear_heap_size >> 20),
         static_cast<unsigned long>(linearSpaceFree() >> 10));
-    std::printf("This is a diagnostic build, not the game:\n"
+    if (!g_play) std::printf("This is a diagnostic build, not the game:\n"
                 "no graphics, no input. It boots Brawl,\n"
                 "lets the attract demo start a VS match\n"
                 "and measures how fast the 3DS runs it.\n\n"
@@ -908,7 +1446,7 @@ int main(int, char**)
         StopWithMessage("Game files missing", "copy the extracted disc to sdmc:/3ds/brawl3ds/game/ (sys/ and files/)");
     }
     // A first boot (no save) stops at Brawl's "create save data?" prompt, which this build cannot answer.
-    if (stat("sdmc:/3ds/brawl3ds/UserData/NAND/title/00010000/52534245/data/autosv0.bin", &info) != 0) {
+    if (!g_play && stat("sdmc:/3ds/brawl3ds/UserData/NAND/title/00010000/52534245/data/autosv0.bin", &info) != 0) {
         StopWithMessage("No Brawl save data",
                         "Brawl would stop at its 'create save data?'\nprompt and this build has no input.\n"
                         "Copy your save (the PC build's\nUserData/NAND/title/00010000/52534245/data)\n"
@@ -970,7 +1508,7 @@ int main(int, char**)
 
     EnterStep(3);
     g_mainGuestContextSlot = &g_currentCpuContext;  // this thread's instance, for the heartbeat's guest sampler
-    Brawl3dsProfilerStart(g_mainGuestContextSlot);
+    if (!g_play) Brawl3dsProfilerStart(g_mainGuestContextSlot);  // the sampler costs game-thread time
     // The runtime's overlay code still calls ImGui on every presented frame (cursor auto-hide, ImGui::GetTime, ...)
     // even though the 3DS never renders an ImGui frame. Without a context those are null-pointer reads: Azahar
     // logs them as "unmapped Read32" and returns 0, a real New 3DS raises a data abort (settings_overlay::Draw

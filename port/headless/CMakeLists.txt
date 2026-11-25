@@ -121,14 +121,18 @@ list(FILTER RUNTIME_SOURCES EXCLUDE REGEX
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/netplay/net_socket\\.cpp$|/product/engine_loader\\.cpp$|/hle/net/network_ssl\\.cpp$")
 # One product per binary: Brawl is the base product (retro_rewind_product.cpp is Mario Kart Wii's Retro Rewind).
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/product/retro_rewind_product\\.cpp$")
+# Sound goes to the console's DSP (port audio_backend_3ds.cpp, in the executable) instead of through SDL.
+list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/audio_backend\\.cpp$")
 add_library(b3_runtime STATIC ${RUNTIME_SOURCES} "${RT}/src/platform/3ds/co_switch.S")
 brawl3ds_target(b3_runtime)
 target_compile_options(b3_runtime PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-O2;-std=gnu++20;-include;${RT}/include/mkw_pch.h>")
 
 # --- generated (translator output that is not translated code) ---
+# The registration records and the guest symbol table go in without their ~120,000 names (~5 MiB of the ~44.5 MiB
+# the console has for code and data): tools/slim_generated_tables.py <wiicompiled/generated> <GEN3DS_DIR>.
 file(GLOB GENERATED_DISPATCH "${W}/generated/build_shards/base_dispatch/*.cpp"
-  "${W}/generated/build_shards/base_registration/*.cpp")
-add_library(b3_generated STATIC ${GENERATED_DISPATCH} "${W}/generated/guest_symbol_table.cpp"
+  "${GEN3DS_DIR}/registration/*.cpp")
+add_library(b3_generated STATIC ${GENERATED_DISPATCH} "${GEN3DS_DIR}/guest_symbol_table_3ds.cpp"
   "${GEN3DS_DIR}/data_sections_init_3ds.cpp")
 brawl3ds_target(b3_generated)
 target_compile_options(b3_generated PRIVATE -Os -std=gnu++20 -include "${RT}/include/mkw_pch.h")
@@ -158,7 +162,8 @@ endif()
 # --- the program ---
 add_executable(brawl3ds "${PORT}/main_3ds.cpp" "${PORT}/aurora_headless_3ds.cpp"
   "${PORT}/posix_and_aurora_extras_3ds.cpp" "${PORT}/alloc_tracker_3ds.cpp" "${PORT}/fast_tree_3ds.cpp" "${PORT}/profiler_3ds.cpp"
-  "${LINK_STUBS}")
+  "${LINK_STUBS}" "${GEN3DS_DIR}/trampolines_3ds.cpp"  # the veneer table: tools/gen_trampoline_table.py
+  "${PORT}/natives_3ds.cpp" "${PORT}/audio_backend_3ds.cpp" "${PORT}/code_packs_3ds.cpp")  # game functions written for the ARM: tools/apply_natives.py
 brawl3ds_target(brawl3ds)
 target_compile_options(brawl3ds PRIVATE -O2 -std=gnu++20 -include "${RT}/include/mkw_pch.h")
 set_target_properties(brawl3ds PROPERTIES SUFFIX ".elf")
@@ -172,7 +177,9 @@ target_link_options(brawl3ds PRIVATE "-Wl,-Map,${CMAKE_BINARY_DIR}/brawl3ds.map"
   # Live-allocation tracker (alloc_tracker_3ds.cpp).
   -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free -Wl,--wrap=_Znwj -Wl,--wrap=_Znaj -Wl,--wrap=rename
   # The renderer back end times the runtime's display-list draws (aurora3ds/backend_3ds.cpp).
-  -Wl,--wrap=GXCallDisplayList)
+  -Wl,--wrap=GXCallDisplayList
+  # Render frame skip (main_3ds.cpp, debug_flags.txt 128/256): the game's render phase.
+  -Wl,--wrap=func_8002E79C -Wl,--wrap=func_8002E844)
 # The runtime registers its HLE functions and the translator's function tables through static initializers that
 # nothing references by name, so those archives must be linked whole (the PC build links them as object libraries).
 target_link_libraries(brawl3ds PRIVATE

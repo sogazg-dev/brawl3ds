@@ -187,7 +187,19 @@ void* __wrap__Znwj(size_t size)
         if (len > 0) write(2, line, static_cast<size_t>(len));
     }
     ++g_insideNew;
-    void* p = __real__Znwj(size);
+    void* p = nullptr;
+    try {
+        p = __real__Znwj(size);
+    } catch (...) {
+        // std::bad_alloc: malloc's own line names operator new as the caller; this one names who called it (a
+        // caught bad_alloc repeated 28 times in the console run of 2026-11-23 before the run aborted).
+        --g_insideNew;
+        char line[96];
+        const int len = std::snprintf(line, sizeof(line), "[alloc] new(%lu) FAILED (caller %p)\n",
+                                      static_cast<unsigned long>(size), __builtin_return_address(0));
+        if (len > 0) write(2, line, static_cast<size_t>(len));
+        throw;
+    }
     --g_insideNew;
     Insert(p, size, __builtin_return_address(0));
     return p;

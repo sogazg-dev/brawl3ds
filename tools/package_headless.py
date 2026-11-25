@@ -64,6 +64,12 @@ AccessControlInfo:
   CanShareDeviceMemory: true
   RunnableOnSleep: false
   SpecialMemoryArrange: true
+  # The DSP's memory, as devkitPro's application template maps it: ndsp reads and writes it directly, and
+  # without the mapping opening the sound device is a data abort on the console (what stopped ndsp before).
+  IORegisterMapping:
+   - 1ff00000-1ff7ffff
+  MemoryMapping:
+   - 1f000000-1f5fffff:r
   SystemCallAccess:
     ArbitrateAddress: 34
     Break: 60
@@ -73,6 +79,7 @@ AccessControlInfo:
     CloseHandle: 35
     ConnectToPort: 45
     ControlMemory: 1
+    ControlProcessMemory: 112
     CreateAddressArbiter: 33
     CreateEvent: 23
     CreateMemoryBlock: 30
@@ -154,6 +161,9 @@ def main():
     ap.add_argument("--save", type=Path, help="your Brawl save folder (.../52534245/data), copied into the SD folder")
     ap.add_argument("--input-script", default="scTitle@60f:A:120f",
                     help="scripted pad input for the run (default: skip the title movie)")
+    ap.add_argument("--play", action="store_true",
+                    help="package the playable build: its own title (Brawl3DS, unique ID 0xBB3D3), which "
+                         "main_3ds.cpp recognises; brawl3ds-play.cia")
     ap.add_argument("--devkitpro", type=Path, default=Path("C:/devkitPro"))
     ap.add_argument("--makerom", type=Path, default=Path.home() / "brawl3ds-work/tools/makerom/makerom.exe")
     args = ap.parse_args()
@@ -171,14 +181,22 @@ def main():
     icon_png = args.out / "icon.png"
     icon_png.write_bytes(png(48, 48, icon_pixel))
     smdh = args.out / "icon.smdh"
-    run([args.devkitpro / "tools/bin/smdhtool.exe", "--create", "Brawl3DS headless",
-         "Brawl timing test (no graphics)", "brawl3ds", icon_png, smdh])
+    name = "brawl3ds-play" if args.play else "brawl3ds-headless"
+    run([args.devkitpro / "tools/bin/smdhtool.exe", "--create", "Brawl3DS" if args.play else "Brawl3DS headless",
+         "Brawl on the 3DS (playable test)" if args.play else "Brawl timing test (no graphics)", "brawl3ds",
+         icon_png, smdh])
 
-    rsf = args.out / "brawl3ds-headless.rsf"
-    rsf.write_text(RSF, encoding="ascii")
-    cia = args.out / "brawl3ds-headless.cia"
+    rsf = args.out / f"{name}.rsf"
+    rsf_text = RSF
+    if args.play:
+        rsf_text = (RSF.replace("Title: Brawl3DS headless", "Title: Brawl3DS")
+                    .replace("ProductCode: CTR-P-B3DH", "ProductCode: CTR-P-B3DP")
+                    .replace("UniqueId: 0xBB3D2", "UniqueId: 0xBB3D3"))
+        assert "0xBB3D3" in rsf_text and "CTR-P-B3DP" in rsf_text
+    rsf.write_text(rsf_text, encoding="ascii")
+    cia = args.out / f"{name}.cia"
     run([args.makerom, "-f", "cia", "-o", cia, "-rsf", rsf, "-target", "t", "-elf", elf, "-icon", smdh])
-    shutil.copyfile(args.build / "brawl3ds.3dsx", args.out / "brawl3ds-headless.3dsx")
+    shutil.copyfile(args.build / "brawl3ds.3dsx", args.out / f"{name}.3dsx")
 
     sd = args.out / "sd" / "3ds" / "brawl3ds"
     sd.mkdir(parents=True, exist_ok=True)

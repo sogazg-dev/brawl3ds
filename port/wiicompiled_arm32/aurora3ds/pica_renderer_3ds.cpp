@@ -28,6 +28,9 @@
 // core 2 (or with debug_flags.txt bit 32) the same commands run on the game thread as they are recorded.
 
 #include "pica_internal.hpp"
+#include "brawl3ds_cp_hooks.h"
+#include "gx/command_processor.hpp"
+#include "gx/fifo.hpp"
 
 #include <3ds/synchronization.h>
 #include <3ds/thread.h>
@@ -37,12 +40,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 
 extern "C" const unsigned char brawl3ds_gx_m4_shbin[];
 extern "C" const unsigned int brawl3ds_gx_m4_shbin_size;
 
 // What the renderer is doing, for main_3ds.cpp's stall report (heartbeat thread).
 extern "C" const char* volatile g_brawl3dsRenderPhase = "not started";
+
+// Vertex state writes on the worker (Aurora's handle_cp, the GX calls run there): see g_recPlanGen.
+extern "C" unsigned g_brawl3dsVtxGen = 0;
+// Set by the runtime around a GXCallDisplayList of a list in guest memory (gx_dl.cpp, brawl3ds-dl-ref).
+extern "C" unsigned char g_brawl3dsListInGuestRam = 0;
 
 namespace {
 using namespace aurora::gx;
@@ -170,6 +179,7 @@ struct AttrPlan {
     GXCompType type;
     float scale;          // fixed-point components: 1 / 2^frac
     bool two;             // texture coordinates: s and t (else s only); position: x y z (else x y)
+    uint8_t shift;        // fixed-point components: frac (scale = 1 / 2^shift); 0 for floats
 };
 struct VertexPlan {
     uint32_t size;        // bytes per GX vertex
@@ -216,12 +226,42 @@ void DecodePositions(const VertexPlan& plan, const uint8_t* src, uint32_t count,
     }
 }
 
+// A fixed-point component as the integer it is.
+inline int32_t LoadInt(const uint8_t* p, GXCompType type, bool be)
+{
+    switch (type) {
+    case GX_U8: return p[0];
+    case GX_S8: return static_cast<int8_t>(p[0]);
+    case GX_U16: return Load16(p, be);
+    default: return static_cast<int16_t>(Load16(p, be));
+    }
+}
+// value * 2^up / 2^shift, toward zero: what the float path's exact product gives when it is cut to an integer
+// (a 16-bit value times a power of two, and times 127 for normals, is exact in a float).
+inline int32_t ScaleFixed(int32_t value, uint32_t up, uint32_t shift)
+{
+    return shift <= up ? value * (1 << (up - shift)) : value / (1 << (shift - up));
+}
+
 // One texture-coordinate set of a draw into `field` (uv or uv2) of each vertex.
 template <class V>
 void DecodeUvs(const AttrPlan& a, const uint8_t* src, bool streamBe, uint32_t count, uint32_t size, V* out,
                int16_t (V::*field)[2])
 {
     const uint32_t step = a.type == GX_F32 ? 4 : (a.type == GX_U16 || a.type == GX_S16) ? 2 : 1;
+    if (a.type != GX_F32) {  // fixed point: integers all the way (kUvScale = 2^9), same results as below
+        const GXCompType type = a.type;
+        const bool be = a.be, two = a.two;
+        const uint32_t shift = a.shift;
+        for (uint32_t n = 0; n < count; ++n, src += size) {
+            const uint8_t* values = AttrValues(a, src, streamBe);
+            const int32_t u = ScaleFixed(LoadInt(values, type, be), 9, shift);
+            const int32_t v = two ? ScaleFixed(LoadInt(values + step, type, be), 9, shift) : 0;
+            (out[n].*field)[0] = static_cast<int16_t>(std::clamp(u, -32768, 32767));
+            (out[n].*field)[1] = static_cast<int16_t>(std::clamp(v, -32768, 32767));
+        }
+        return;
+    }
     for (uint32_t n = 0; n < count; ++n, src += size) {
         const uint8_t* values = AttrValues(a, src, streamBe);
         const float u = LoadComponent(values, a.type, a.scale, a.be) * kUvScale;
@@ -238,6 +278,19 @@ template <class V>
 void DecodeNormals(const AttrPlan& a, const uint8_t* src, bool streamBe, uint32_t count, uint32_t size, V* out)
 {
     const uint32_t step = a.type == GX_F32 ? 4 : (a.type == GX_U16 || a.type == GX_S16) ? 2 : 1;
+    if (a.type != GX_F32) {  // fixed point: (value * 127) / 2^shift in integers, same results as below
+        const GXCompType type = a.type;
+        const bool be = a.be;
+        const int32_t divisor = 1 << a.shift;
+        for (uint32_t n = 0; n < count; ++n, src += size) {
+            const uint8_t* values = AttrValues(a, src, streamBe);
+            for (uint32_t k = 0; k < 3; ++k) {
+                const int32_t c = LoadInt(values + k * step, type, be) * 127 / divisor;
+                out[n].n[k] = static_cast<int8_t>(std::clamp(c, -127, 127));
+            }
+        }
+        return;
+    }
     for (uint32_t n = 0; n < count; ++n, src += size) {
         const uint8_t* values = AttrValues(a, src, streamBe);
         out[n].n[0] = NormalByte(LoadComponent(values, a.type, a.scale, a.be));
@@ -321,11 +374,15 @@ enum CmdType : uint16_t {
     kCmdBegin, kCmdFlush, kCmdTexEnv, kCmdTexEnvBuf, kCmdAlphaTest, kCmdBlend, kCmdDepth, kCmdCull, kCmdFogMode,
     kCmdFogColor, kCmdFogLut, kCmdFVUnif, kCmdBoolUnif, kCmdIVUnif, kCmdBindTex, kCmdBindRamp, kCmdDraw, kCmdPlan,
     kCmdAppend, kCmdClear, kCmdEndFrame,
+    // Step 2: GX commands for Aurora's command processor, which runs on the worker (brawl3ds_cp_hooks.h).
+    kCmdCpData, kCmdCpRawDraw, kCmdCpCall, kCmdCpEndFrame,
 };
 struct CmdHeader {
     uint16_t type;
-    uint16_t size;  // the whole command, header included, a multiple of 8
+    uint16_t pad;
+    uint32_t size;  // the whole command, header included, a multiple of 8 (GX data can pass 64 KiB)
 };
+static_assert(sizeof(CmdHeader) == 8);
 struct CmdBegin { uint32_t clearColor; };
 struct CmdTexEnv { int32_t stage; C3D_TexEnv env; };
 struct CmdTexEnvBuf { int32_t rgb, alpha; };
@@ -353,8 +410,21 @@ struct CmdDraw {
 struct CmdPlan { VertexPlan plan; };
 struct CmdAppend { int32_t prim; uint32_t vtxCount, bytes; };  // followed by the vertices' raw bytes
 struct CmdClear { float x0, x1, y0, y1, z; uint8_t rgba[4]; };
+struct CmdCpData { uint32_t bytes; uint8_t kind, bigEndian, pad[2]; };  // kind 0 FIFO, 1 display list; then the bytes
+// kind 2: a display list left where it is, in guest memory (then its address). The runtime marks the lists it
+// passes straight from the game's model data (g_brawl3dsListInGuestRam): geometry, ~670 KiB a match frame that
+// was copied into the ring. They stand still until the worker has read them: the game thread waits for the
+// worker at the end of every frame, and model data is not rewritten between its draw and that.
+struct CmdCpListRef { const uint8_t* data; uint32_t pad; };
+static_assert(sizeof(CmdCpListRef) == 8);
+struct CmdCpRawDraw { int32_t prim, fmt; uint32_t vtxCount, bytes; };   // then the vertices
+struct CmdCpCall { void (*fn)(void*); uint32_t bytes; };                 // then the call's captured values
+static_assert(sizeof(CmdCpData) % 8 == 0 && sizeof(CmdCpRawDraw) % 8 == 0 && sizeof(CmdCpCall) % 8 == 0);
 
-constexpr uint32_t kRingBytes = 2u << 20;  // a match frame records ~1 MiB (most of it appended vertices)
+// A power of two (positions are taken modulo it with a mask: the ARM11 has no divide instruction). 2 MiB if the heap
+// has it (a match frame records ~1 MiB, most of it appended vertices), else 1 MiB or 512 KiB: the game thread then
+// waits for ring space more often instead of the run aborting.
+uint32_t g_ringBytes = 2u << 20;
 uint8_t* g_ring = nullptr;
 uint32_t g_head = 0;  // bytes recorded so far (the producer's; the worker reads it)
 uint32_t g_tail = 0;  // bytes executed so far (the worker's; the producer reads it)
@@ -366,6 +436,27 @@ int g_workerSleeping = 0, g_producerWaitingSpace = 0, g_producerWaitingDrain = 0
 uint64_t g_workerBusyTicks = 0, g_drainWaitTicks = 0, g_spaceWaitTicks = 0;
 uint64_t g_ringBytesRecorded = 0;
 uint32_t g_ringPeak = 0;
+uint32_t g_wakeSignals = 0;  // times the game thread had to wake a sleeping worker (a syscall each)
+// Step 2: the worker's time in Aurora's command processor (with the recording it does now), the game thread's
+// catch-up waits (inline scopes) and the GX bytes handed over.
+bool g_cpOnWorker = false;  // Aurora's command processor runs on the worker (else on the game thread, as in step 1)
+bool g_cpWanted = false;    // ... from the end of the first frame the renderer saw (StartRenderer, Brawl3dsPicaEndFrame)
+int g_cpInlineDepth = 0;    // game thread: > 0 inside an inline scope (it decodes GX commands itself)
+uint64_t g_cpTicks = 0, g_winCpTicks = 0, g_cpBytes = 0;
+uint32_t g_cpSyncs = 0, g_winCpSyncs = 0, g_cpFailures = 0;
+uint64_t g_cpSyncTicks = 0, g_winCpSyncTicks = 0;  // the game thread's time in those waits
+// The GX functions that made the game thread wait (inline scopes), for the match summary.
+struct SyncSite {
+    const char* name;
+    uint32_t count;
+    uint64_t ticks;
+};
+SyncSite g_syncSites[8];
+const char* g_syncSite = nullptr;  // the site of the wait in progress
+// The same, for the periodic frame lines of headless.log (Brawl3dsPicaTakeWindowStats): a run that stops early
+// still says how the worker did.
+uint64_t g_winBusyTicks = 0, g_winDrainTicks = 0;
+uint32_t g_winWakeSignals = 0;
 
 void ExecuteRecorded();  // the worker's command loop body (below)
 
@@ -373,20 +464,21 @@ void ExecuteRecorded();  // the worker's command loop body (below)
 uint8_t* Reserve(uint32_t size)
 {
     for (;;) {
-        const uint32_t at = g_head % kRingBytes;
-        const uint32_t contiguous = kRingBytes - at;
+        const uint32_t at = g_head & (g_ringBytes - 1);
+        const uint32_t contiguous = g_ringBytes - at;
         const uint32_t need = size <= contiguous ? size : contiguous + size;  // wrapping skips the rest of the ring
         const uint32_t tail = __atomic_load_n(&g_tail, __ATOMIC_ACQUIRE);
         const uint32_t used = g_head - tail;
-        if (used + need <= kRingBytes) {
+        if (used + need <= g_ringBytes) {
             if (size > contiguous) {
                 auto* wrap = reinterpret_cast<CmdHeader*>(g_ring + at);
                 wrap->type = kCmdWrap;
+                wrap->pad = 0;
                 wrap->size = 0;
                 g_head += contiguous;  // published with the command after it
             }
             g_ringPeak = std::max(g_ringPeak, used + need);
-            return g_ring + g_head % kRingBytes;
+            return g_ring + (g_head & (g_ringBytes - 1));
         }
         if (!g_workerOn) {  // cannot happen inline (everything runs as it is recorded)
             std::fprintf(stderr, "[pica] command ring full without a worker\n");
@@ -394,7 +486,7 @@ uint8_t* Reserve(uint32_t size)
         }
         const uint64_t start = svcGetSystemTick();
         __atomic_store_n(&g_producerWaitingSpace, 1, __ATOMIC_SEQ_CST);
-        if (g_head - __atomic_load_n(&g_tail, __ATOMIC_SEQ_CST) + need > kRingBytes)
+        if (g_head - __atomic_load_n(&g_tail, __ATOMIC_SEQ_CST) + need > g_ringBytes)
             LightEvent_Wait(&g_spaceAvailable);
         __atomic_store_n(&g_producerWaitingSpace, 0, __ATOMIC_SEQ_CST);
         g_spaceWaitTicks += svcGetSystemTick() - start;
@@ -413,44 +505,74 @@ void Commit(uint32_t size)
     if (__atomic_load_n(&g_workerSleeping, __ATOMIC_SEQ_CST)) {
         __atomic_store_n(&g_workerSleeping, 0, __ATOMIC_SEQ_CST);
         LightEvent_Signal(&g_workAvailable);
+        ++g_wakeSignals;
+        ++g_winWakeSignals;
     }
 }
 
 constexpr uint32_t CmdSize(uint32_t payload) { return (sizeof(CmdHeader) + payload + 7u) & ~7u; }
 
+void Execute(const CmdHeader* h);  // runs one command (the worker side, below)
+
+// The worker records too since step 2 (Aurora's command processor runs there and calls the recording side): its
+// commands run at once, in order, from this scratch buffer instead of going through the ring. An appended draw is
+// the largest command (Brawl3dsPicaAppend keeps it under 64 KiB).
+alignas(8) uint8_t g_inlineCommand[0x10000];
+bool OnWorker() { return g_worker != nullptr && threadGetCurrent() == g_worker; }
+uint8_t* ReserveCommand(uint32_t size)
+{
+    if (!OnWorker()) return Reserve(size);
+    if (size > sizeof(g_inlineCommand)) {
+        std::fprintf(stderr, "[pica] a %u-byte command recorded on the worker\n", size);
+        std::abort();
+    }
+    return g_inlineCommand;
+}
+void CommitCommand(CmdHeader* h)
+{
+    if (OnWorker())
+        Execute(h);
+    else
+        Commit(h->size);
+}
+
 template <class T>
 T* Record(CmdType type, uint32_t extra = 0)
 {
     const uint32_t size = CmdSize(sizeof(T) + extra);
-    auto* h = reinterpret_cast<CmdHeader*>(Reserve(size));
+    auto* h = reinterpret_cast<CmdHeader*>(ReserveCommand(size));
     h->type = type;
-    h->size = static_cast<uint16_t>(size);
+    h->pad = 0;
+    h->size = size;
     return reinterpret_cast<T*>(h + 1);
 }
 template <class T>
 void Publish(T* payload)
 {
-    Commit(reinterpret_cast<CmdHeader*>(payload)[-1].size);
+    CommitCommand(reinterpret_cast<CmdHeader*>(payload) - 1);
 }
 void RecordBare(CmdType type)
 {
-    auto* h = reinterpret_cast<CmdHeader*>(Reserve(CmdSize(0)));
+    auto* h = reinterpret_cast<CmdHeader*>(ReserveCommand(CmdSize(0)));
     h->type = type;
-    h->size = static_cast<uint16_t>(CmdSize(0));
-    Commit(h->size);
+    h->pad = 0;
+    h->size = CmdSize(0);
+    CommitCommand(h);
 }
 
 // Waits until the worker has run everything recorded (the frame's end).
 void Drain()
 {
-    if (!g_workerOn) return;
+    if (!g_workerOn || OnWorker()) return;
     const uint64_t start = svcGetSystemTick();
     while (__atomic_load_n(&g_tail, __ATOMIC_SEQ_CST) != g_head) {
         __atomic_store_n(&g_producerWaitingDrain, 1, __ATOMIC_SEQ_CST);
         if (__atomic_load_n(&g_tail, __ATOMIC_SEQ_CST) != g_head) LightEvent_Wait(&g_drained);
         __atomic_store_n(&g_producerWaitingDrain, 0, __ATOMIC_SEQ_CST);
     }
-    g_drainWaitTicks += svcGetSystemTick() - start;
+    const uint64_t waited = svcGetSystemTick() - start;
+    g_drainWaitTicks += waited;
+    g_winDrainTicks += waited;
 }
 
 // ============================================================================================================
@@ -738,7 +860,7 @@ void TakePendingCapture()
     g_pendingCaptureSource = nullptr;
     if (g_captureCount >= sizeof(g_captures) / sizeof(g_captures[0])) return;
     auto* rgb = static_cast<uint8_t*>(std::malloc(kShotBytes));
-    if (!rgb) return;
+    if (!rgb) return;  // no memory left for it: the capture is skipped, the run goes on
     GSPGPU_InvalidateDataCache(src, kShotBytes);
     std::memcpy(rgb, src, kShotBytes);
     Capture& c = g_captures[g_captureCount++];
@@ -779,9 +901,16 @@ void ExecBlend(const CmdBlend& b)
     }
 }
 
+void ExecCp(const CmdHeader* h);  // step 2: Aurora's command processor on the worker (below)
+
 // Runs one recorded command.
 void Execute(const CmdHeader* h)
 {
+    // GX commands for the command processor: always (GXInit's come before the GPU is up).
+    if (h->type >= kCmdCpData) {
+        ExecCp(h);
+        return;
+    }
     const void* p = h + 1;
     // Nothing touches citro3d before it is up (InitGpu runs at the first frame's start). State still applies to a
     // frame the GPU did not let start (the game thread's record of it stays right); textures and draws do not.
@@ -849,6 +978,7 @@ void Execute(const CmdHeader* h)
     case kCmdAppend: ExecAppend(*static_cast<const CmdAppend*>(p)); break;
     case kCmdClear: ExecClear(*static_cast<const CmdClear*>(p)); break;
     case kCmdEndFrame: ExecEndFrame(); break;
+    case kCmdCpData: case kCmdCpRawDraw: case kCmdCpCall: case kCmdCpEndFrame: ExecCp(h); break;
     default: break;
     }
 }
@@ -859,9 +989,9 @@ void ExecuteRecorded()
     uint32_t tail = g_tail;
     const uint32_t head = __atomic_load_n(&g_head, __ATOMIC_ACQUIRE);
     while (tail != head) {
-        const auto* h = reinterpret_cast<const CmdHeader*>(g_ring + tail % kRingBytes);
+        const auto* h = reinterpret_cast<const CmdHeader*>(g_ring + (tail & (g_ringBytes - 1)));
         if (h->type == kCmdWrap) {
-            tail += kRingBytes - tail % kRingBytes;
+            tail += g_ringBytes - (tail & (g_ringBytes - 1));
             continue;
         }
         Execute(h);
@@ -872,13 +1002,27 @@ void ExecuteRecorded()
     __atomic_store_n(&g_tail, tail, __ATOMIC_SEQ_CST);
 }
 
-// The GPU worker on core 2: runs commands as they come; spins a little before sleeping (the core is its own).
+// The GPU worker on core 2: runs commands as they come. The core is its own (any thread put there later needs a
+// higher priority to preempt it), so while a frame is being recorded it stays awake up to kAwakeTicks between commands:
+// every sleep costs the game thread a wake-up syscall at its next command, and a frame records thousands of
+// commands in bursts. Between frames (game logic) it sleeps after a short spin.
+constexpr uint64_t kAwakeTicks = SYSCLOCK_ARM11 / 125;  // 8 ms
 void WorkerMain(void*)
 {
     for (;;) {
         uint32_t spins = 0;
+        uint64_t idleSince = 0;
         while (__atomic_load_n(&g_head, __ATOMIC_ACQUIRE) == g_tail) {
             if (++spins < 4000) continue;
+            if (g_frameOpen) {
+                const uint64_t now = svcGetSystemTick();
+                if (!idleSince) idleSince = now;
+                if (now - idleSince < kAwakeTicks) {
+                    spins = 0;
+                    continue;
+                }
+            }
+            idleSince = 0;
             __atomic_store_n(&g_workerSleeping, 1, __ATOMIC_SEQ_CST);
             if (__atomic_load_n(&g_head, __ATOMIC_SEQ_CST) == g_tail) LightEvent_Wait(&g_workAvailable);
             __atomic_store_n(&g_workerSleeping, 0, __ATOMIC_SEQ_CST);
@@ -886,7 +1030,9 @@ void WorkerMain(void*)
         }
         const uint64_t start = svcGetSystemTick();
         ExecuteRecorded();
-        g_workerBusyTicks += svcGetSystemTick() - start;
+        const uint64_t busy = svcGetSystemTick() - start;
+        g_workerBusyTicks += busy;
+        g_winBusyTicks += busy;
         if (__atomic_load_n(&g_producerWaitingSpace, __ATOMIC_SEQ_CST)) LightEvent_Signal(&g_spaceAvailable);
         if (__atomic_load_n(&g_producerWaitingDrain, __ATOMIC_SEQ_CST) &&
             __atomic_load_n(&g_head, __ATOMIC_SEQ_CST) == g_tail)
@@ -903,6 +1049,13 @@ bool g_recFrameOpen = false;
 bool g_recBatchOpen = false;
 uint32_t g_recBatchVerts = 0;
 VertexPlan g_recPlan;
+// g_recPlan is still what BuildPlan would give for (g_recPlanFmt, g_recPlanBe): nothing has written the vertex
+// state since (g_brawl3dsVtxGen counts the CP register writes that changed one and the GX calls run on the
+// worker). A match frame appends ~11,000 draws to its ~550 batches; building and comparing a plan for each was
+// a third of the worker's time.
+unsigned g_recPlanGen = 0;
+int g_recPlanFmt = -1;
+bool g_recPlanBe = false, g_recPlanMemo = false;
 uint32_t g_recDropped = 0;
 MaterialPlan g_plan;
 ChannelPlan g_channel;
@@ -917,10 +1070,20 @@ uint16_t g_boolShadow = 0;
 C3D_IVec g_ivShadow[4];
 
 // The shader is parsed here (pure CPU work): the uniform locations are needed to record. The worker binds it.
+// It starts at the first draw, as before step 2: started by GXInit's commands, its 2 MiB ring took the memory the
+// runtime's disc index needs a moment later (console, 2026-11-24: malloc(48) failed, "DVD file table is
+// unavailable"). The switches that choose the threads are read here (main_3ds.cpp reads them a little later).
 void StartRenderer()
 {
     if (g_started) return;
     g_started = true;
+    if (g_debugFlags == 0) {
+        if (std::FILE* f = std::fopen("sdmc:/3ds/brawl3ds/debug_flags.txt", "r")) {
+            unsigned flags = 0;
+            if (std::fscanf(f, "%u", &flags) == 1) g_debugFlags = flags;
+            std::fclose(f);
+        }
+    }
     g_dvlb = DVLB_ParseFile(reinterpret_cast<u32*>(const_cast<unsigned char*>(brawl3ds_gx_m4_shbin)),
                             brawl3ds_gx_m4_shbin_size);
     if (g_dvlb) {
@@ -945,11 +1108,16 @@ void StartRenderer()
             g_dvlb = nullptr;  // InitGpu reports it
         }
     }
-    g_ring = static_cast<uint8_t*>(std::malloc(kRingBytes));
+    for (g_ringBytes = 2u << 20; g_ringBytes >= (512u << 10); g_ringBytes >>= 1) {
+        g_ring = static_cast<uint8_t*>(std::malloc(g_ringBytes));
+        if (g_ring) break;
+    }
     if (!g_ring) {
-        std::fprintf(stderr, "[pica] no memory for the command ring\n");
+        std::fprintf(stderr, "[pica] no memory for the command ring (not even 512 KiB)\n");
         std::abort();
     }
+    if (g_ringBytes != (2u << 20))
+        std::fprintf(stderr, "[pica] command ring %u KiB (no 2 MiB block in the heap)\n", g_ringBytes >> 10);
     LightEvent_Init(&g_workAvailable, RESET_ONESHOT);
     LightEvent_Init(&g_spaceAvailable, RESET_ONESHOT);
     LightEvent_Init(&g_drained, RESET_ONESHOT);
@@ -961,8 +1129,135 @@ void StartRenderer()
         g_worker = threadCreate(WorkerMain, nullptr, 64 * 1024, priority, 2, true);
     }
     g_workerOn = g_worker != nullptr;
-    std::fprintf(stderr, "[pica] GPU work %s\n",
-                 g_workerOn ? "on a worker thread on core 2" : "on the game thread (no core 2 worker)");
+    // The command processor moves to the worker at the end of this frame (Brawl3dsPicaEndFrame), with nothing in
+    // flight: this first draw is already being decoded here.
+    g_cpWanted = g_workerOn && !(g_debugFlags & 64);
+    std::fprintf(stderr, "[pica] GPU work %s; GX command processor on %s\n",
+                 g_workerOn ? "on a worker thread on core 2" : "on the game thread (no core 2 worker)",
+                 g_cpWanted ? "the worker from the end of this frame" : "the game thread");
+}
+
+// ============================================================================================================
+// Step 2: Aurora's command processor on the worker (brawl3ds_cp_hooks.h). The game thread hands over GX bytes;
+// the worker decodes them, which records (at once, on the worker) and draws.
+// ============================================================================================================
+
+void Sync();
+void CpEndFrame();  // the frame's end on the worker (below, with the recorder)
+
+// Queues GX bytes (copied). Too large for the ring: decoded here once the worker has caught up.
+bool DeferBytes(uint8_t kind, bool bigEndian, const uint8_t* data, uint32_t size)
+{
+    const uint32_t cmd = CmdSize(sizeof(CmdCpData) + size);
+    if (cmd > g_ringBytes / 2) {
+        Sync();
+        ++g_cpInlineDepth;
+        if (kind == 0) {
+            uint32_t consumed = 0;
+            while (consumed < size) {
+                const uint32_t n = aurora::gx::fifo::process(data + consumed, size - consumed, bigEndian);
+                if (n == 0) break;
+                consumed += n;
+            }
+        } else {
+            brawl3ds_cp_process_display_list(data, size, bigEndian);
+        }
+        --g_cpInlineDepth;
+        return true;
+    }
+    auto* h = reinterpret_cast<CmdHeader*>(Reserve(cmd));
+    h->type = kCmdCpData;
+    h->pad = 0;
+    h->size = cmd;
+    auto* c = reinterpret_cast<CmdCpData*>(h + 1);
+    c->bytes = size;
+    c->kind = kind;
+    c->bigEndian = bigEndian ? 1 : 0;
+    c->pad[0] = c->pad[1] = 0;
+    std::memcpy(c + 1, data, size);
+    g_cpBytes += size;
+    Commit(cmd);
+    return true;
+}
+
+// The game thread waits until the worker has decoded (and run) everything queued.
+void Sync()
+{
+    if (!g_cpOnWorker || OnWorker()) return;
+    const uint64_t start = svcGetSystemTick();
+    if (g_cpInlineDepth == 0) aurora::gx::fifo::drain();  // what is still in the FIFO goes first
+    Drain();
+    const uint64_t ticks = svcGetSystemTick() - start;
+    ++g_cpSyncs;
+    ++g_winCpSyncs;
+    g_cpSyncTicks += ticks;
+    g_winCpSyncTicks += ticks;
+    const char* name = g_syncSite ? g_syncSite : "(large GX data)";
+    for (SyncSite& site : g_syncSites) {
+        if (site.name == nullptr || site.name == name || std::strcmp(site.name, name) == 0) {
+            site.name = name;
+            ++site.count;
+            site.ticks += ticks;
+            break;
+        }
+    }
+}
+
+void ProcessCpCommand(const CmdHeader* h)
+{
+    const void* p = h + 1;
+    switch (h->type) {
+    case kCmdCpData: {
+        const auto* c = static_cast<const CmdCpData*>(p);
+        const auto* bytes = reinterpret_cast<const uint8_t*>(c + 1);
+        if (c->kind == 0) {
+            uint32_t consumed = 0;
+            while (consumed < c->bytes) {
+                const uint32_t n = aurora::gx::fifo::process(bytes + consumed, c->bytes - consumed, c->bigEndian != 0);
+                if (n == 0) break;
+                consumed += n;
+            }
+        } else if (c->kind == 2) {
+            brawl3ds_cp_process_display_list(reinterpret_cast<const CmdCpListRef*>(c + 1)->data, c->bytes,
+                                             c->bigEndian != 0);
+        } else {
+            brawl3ds_cp_process_display_list(bytes, c->bytes, c->bigEndian != 0);
+        }
+        break;
+    }
+    case kCmdCpRawDraw: {
+        const auto* c = static_cast<const CmdCpRawDraw*>(p);
+        aurora::gx::fifo::submit_raw_draw(static_cast<GXPrimitive>(c->prim), static_cast<GXVtxFmt>(c->fmt),
+                                          reinterpret_cast<const uint8_t*>(c + 1), static_cast<uint16_t>(c->vtxCount),
+                                          c->bytes);
+        break;
+    }
+    case kCmdCpCall: {
+        const auto* c = static_cast<const CmdCpCall*>(p);
+        ++g_brawl3dsVtxGen;  // a GX call: it may set an array or a vertex format directly
+        c->fn(const_cast<CmdCpCall*>(c) + 1);
+        aurora::gx::fifo::drain();  // what the call wrote into the worker's own FIFO
+        break;
+    }
+    case kCmdCpEndFrame: CpEndFrame(); break;
+    default: break;
+    }
+}
+
+void ExecCp(const CmdHeader* h)
+{
+    const uint64_t start = svcGetSystemTick();
+    try {
+        ProcessCpCommand(h);
+    } catch (const std::exception& e) {
+        // On the game thread the runtime's GX entry points swallowed these (GX__CallDisplayList_80172f64).
+        if (g_cpFailures++ < 8) std::fprintf(stderr, "[pica] GX command processor: %s\n", e.what());
+    } catch (...) {
+        if (g_cpFailures++ < 8) std::fprintf(stderr, "[pica] GX command processor: unknown exception\n");
+    }
+    const uint64_t ticks = svcGetSystemTick() - start;
+    g_cpTicks += ticks;
+    g_winCpTicks += ticks;
 }
 
 inline C3D_FVec Row(const aurora::Vec4<float>& r) { return FVec4_New(r[0], r[1], r[2], r[3]); }
@@ -970,7 +1265,10 @@ inline C3D_FVec Row(const aurora::Vec4<float>& r) { return FVec4_New(r[0], r[1],
 inline void SetVec(int id, const C3D_FVec& v)
 {
     C3D_FVec& cur = g_fvShadow[id];
-    if (std::memcmp(&cur, &v, sizeof(v)) != 0) {
+    uint32_t a[4], b[4];  // four words: newlib's memcmp goes byte by byte, ~25,000 times a frame
+    std::memcpy(a, &cur, sizeof(a));
+    std::memcpy(b, &v, sizeof(b));
+    if (((a[0] ^ b[0]) | (a[1] ^ b[1]) | (a[2] ^ b[2]) | (a[3] ^ b[3])) != 0) {
         cur = v;
         auto* c = Record<CmdFVUnif>(kCmdFVUnif);
         c->id = id;
@@ -1256,6 +1554,7 @@ void BuildPlan(GXVtxFmt fmt, bool be, VertexPlan& plan)
         a.type = af.type;
         a.be = be;
         a.scale = af.type == GX_F32 ? 1.0f : 1.0f / static_cast<float>(1u << af.frac);
+        a.shift = af.type == GX_F32 ? 0 : static_cast<uint8_t>(af.frac);
         if (type == GX_DIRECT) {
             at += DirectSize(attr, af);
         } else {
@@ -1378,6 +1677,10 @@ void Brawl3dsPicaDraw(GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, 
     c->indices = indices;
     c->indexCount = indexCount;
     g_recPlan = c->plan;
+    g_recPlanGen = g_brawl3dsVtxGen;
+    g_recPlanFmt = static_cast<int>(fmt);
+    g_recPlanBe = bigEndian;
+    g_recPlanMemo = OnWorker();  // only the worker's own state is counted
     const VertexPlan dumpPlan = c->plan;
     Publish(c);
     g_recBatchOpen = true;
@@ -1403,14 +1706,23 @@ bool Brawl3dsPicaAppend(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices,
         ++g_recDropped;
         return true;  // dropped, but handled
     }
-    VertexPlan plan;
-    BuildPlan(fmt, bigEndian, plan);
-    if (std::memcmp(&plan, &g_recPlan, sizeof(plan)) != 0) {  // arrays or byte order changed under the batch
-        g_recPlan = plan;
-        auto* p = Record<CmdPlan>(kCmdPlan);
-        p->plan = plan;
-        Publish(p);
+    const bool memo = g_recPlanMemo && g_recPlanGen == g_brawl3dsVtxGen && g_recPlanFmt == static_cast<int>(fmt) &&
+                      g_recPlanBe == bigEndian && OnWorker();
+    if (!memo) {
+        VertexPlan plan;
+        BuildPlan(fmt, bigEndian, plan);
+        if (std::memcmp(&plan, &g_recPlan, sizeof(plan)) != 0) {  // arrays or byte order changed under the batch
+            g_recPlan = plan;
+            auto* p = Record<CmdPlan>(kCmdPlan);
+            p->plan = plan;
+            Publish(p);
+        }
+        g_recPlanGen = g_brawl3dsVtxGen;
+        g_recPlanFmt = static_cast<int>(fmt);
+        g_recPlanBe = bigEndian;
+        g_recPlanMemo = OnWorker();
     }
+    const VertexPlan& plan = g_recPlan;
     const uint32_t bytes = vtxCount * plan.size;
     if (CmdSize(sizeof(CmdAppend) + bytes) > 0xFFF8) {  // larger than a command can be: drawn in full instead
         return false;
@@ -1604,6 +1916,7 @@ extern "C" void Brawl3dsPicaCaptureNextFrame(const char* path)
 
 extern "C" void Brawl3dsPicaWriteCaptures()
 {
+    if (g_started) Drain();
     for (uint32_t i = 0; i < g_captureCount; ++i) {
         WriteBmp(g_captures[i].path, g_captures[i].rgb);
         std::free(g_captures[i].rgb);
@@ -1614,16 +1927,29 @@ extern "C" void Brawl3dsPicaWriteCaptures()
 // Material and texture statistics for the match summary (headless.log). Called between frames.
 extern "C" void Brawl3dsPicaWriteStats(std::FILE* f, unsigned frames)
 {
+    if (g_started) Drain();
     if (f) {
         const double div = frames ? frames : 1;
         auto ms = [&](uint64_t ticks) { return static_cast<double>(ticks) * 1000.0 / SYSCLOCK_ARM11 / div; };
         std::fprintf(f, "GPU stalls (frames not drawn after 2 s of waiting): %u\n", g_gpuStalls);
         std::fprintf(f,
                      "GPU work: %s; worker busy %.2f ms per frame; game thread waited %.2f ms per frame for it at frame "
-                     "ends and %.2f ms for ring space; %.0f KiB recorded per frame (ring %u KiB, peak %u KiB)\n",
+                     "ends and %.2f ms for ring space; %.0f KiB recorded per frame (ring %u KiB, peak %u KiB); %.1f "
+                     "worker wake-ups per frame\n",
                      g_workerOn ? "worker thread on core 2" : "on the game thread", ms(g_workerBusyTicks),
                      ms(g_drainWaitTicks), ms(g_spaceWaitTicks), static_cast<double>(g_ringBytesRecorded) / 1024.0 / div,
-                     kRingBytes >> 10, g_ringPeak >> 10);
+                     g_ringBytes >> 10, g_ringPeak >> 10, g_wakeSignals / div);
+        std::fprintf(f,
+                     "GX command processor: %s; %.2f ms per frame on the worker (with the recording it calls), %.0f "
+                     "KiB of GX commands handed over per frame, %.1f catch-up waits per frame, %u failures\n",
+                     g_cpOnWorker ? "on the worker" : "on the game thread", ms(g_cpTicks),
+                     static_cast<double>(g_cpBytes) / 1024.0 / div, g_cpSyncs / div, g_cpFailures);
+        std::fprintf(f, "catch-up waits: %.2f ms per frame on the game thread;", ms(g_cpSyncTicks));
+        for (const SyncSite& site : g_syncSites) {
+            if (site.name)
+                std::fprintf(f, " %s %.1f/frame %.2f ms;", site.name, site.count / div, ms(site.ticks));
+        }
+        std::fprintf(f, "\n");
         std::fprintf(f,
                      "lighting: %u of %u batches lit (%.1f lights each), %u lit approximately, %u read channel "
                      "COLOR1A1 (drawn as COLOR0A0)\n",
@@ -1638,14 +1964,47 @@ extern "C" void Brawl3dsPicaWriteStats(std::FILE* f, unsigned frames)
     g_statPartViewport = g_statClears = g_statClearsSkipped = g_statPostMtx = g_statPostNormalize = 0;
     g_workerBusyTicks = g_drainWaitTicks = g_spaceWaitTicks = g_ringBytesRecorded = 0;
     g_ringPeak = 0;
+    g_wakeSignals = 0;
+    g_cpTicks = g_cpBytes = g_cpSyncTicks = 0;
+    g_cpSyncs = 0;
+    for (SyncSite& site : g_syncSites) site = SyncSite{};
     WriteTevStats(f, frames);
     WriteTextureStats(f, frames);
 }
 
-// The frame's end: the worker submits it; the game thread waits until it has (Aurora's staging arena, which the
-// frame's draws point into, is reset right after).
-void Brawl3dsPicaEndFrame()
+// backend_3ds.cpp: the frame is done with Aurora's staging (reset the arena, the arrays, the current draw).
+void Brawl3dsRendererStagingEndFrame();
+
+namespace {
+// The recorder's frame end, on the thread that runs the command processor.
+void RecorderEndFrame()
 {
+    RecordFlush();
+    if (g_recFrameOpen) RecordBare(kCmdEndFrame);
+    g_recFrameOpen = false;
+    g_recBatchOpen = false;
+    g_debugFrame = false;  // a debug dump covers one frame
+}
+
+// Step 2: the frame's end, queued by the game thread and run by the worker in order.
+void CpEndFrame()
+{
+    RecorderEndFrame();
+    Brawl3dsRendererStagingEndFrame();
+}
+} // namespace
+
+// The frame's end: the worker submits it; the game thread waits until it has (Aurora's staging arena, which the
+// frame's draws point into, is reset after). Step 2: the worker also decodes the frame's last GX commands and
+// resets the staging itself; true when it did.
+bool Brawl3dsPicaEndFrame()
+{
+    if (g_started && g_cpOnWorker) {
+        aurora::gx::fifo::drain();  // the FIFO's last commands, then the frame's end
+        RecordBare(kCmdCpEndFrame);
+        Drain();
+        return true;
+    }
     if (g_started) {
         RecordFlush();
         if (g_recFrameOpen) RecordBare(kCmdEndFrame);
@@ -1653,10 +2012,134 @@ void Brawl3dsPicaEndFrame()
     }
     g_recFrameOpen = false;
     g_recBatchOpen = false;
-    g_debugFrame = false;  // a debug dump covers one frame
+    g_debugFrame = false;
+    if (g_cpWanted && !g_cpOnWorker) {
+        // Between frames, the worker idle: GX commands from now on are decoded there. The staging of this frame is
+        // reset by the caller on this thread, as before.
+        g_cpOnWorker = true;
+        std::fprintf(stderr, "[pica] GX command processor now on the worker\n");
+    }
+    return false;
+}
+
+// ---- brawl3ds_cp_hooks.h ----
+extern "C" bool brawl3ds_cp_on_worker(void) { return OnWorker(); }
+
+extern "C" bool brawl3ds_cp_deferred(void)
+{
+    if (OnWorker()) return false;
+    return g_cpOnWorker && g_cpInlineDepth == 0;
+}
+
+extern "C" bool brawl3ds_cp_defer_fifo(const uint8_t* data, uint32_t size)
+{
+    if (!brawl3ds_cp_deferred()) return false;
+    return DeferBytes(0, true, data, size);
+}
+
+extern "C" bool brawl3ds_cp_defer_list(const uint8_t* data, uint32_t size, bool bigEndian)
+{
+    if (!brawl3ds_cp_deferred()) return false;
+    if (size == 0) return true;
+    if (g_brawl3dsListInGuestRam && size >= 128) {  // by reference (CmdCpListRef)
+        const uint32_t cmd = CmdSize(sizeof(CmdCpData) + sizeof(CmdCpListRef));
+        auto* h = reinterpret_cast<CmdHeader*>(Reserve(cmd));
+        h->type = kCmdCpData;
+        h->pad = 0;
+        h->size = cmd;
+        auto* c = reinterpret_cast<CmdCpData*>(h + 1);
+        c->bytes = size;
+        c->kind = 2;
+        c->bigEndian = bigEndian ? 1 : 0;
+        c->pad[0] = c->pad[1] = 0;
+        auto* ref = reinterpret_cast<CmdCpListRef*>(c + 1);
+        ref->data = data;
+        ref->pad = 0;
+        Commit(cmd);
+        return true;
+    }
+    return DeferBytes(1, bigEndian, data, size);
+}
+
+extern "C" void brawl3ds_cp_defer_raw_draw(int prim, int fmt, const uint8_t* vertices, uint16_t vtxCount,
+                                           uint32_t bytes)
+{
+    aurora::gx::fifo::drain();  // the commands before the draw go first
+    const uint32_t size = CmdSize(sizeof(CmdCpRawDraw) + bytes);
+    auto* h = reinterpret_cast<CmdHeader*>(Reserve(size));
+    h->type = kCmdCpRawDraw;
+    h->pad = 0;
+    h->size = size;
+    auto* c = reinterpret_cast<CmdCpRawDraw*>(h + 1);
+    c->prim = prim;
+    c->fmt = fmt;
+    c->vtxCount = vtxCount;
+    c->bytes = bytes;
+    std::memcpy(c + 1, vertices, bytes);
+    g_cpBytes += bytes;
+    Commit(size);
+}
+
+extern "C" void* brawl3ds_cp_begin_call(void (*fn)(void*), uint32_t bytes)
+{
+    aurora::gx::fifo::drain();  // the commands before the call go first
+    const uint32_t size = CmdSize(sizeof(CmdCpCall) + bytes);
+    auto* h = reinterpret_cast<CmdHeader*>(Reserve(size));
+    h->type = kCmdCpCall;
+    h->pad = 0;
+    h->size = size;
+    auto* c = reinterpret_cast<CmdCpCall*>(h + 1);
+    c->fn = fn;
+    c->bytes = bytes;
+    return c + 1;
+}
+
+extern "C" void brawl3ds_cp_end_call(void* payload)
+{
+    auto* h = reinterpret_cast<CmdHeader*>(static_cast<uint8_t*>(payload) - sizeof(CmdCpCall)) - 1;
+    Commit(h->size);
+}
+
+extern "C" void brawl3ds_cp_inline_begin(const char* site)
+{
+    if (!g_cpOnWorker || OnWorker()) return;
+    if (g_cpInlineDepth == 0) {
+        g_syncSite = site ? site : "(unnamed)";
+        Sync();
+        g_syncSite = nullptr;
+    }
+    ++g_cpInlineDepth;
+}
+
+extern "C" void brawl3ds_cp_inline_end(void)
+{
+    if (!g_cpOnWorker || OnWorker() || g_cpInlineDepth == 0) return;
+    --g_cpInlineDepth;
+}
+
+// For headless.log's periodic frame lines (main_3ds.cpp): the worker's time in the command processor and the
+// game thread's catch-up waits since the last call.
+extern "C" void Brawl3dsPicaTakeCpStats(double* cpMs, uint32_t* syncs, double* syncMs)
+{
+    *cpMs = static_cast<double>(g_winCpTicks) * 1000.0 / SYSCLOCK_ARM11;
+    *syncs = g_winCpSyncs;
+    *syncMs = static_cast<double>(g_winCpSyncTicks) * 1000.0 / SYSCLOCK_ARM11;
+    g_winCpTicks = g_winCpSyncTicks = 0;
+    g_winCpSyncs = 0;
 }
 
 extern "C" bool Brawl3dsPicaActive() { return g_ready; }
+
+// For headless.log's periodic frame lines: the worker's busy time, the game thread's frame-end wait (ms, summed)
+// and the wake-ups since the last call. Called between frames.
+extern "C" void Brawl3dsPicaTakeWindowStats(double* busyMs, double* waitMs, uint32_t* wakeups)
+{
+    *busyMs = static_cast<double>(g_winBusyTicks) * 1000.0 / SYSCLOCK_ARM11;
+    *waitMs = static_cast<double>(g_winDrainTicks) * 1000.0 / SYSCLOCK_ARM11;
+    *wakeups = g_winWakeSignals;
+    g_winBusyTicks = g_winDrainTicks = 0;
+    g_winWakeSignals = 0;
+}
 extern "C" uint32_t Brawl3dsPicaTakeDropped()
 {
     const uint32_t n = g_droppedDraws + g_recDropped;

@@ -4,7 +4,7 @@
 // unchanged; they emit work through the gfx:: staging layer and a few gx.cpp state functions, which WebGPU
 // implements on PC. Here:
 //   - push_verts/indices/storage and map_uniform copy into one per-frame CPU arena and return ranges into it;
-//   - pipeline_ref keeps every distinct pipeline config in a table and returns its index;
+//   - pipeline_ref gives every distinct pipeline config an index (it keeps a 64-bit fingerprint, not the config);
 //   - push_draw_command records the draw. Milestone 1 only counts draws and vertices (Brawl3dsRenderStats); the
 //     PICA200 draw path (vertex decode on the CPU, citro3d) replaces the counting in milestone 2;
 //   - texture objects, frame interpolation and window/VI sizing are inert or fixed to the 400x240 top screen; of an
@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>  // std::_Hash_bytes
 #include <mutex>
 #include <string_view>
 #include <unordered_map>
@@ -46,7 +47,7 @@ extern "C" void Brawl3dsRendererCountDraw(uint32_t vertices, uint32_t indices);
 void Brawl3dsPicaDraw(GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, const uint16_t* indices,
                       uint32_t indexCount, bool bigEndian);
 bool Brawl3dsPicaAppend(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint32_t vtxCount, bool bigEndian);
-void Brawl3dsPicaEndFrame();
+bool Brawl3dsPicaEndFrame();
 void Brawl3dsPicaClearRect(int x, int y, int w, int h, bool color, bool alpha, bool depth);
 
 namespace {
@@ -78,14 +79,14 @@ public:
     {
         return m_chunks[encoded >> kChunkShift].bytes + (encoded & (kChunkSize - 1));
     }
-    // A new frame: chunks are reused; one-off oversized chunks and anything past the first sixteen are released.
+    // A new frame: chunks are reused; one-off oversized chunks and anything past the first 24 are released.
     // (A match frame fills ~8; releasing and re-allocating 256 KiB blocks every frame fragmented the heap until one
-    // allocation failed.)
+    // allocation failed.) Smaller fallback chunks (next_chunk) are kept too: freeing them would fragment it further.
     void reset()
     {
         size_t kept = 0;
         for (Chunk& chunk : m_chunks) {
-            if (chunk.size == kChunkSize && kept < 16) {
+            if (chunk.bytes && chunk.size <= kChunkSize && kept < 24) {
                 m_chunks[kept++] = chunk;
             } else {
                 std::free(chunk.bytes);
@@ -104,19 +105,41 @@ private:
     };
     void next_chunk(size_t length)
     {
+        // Chunks are taken as they are needed, not ahead of time: at boot the regular heap has only ~2 MiB left
+        // past the guest RAM, and taking a match's ~2.5 MiB of chunks there left no room for the renderer's 2 MiB
+        // command ring (console run of 2026-11-23: abort at frame 2).
+        if (m_chunks.empty()) m_chunks.reserve(32);
         if (length > kChunkSize) {  // a staging of its own
             m_chunks.push_back({static_cast<uint8_t*>(std::malloc(length)), length});
             m_current = static_cast<uint32_t>(m_chunks.size() - 1);
         } else {
             size_t next = m_started ? m_current + 1 : 0;
-            while (next < m_chunks.size() && m_chunks[next].size != kChunkSize) ++next;
+            while (next < m_chunks.size() && m_chunks[next].size < length) ++next;
             if (next >= m_chunks.size()) {
-                m_chunks.push_back({static_cast<uint8_t*>(std::malloc(kChunkSize)), kChunkSize});
+                // A new chunk. Late in a match the heap still has ~11 MiB free but in pieces, and the console run
+                // of 2026-11-23 aborted at frame ~3606 on a 256 KiB chunk: take smaller ones then (a chunk's size
+                // is kept with it, and push moves on when one is full).
+                Chunk chunk{nullptr, 0};
+                for (size_t size = kChunkSize; size >= length && size >= (16u << 10); size >>= 1) {
+                    chunk = {static_cast<uint8_t*>(std::malloc(size)), size};
+                    if (chunk.bytes) break;
+                }
+                if (!chunk.bytes) chunk = {static_cast<uint8_t*>(std::malloc(length)), length};
+                if (chunk.bytes && chunk.size != kChunkSize) {
+                    static uint32_t s_logged = 0;
+                    if (s_logged++ < 8)
+                        std::fprintf(stderr, "[aurora3ds] staging: no 256 KiB block in the heap, using %u KiB\n",
+                                     static_cast<unsigned>(chunk.size >> 10));
+                }
+                m_chunks.push_back(chunk);
                 next = m_chunks.size() - 1;
             }
             m_current = static_cast<uint32_t>(next);
         }
-        if (!m_chunks[m_current].bytes) std::abort();
+        if (!m_chunks[m_current].bytes) {
+            std::fprintf(stderr, "[aurora3ds] staging: no memory for %u bytes\n", static_cast<unsigned>(length));
+            std::abort();
+        }
         m_started = true;
         m_pos = 0;
     }
@@ -134,8 +157,11 @@ bool g_haveDraw = false;     // g_lastDraw is this frame's current draw (unchang
 GXVtxFmt g_lastDrawFmt = GX_VTXFMT0;
 uint64_t g_appendedDraws = 0, g_appendedVerts = 0;
 bool g_drawBigEndian = true;  // set per draw by Aurora's handle_draw / submit_raw_draw (patch script)
-std::vector<aurora::gx::PipelineConfig> g_pipelines;
-std::unordered_multimap<size_t, size_t> g_pipelineIndex;  // config hash -> index in g_pipelines
+// Distinct pipeline configs: a 64-bit fingerprint (two 32-bit hashes of the config's bytes) -> its index. Nothing
+// here reads a config back, and keeping copies of them (~2.8 KB each, in one growing vector) took a 354 KB block
+// that the fragmented heap no longer had in the console run of 2026-11-23: malloc failed and the run aborted in the
+// match. The fingerprint costs what the copy's memcmp did; a collision of two configs in use is negligible.
+std::unordered_map<uint64_t, uint32_t> g_pipelineIndex;
 uint64_t g_displayListTicks = 0;  // time in Aurora's GXCallDisplayList (the runtime's display-list draws)
 uint32_t g_frame = 0;
 } // namespace
@@ -227,17 +253,12 @@ void split_staging_batch() {}
 template <>
 PipelineRef pipeline_ref(const gx::PipelineConfig& config)
 {
-    // Hashed: the first version compared each new config with every config seen so far (a linear memcmp of a
-    // large struct), which the command processor's small 3DS pipeline-state cache calls often.
-    const std::string_view bytes(reinterpret_cast<const char*>(&config), sizeof(config));
-    const size_t hash = std::hash<std::string_view>{}(bytes);
-    auto [begin, end] = g_pipelineIndex.equal_range(hash);
-    for (auto it = begin; it != end; ++it) {
-        if (std::memcmp(&g_pipelines[it->second], &config, sizeof(config)) == 0) return it->second;
-    }
-    g_pipelines.push_back(config);
-    g_pipelineIndex.emplace(hash, g_pipelines.size() - 1);
-    return g_pipelines.size() - 1;
+    // Called only when the command processor's small 3DS pipeline-state cache misses.
+    const uint64_t lo = std::_Hash_bytes(&config, sizeof(config), 0xc70f6907u);
+    const uint64_t hi = std::_Hash_bytes(&config, sizeof(config), 0x9e3779b9u);
+    const uint64_t key = (hi << 32) | (lo & 0xFFFFFFFFu);
+    auto [it, added] = g_pipelineIndex.try_emplace(key, static_cast<uint32_t>(g_pipelineIndex.size()));
+    return it->second;
 }
 template <>
 PipelineRef pipeline_ref(const clear::PipelineConfig&)
@@ -457,14 +478,49 @@ Site*& Head() noexcept
 }
 } // namespace brawl3ds_zones
 
+// The runtime's display-list calls and gather-pipe writes on the game thread (tools/patch_wiicompiled_arm32.py,
+// tag brawl3ds-gx-zones): 0 whole call, 1 classify, 2 scan (cache miss), 3 apply arrays/formats, 4 republish the
+// applied state, 5 interpreter fallback, 6 burst gather-pipe writes.
+namespace {
+constexpr int kGxdlParts = 7;
+uint64_t g_gxdlTicks[kGxdlParts], g_gxdlCalls[kGxdlParts];
+uint64_t g_fifoWrites = 0, g_fifoWriteBytes = 0;
+} // namespace
+
+extern "C" void Brawl3dsGxdlZone(int part, unsigned long long ticks)
+{
+    if (part < 0 || part >= kGxdlParts) return;
+    g_gxdlTicks[part] += ticks;
+    ++g_gxdlCalls[part];
+}
+
+extern "C" void Brawl3dsGxCountFifoWrite(unsigned bytes)
+{
+    ++g_fifoWrites;
+    g_fifoWriteBytes += bytes;
+}
+
 extern "C" void Brawl3dsZonesReset()
 {
     for (auto* site = brawl3ds_zones::Head(); site; site = site->next) site->ticks = site->calls = 0;
+    for (int i = 0; i < kGxdlParts; ++i) g_gxdlTicks[i] = g_gxdlCalls[i] = 0;
+    g_fifoWrites = g_fifoWriteBytes = 0;
 }
 
 extern "C" void Brawl3dsZonesWrite(std::FILE* f, unsigned frames)
 {
     if (!f || frames == 0) return;
+    static const char* const kGxdlNames[kGxdlParts] = {
+        "display-list call, whole", "  classify (scan cache probe)", "  scan (cache miss)", "  apply arrays and formats",
+        "  republish applied state", "  interpreter fallback", "burst gather-pipe writes"};
+    std::fprintf(f, "game thread GX (runtime HLE, per match frame):\n");
+    for (int i = 0; i < kGxdlParts; ++i) {
+        const double ms = static_cast<double>(g_gxdlTicks[i]) * 1000.0 / SYSCLOCK_ARM11 / frames;
+        std::fprintf(f, "  %8.2f ms  %8.1f calls  %s\n", ms, static_cast<double>(g_gxdlCalls[i]) / frames,
+                     kGxdlNames[i]);
+    }
+    std::fprintf(f, "  %8.1f single gather-pipe writes, %.0f KiB per frame\n",
+                 static_cast<double>(g_fifoWrites) / frames, static_cast<double>(g_fifoWriteBytes) / 1024.0 / frames);
     std::fprintf(f, "Aurora GX front-end zones (inclusive, per match frame):\n");
     for (auto* site = brawl3ds_zones::Head(); site; site = site->next) {
         if (!site->calls) continue;
@@ -477,8 +533,15 @@ extern "C" void Brawl3dsZonesWrite(std::FILE* f, unsigned frames)
 // The runtime's display-list draws, timed (-Wl,--wrap=GXCallDisplayList in port/headless/CMakeLists.txt: calls from
 // the runtime go through here, Aurora's own internal calls do not).
 extern "C" void __real_GXCallDisplayList(const void* list, u32 bytes);
+// The GX timers of the runtime and this file (debug_flags.txt 512): a system call each, ~14,000 a match frame.
+extern "C" unsigned char g_brawl3dsGxTiming = 0;
+
 extern "C" void __wrap_GXCallDisplayList(const void* list, u32 bytes)
 {
+    if (!g_brawl3dsGxTiming) {
+        __real_GXCallDisplayList(list, bytes);
+        return;
+    }
     const uint64_t start = svcGetSystemTick();
     __real_GXCallDisplayList(list, bytes);
     g_displayListTicks += svcGetSystemTick() - start;
@@ -489,15 +552,22 @@ extern "C" void Brawl3dsRendererTakeStats(uint64_t* displayListTicks, uint32_t* 
 {
     *displayListTicks = g_displayListTicks;
     g_displayListTicks = 0;
-    *pipelines = static_cast<uint32_t>(g_pipelines.size());
+    *pipelines = static_cast<uint32_t>(g_pipelineIndex.size());
 }
 
-// Called once per game frame by the 3DS frame hook: the staged bytes of the frame are no longer needed.
-extern "C" void Brawl3dsRendererEndFrame()
+// The staged bytes of the frame are no longer needed. On the thread that runs Aurora's command processor (the
+// worker since renderer milestone 5 step 2, pica_renderer_3ds.cpp).
+void Brawl3dsRendererStagingEndFrame()
 {
-    Brawl3dsPicaEndFrame();  // before the arena is reused: the frame's draws are submitted
     g_arena.reset();
     g_storage.clear();
     g_haveDraw = false;  // a new frame has no current draw
     ++g_frame;
+}
+
+// Called once per game frame by the 3DS frame hook.
+extern "C" void Brawl3dsRendererEndFrame()
+{
+    // Before the arena is reused: the frame's draws are submitted (by the worker, which then resets it itself).
+    if (!Brawl3dsPicaEndFrame()) Brawl3dsRendererStagingEndFrame();
 }

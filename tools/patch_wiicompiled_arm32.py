@@ -22,6 +22,8 @@ What it changes (all guarded by __arm__ && !__aarch64__, so x86-64 and AArch64 b
   Also copies port/wiicompiled_arm32/guest_flat_memory_3ds.cpp into runtime/src/platform/3ds/ (the 3DS build uses
   it instead of guest_flat_memory.cpp).
   * system_bridge.h             newlib has no sigjmp_buf: use jmp_buf on the 3DS
+  * hle/audio/ax_mix.cpp        (off: ENABLE_AX_MIX_CORE2) the AX/DSP mix worker on core 2, above the GPU worker's priority (libctru's
+                                std::thread puts every thread on core 0 at the lowest priority)
 
 Idempotent: a file already patched is left alone. Fails loudly if an expected upstream snippet moved.
 """
@@ -49,6 +51,24 @@ def edit(path: Path, replacements):
         text = text.replace(old, new)
     path.write_text(f"// {MARK}: patched by brawl3ds tools/patch_wiicompiled_arm32.py\n" + text, encoding="utf-8")
     print(f"  patched: {path.name}")
+
+
+def edit_tagged(path: Path, tag: str, replacements):
+    """Like edit(), for a later change to a file that may already carry MARK: `tag` (which the replacements must
+    contain) tells whether this change is in."""
+    text = path.read_text(encoding="utf-8")
+    if tag in text:
+        print(f"  already patched ({tag}): {path.name}")
+        return
+    for old, new, count in replacements:
+        found = text.count(old)
+        if found == 0 or (count is not None and found != count):
+            sys.exit(f"{path}: expected {count or 'some'} occurrence(s) of:\n{old}\nfound {found}")
+        text = text.replace(old, new)
+    if tag not in text:
+        sys.exit(f"{path}: the replacements for {tag} do not contain the tag")
+    path.write_text(text, encoding="utf-8")
+    print(f"  patched ({tag}): {path.name}")
 
 
 def main(wiicompiled: Path):
@@ -722,6 +742,603 @@ def main(wiicompiled: Path):
         ("#if defined(_WIN32)\nusing MkwJmpBuf = jmp_buf;",
          "#if defined(_WIN32) || defined(__3DS__)\nusing MkwJmpBuf = jmp_buf;", 1),
     ])
+
+    # DVD reads: every read staged its bytes in a new std::vector of the read's size (512 KiB for most of Brawl's
+    # reads) before the copy into guest memory. Late in the demo match the fragmented heap had no 512 KiB block left
+    # (console run of 2026-11-23: std::bad_alloc at frame 3797). On the 3DS one staging buffer is reused (a plain static: a thread_local one coincided with a hang at the title movie):
+    # it reaches its largest size at boot and keeps it. ReadExact reads straight into it (it is private staging, not
+    # guest memory, so a failed read still leaves the guest destination untouched).
+    edit_tagged(inc / "hle" / "dvd_contract.h", "brawl3ds-dvd-staging", [
+        ("    std::vector<uint8_t> staged(length);\n",
+         "#if defined(__3DS__)  // brawl3ds-dvd-staging: read into the caller's reused buffer\n"
+         "    std::vector<uint8_t>& staged = destination;\n    staged.resize(length);\n#else\n"
+         "    std::vector<uint8_t> staged(length);\n#endif\n", 1),
+        ("    destination = std::move(staged);\n",
+         "#if !defined(__3DS__)\n    destination = std::move(staged);\n#endif\n", 1),
+    ])
+    edit_tagged(src / "hle" / "storage" / "dvd.cpp", "brawl3ds-dvd-staging", [
+        # Anchored at the line start: the indented third one also contains the four-space text.
+        ("\n    std::vector<uint8_t> tempBuf;\n",
+         "\n#if defined(__3DS__)  // brawl3ds-dvd-staging: one reused staging buffer (no 512 KiB allocation per read)\n"
+         "    static std::vector<uint8_t> tempBuf;  // the DVD HLE runs on the game thread only\n#else\n    std::vector<uint8_t> tempBuf;\n#endif\n", 2),
+        ("\n            std::vector<uint8_t> tempBuf;\n",
+         "\n#if defined(__3DS__)  // brawl3ds-dvd-staging\n"
+         "            static std::vector<uint8_t> tempBuf;  // the DVD HLE runs on the game thread only\n#else\n"
+         "            std::vector<uint8_t> tempBuf;\n#endif\n", 1),
+    ])
+
+    # The AX/DSP mix worker on core 2 (renderer milestone 5). libctru's std::thread creates every thread on core 0
+    # at priority 0x3F, so the "deferred" mix only ran when the game thread blocked in JoinMix: no overlap at all.
+    if ENABLE_AX_MIX_CORE2: edit(src / "hle" / "audio" / "ax_mix.cpp", [
+        ("#include <thread>\n\nnamespace AxDspHle {\n", "#include <thread>\n" + AX_MIX_THREAD_3DS +
+         "\nnamespace AxDspHle {\n", 1),
+        ("    std::thread m_mixThread;\n",
+         "#if defined(__3DS__)\n    Brawl3dsMixThread m_mixThread;\n#else\n    std::thread m_mixThread;\n#endif\n", 1),
+        ("            m_mixThread = std::thread([this] { MixWorkerMain(); });\n",
+         "#if defined(__3DS__)\n            m_mixThread = Brawl3dsMixThread([this] { MixWorkerMain(); });\n#else\n"
+         "            m_mixThread = std::thread([this] { MixWorkerMain(); });\n#endif\n", 1),
+    ])
+
+    # Renderer milestone 5, step 2: Aurora's command processor on the core-2 worker.
+    patch_cp_worker(wiicompiled / "aurora-main" / "lib")
+    patch_cp_sync_sites(wiicompiled / "aurora-main" / "lib")
+    patch_gx_zones(src / "hle" / "gx")
+    patch_play_mode(src)
+    patch_fast_float_store(inc)
+    patch_vtx_gen(wiicompiled / "aurora-main" / "lib")
+    patch_fast_indirect(inc)
+    patch_dl_ref(src / "hle" / "gx")
+    patch_layout_hash(src / "hle" / "gx")
+    patch_indirect_slots(inc)
+    patch_unregistered_stubs(src)
+
+
+STUBREG_TAG = "brawl3ds-unregistered-stubs"
+
+
+def patch_unregistered_stubs(src: Path):
+    """The 3DS build registers only the functions it really holds (tools/slim_generated_tables.py leaves the ~109,000
+    stubs' records out: ~14 MiB of registry heap and 4 MiB of records). The generated dispatch table still lists
+    the stubs, which is how indirect calls reach them; the start-up check that every table entry is registered
+    lets those pass."""
+    edit_tagged(src / "abi_bridge.cpp", STUBREG_TAG, [
+        ("        const auto winner = AddressIndex().find(record.address);\n"
+         "        if (winner == AddressIndex().end()) {\n",
+         "        const auto winner = AddressIndex().find(record.address);\n"
+         f"#if {ARM32}  // {STUBREG_TAG}: a stub of the 3DS build, not registered on purpose\n"
+         "        if (winner == AddressIndex().end()) {\n            continue;\n        }\n#endif\n"
+         "        if (winner == AddressIndex().end()) {\n", 1),
+    ])
+
+
+SLOT_TAG = "brawl3ds-indirect-slots"
+
+
+def patch_indirect_slots(inc: Path):
+    """bctrl through a small table of its own. InvokeIndirectCpu was one 1.6 KiB function with a 300-byte frame, a
+    thread-local memo (a call to read the thread pointer) and a second thread-pointer read for the context check:
+    ~7% of the game thread in the VS demo. In front of it now: one global direct-mapped table of the targets that
+    need no register guard (filled by the general path), in a function small enough to need no frame of its own.
+    Guest code runs on one host thread (fibers), so the table needs no lock. Defined in port natives_3ds.cpp."""
+    edit_tagged(inc / "abi_bridge.h", SLOT_TAG, [
+        ("inline void InvokeIndirectCpu(uint32_t target, CpuContext* ctx) {\n"
+         "    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();\n",
+         f"#if {ARM32}  // {SLOT_TAG}\n"
+         "struct Brawl3dsFastIndirectSlot {\n    uint32_t address;\n    void (*entry)(CpuContext*);\n};\n"
+         "inline constexpr uint32_t kBrawl3dsFastIndirectSlots = 4096;\n"
+         "extern Brawl3dsFastIndirectSlot g_brawl3dsFastIndirect[kBrawl3dsFastIndirectSlots];\n"
+         "MKW_PPC_NO_INLINE void InvokeIndirectCpuGeneral(uint32_t target, CpuContext* ctx);\n"
+         "inline __attribute__((noinline)) void InvokeIndirectCpu(uint32_t target, CpuContext* ctx) {\n"
+         "    const Brawl3dsFastIndirectSlot& slot =\n"
+         "        g_brawl3dsFastIndirect[(target >> 2) & (kBrawl3dsFastIndirectSlots - 1)];\n"
+         "    if (slot.address == target && slot.entry != nullptr && ctx != nullptr && TryGetCpuContext() == ctx) {\n"
+         "        slot.entry(ctx);\n        return;\n    }\n"
+         "    InvokeIndirectCpuGeneral(target, ctx);\n}\n"
+         "inline void InvokeIndirectCpuGeneral(uint32_t target, CpuContext* ctx) {\n"
+         "#else\n"
+         "inline void InvokeIndirectCpu(uint32_t target, CpuContext* ctx) {\n"
+         "#endif\n"
+         "    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();\n", 1),
+        ("    ApplyRuntimeCallOptions(target, cpu);\n"
+         "    if (TryDispatchRawCpuTarget(TranslatedFunctionRegistry::FindRawByAddressPtr(target), cpu)) {\n"
+         "        return;\n    }\n"
+         "    if (TryDispatchResolvedCpuTarget(TranslatedFunctionRegistry::FindByAddressPtr(target), cpu)) {\n",
+         "    ApplyRuntimeCallOptions(target, cpu);\n"
+         f"#if {ARM32}  // {SLOT_TAG}: the general path fills the table\n"
+         "    {\n        const RawDispatchRecord* record = TranslatedFunctionRegistry::FindRawByAddressPtr(target);\n"
+         "        if (record && record->entry && !record->preserveNonvolatileGprs && record->nonvolatileFprWriteMask == 0) {\n"
+         "            Brawl3dsFastIndirectSlot& slot =\n"
+         "                g_brawl3dsFastIndirect[(target >> 2) & (kBrawl3dsFastIndirectSlots - 1)];\n"
+         "            slot.entry = record->entry;\n            slot.address = target;\n        }\n"
+         "        if (TryDispatchRawCpuTarget(record, cpu)) {\n            return;\n        }\n    }\n"
+         "#else\n"
+         "    if (TryDispatchRawCpuTarget(TranslatedFunctionRegistry::FindRawByAddressPtr(target), cpu)) {\n"
+         "        return;\n    }\n"
+         "#endif\n"
+         "    if (TryDispatchResolvedCpuTarget(TranslatedFunctionRegistry::FindByAddressPtr(target), cpu)) {\n", 1),
+    ])
+
+
+HASH_TAG = "brawl3ds-layout-hash"
+
+
+def patch_layout_hash(gxdir: Path):
+    """The display-list scan cache's layout hash in 32-bit arithmetic. It is recomputed whenever the vertex layout
+    changed, which a model's shapes do each (~500 times a match frame); the 64-bit FNV over 650 values was ~650
+    64-bit multiplies each time (four instructions and a call's worth each on the ARM11): ~6 ms a frame."""
+    edit_tagged(gxdir / "gx_dl.cpp", HASH_TAG, [
+        ("    uint64_t hash = 1469598103934665603ull;\n    auto mix = [&hash](uint32_t value) {\n",
+         f"#if {ARM32}  // {HASH_TAG}: two 32-bit accumulators, one value per attribute format\n"
+         "    {\n        uint32_t a = 0x811C9DC5u, b = 0x9E3779B1u;\n"
+         "        for (int attr = 0; attr < 26; ++attr) {\n"
+         "            const uint32_t v = static_cast<uint32_t>(g_hleGxState.vtxDesc[attr]);\n"
+         "            a = (a ^ v) * 16777619u;\n            b = (b + v) * 0x85EBCA6Bu;\n            b ^= b >> 15;\n        }\n"
+         "        for (int fmt = 0; fmt < 8; ++fmt) {\n            for (int attr = 0; attr < 26; ++attr) {\n"
+         "                const auto& f = g_hleGxState.vtxAttrFmt[fmt][attr];\n"
+         "                const uint32_t v = static_cast<uint32_t>(f.cnt) | (static_cast<uint32_t>(f.type) << 8) |\n"
+         "                                   (static_cast<uint32_t>(f.frac) << 16);\n"
+         "                a = (a ^ v) * 16777619u;\n                b = (b + v) * 0x85EBCA6Bu;\n                b ^= b >> 15;\n"
+         "            }\n        }\n"
+         "        g_hleGxState.vtxLayoutHash = (static_cast<uint64_t>(a) << 32) | b;\n"
+         "        g_hleGxState.vtxLayoutHashDirty = false;\n        return g_hleGxState.vtxLayoutHash;\n    }\n#endif\n"
+         "    uint64_t hash = 1469598103934665603ull;\n    auto mix = [&hash](uint32_t value) {\n", 1),
+    ])
+
+
+DLREF_TAG = "brawl3ds-dl-ref"
+
+
+def patch_dl_ref(gxdir: Path):
+    """The display lists the runtime passes straight from the game's memory (geometry) are marked, so the 3DS back
+    end hands the worker their address instead of a copy (pica_renderer_3ds.cpp, CmdCpListRef)."""
+    edit_tagged(gxdir / "gx_dl.cpp", DLREF_TAG, [
+        ("extern \"C\" void Brawl3dsGxCountFifoWrite(unsigned bytes);\n",
+         "extern \"C\" void Brawl3dsGxCountFifoWrite(unsigned bytes);\n"
+         f"extern \"C\" unsigned char g_brawl3dsListInGuestRam;  // {DLREF_TAG} (pica_renderer_3ds.cpp)\n", 1),
+        ("            if (applyOk) {\n                EnsureAuroraFrameActive();\n                GXMarkFrameWork();\n"
+         "                GXCallDisplayList(list, nbytes);\n",
+         "            if (applyOk) {\n                EnsureAuroraFrameActive();\n                GXMarkFrameWork();\n"
+         f"#if defined(__3DS__)  // {DLREF_TAG}: geometry straight from the game's memory, not copied for the worker\n"
+         "                g_brawl3dsListInGuestRam = 1;\n                GXCallDisplayList(list, nbytes);\n"
+         "                g_brawl3dsListInGuestRam = 0;\n#else\n"
+         "                GXCallDisplayList(list, nbytes);\n#endif\n", 1),
+    ])
+
+
+INDIRECT_TAG = "brawl3ds-fast-indirect"
+
+
+def patch_fast_indirect(inc: Path):
+    """bctrl to a translated function that needs no register guard, from its own context: the call and nothing else.
+    The general path keeps a 340-byte frame for the guards and writes the mod loader's thread-local execution
+    address around every call (~9% of the game thread in the VS demo, virtual calls being what they are in this
+    game); static calls never did either."""
+    edit_tagged(inc / "abi_bridge.h", INDIRECT_TAG, [
+        ("inline bool TryDispatchRawCpuTarget(const RawDispatchRecord* record, CpuContext* cpu) {\n"
+         "    if (!record || !record->entry) {\n        return false;\n    }\n",
+         f"#if {ARM32}  // {INDIRECT_TAG}\n"
+         "MKW_PPC_NO_INLINE bool TryDispatchRawCpuTargetGuarded(const RawDispatchRecord* record, CpuContext* cpu);\n"
+         "MKW_PPC_FORCE_INLINE bool TryDispatchRawCpuTarget(const RawDispatchRecord* record, CpuContext* cpu) {\n"
+         "    if (!record || !record->entry) {\n        return false;\n    }\n"
+         "    if (!record->preserveNonvolatileGprs && record->nonvolatileFprWriteMask == 0 && TryGetCpuContext() == cpu) {\n"
+         "        record->entry(cpu);\n        return true;\n    }\n"
+         "    return TryDispatchRawCpuTargetGuarded(record, cpu);\n}\n"
+         "inline bool TryDispatchRawCpuTargetGuarded(const RawDispatchRecord* record, CpuContext* cpu) {\n"
+         "#else\n"
+         "inline bool TryDispatchRawCpuTarget(const RawDispatchRecord* record, CpuContext* cpu) {\n"
+         "#endif\n"
+         "    if (!record || !record->entry) {\n        return false;\n    }\n", 1),
+    ])
+
+
+VTXGEN_TAG = "brawl3ds-vtx-gen"
+
+
+def patch_vtx_gen(lib: Path):
+    """A counter of the CP register writes that change the vertex state (descriptor, formats, arrays, the current
+    position matrix): the 3DS back end keeps the vertex plan of a batch while it stands still
+    (pica_renderer_3ds.cpp, g_recPlanGen) instead of building one for each of a frame's ~11,000 draws."""
+    edit_tagged(lib / "gx" / "command_processor.cpp", VTXGEN_TAG, [
+        ("static void handle_cp(u8 addr, u32 value, bool bigEndian) {\n",
+         f"#if defined(__3DS__)  // {VTXGEN_TAG}\nextern \"C\" unsigned g_brawl3dsVtxGen;\n#endif\n"
+         "static void handle_cp(u8 addr, u32 value, bool bigEndian) {\n", 1),
+        ("  if (cp_register_write_unchanged(addr, value)) return;\n",
+         "  if (cp_register_write_unchanged(addr, value)) return;\n"
+         f"#if defined(__3DS__)  // {VTXGEN_TAG}: the 3DS back end's vertex plan memo (pica_renderer_3ds.cpp)\n"
+         "  ++g_brawl3dsVtxGen;\n#endif\n", 1),
+    ])
+
+
+FSTORE_TAG = "brawl3ds-fast-fstore"
+
+
+def patch_fast_float_store(inc: Path):
+    """stfs with BRAWL3DS_FAST_FP: the VFP's own double-to-single conversion instead of the bit-exact Gekko one
+    (a dozen integer instructions on the 64-bit pattern at every single-precision store; game code stores floats
+    constantly: matrices, animation). Every single-precision result is already rounded to single when it is made,
+    so the two differ only for doubles that are not singles, NaN payloads and subnormals (flushed either way)."""
+    edit_tagged(inc / "memory_access.h", FSTORE_TAG, [
+        ("MKW_MEMORY_FORCE_INLINE uint32_t ConvertPpcDoubleToSingleBits(double value) {\n",
+         "MKW_MEMORY_FORCE_INLINE uint32_t ConvertPpcDoubleToSingleBits(double value) {\n"
+         f"#if {ARM32} && defined(BRAWL3DS_FAST_FP)  // {FSTORE_TAG}\n"
+         "    {\n        const float single = static_cast<float>(value);\n        uint32_t singleBits = 0;\n"
+         "        std::memcpy(&singleBits, &single, sizeof(singleBits));\n        return singleBits;\n    }\n#endif\n", 1),
+    ])
+
+
+PLAY_TAG = "brawl3ds-play"
+
+
+def patch_play_mode(src: Path):
+    """The playable build (port main_3ds.cpp, Brawl3dsPlayMode): the 3DS buttons are GameCube controller port 1,
+    no test script is read, and the start-up cover lifts by itself (nothing draws it on the 3DS)."""
+    edit_tagged(src / "hle" / "input" / "pad.cpp", PLAY_TAG, [
+        ("#include <dolphin/pad.h>\n",
+         "#include <dolphin/pad.h>\n"
+         f"#if defined(__3DS__)  // {PLAY_TAG}: port main_3ds.cpp\n"
+         "extern \"C\" bool Brawl3dsReadPad(uint16_t* buttons, int8_t* sticks, uint8_t* triggers);\n#endif\n", 1),
+        ("        statuses[port].stickX = stickX;\n        statuses[port].stickY = stickY;\n    }\n",
+         "        statuses[port].stickX = stickX;\n        statuses[port].stickY = stickY;\n    }\n"
+         f"#if defined(__3DS__)  // {PLAY_TAG}: the 3DS buttons are port 1's controller; the other ports are empty\n"
+         "    {\n        uint16_t buttons = 0;\n        int8_t sticks[4] = {};\n        uint8_t triggers[2] = {};\n"
+         "        if (Brawl3dsReadPad(&buttons, sticks, triggers)) {\n"
+         "            for (uint32_t port = 0; port < PAD_CHANMAX; ++port) {\n"
+         "                statuses[port] = {};\n"
+         "                statuses[port].err = port == 0 ? PAD_ERR_NONE : PAD_ERR_NO_CONTROLLER;\n            }\n"
+         "            statuses[0].button = buttons;\n"
+         "            statuses[0].stickX = sticks[0];\n            statuses[0].stickY = sticks[1];\n"
+         "            statuses[0].substickX = sticks[2];\n            statuses[0].substickY = sticks[3];\n"
+         "            statuses[0].triggerLeft = triggers[0];\n            statuses[0].triggerRight = triggers[1];\n"
+         "        }\n    }\n#endif\n", 1),
+    ])
+    edit_tagged(src / "wii_remote_input.cpp", PLAY_TAG, [
+        ("#include <vector>\n",
+         "#include <vector>\n"
+         f"#if defined(__3DS__)  // {PLAY_TAG}: port main_3ds.cpp\nextern \"C\" bool Brawl3dsPlayMode();\n#endif\n", 1),
+        ("        InputScript parsed;\n",
+         "        InputScript parsed;\n"
+         f"#if defined(__3DS__)  // {PLAY_TAG}: the playable build reads no test script\n"
+         "        if (Brawl3dsPlayMode()) return parsed;\n#endif\n", 1),
+    ])
+    edit_tagged(src / "settings_overlay.cpp", PLAY_TAG, [
+        ("        if (std::getenv(\"NSMBW_INPUT_SCRIPT\") != nullptr || std::filesystem::exists(\"input_script.txt\")) {\n",
+         f"#if defined(__3DS__)  // {PLAY_TAG}: nothing draws the start-up cover on the 3DS: it lifts by itself\n"
+         "        if (true) {\n#else\n"
+         "        if (std::getenv(\"NSMBW_INPUT_SCRIPT\") != nullptr || std::filesystem::exists(\"input_script.txt\")) {\n"
+         "#endif\n", 1),
+    ])
+
+
+ZONES_TAG = "brawl3ds-gx-zones"
+ZONES_HELPERS = f"""#if defined(__3DS__)  // {ZONES_TAG}: where the game thread's GX time goes (headless.log)
+extern "C" unsigned long long svcGetSystemTick(void);
+extern "C" void Brawl3dsGxdlZone(int part, unsigned long long ticks);
+extern "C" void Brawl3dsGxCountFifoWrite(unsigned bytes);
+// Off unless debug_flags.txt has 512: a system call per timer, ten per display list.
+extern "C" unsigned char g_brawl3dsGxTiming;
+static inline unsigned long long Brawl3dsGxTick() {{ return g_brawl3dsGxTiming ? svcGetSystemTick() : 0ull; }}
+struct Brawl3dsGxdlScope {{
+    int part;
+    unsigned long long start;
+    explicit Brawl3dsGxdlScope(int p) : part(p), start(Brawl3dsGxTick()) {{}}
+    ~Brawl3dsGxdlScope() {{ Brawl3dsGxdlZone(part, Brawl3dsGxTick() - start); }}
+}};
+#define BRAWL3DS_GXDL_CAT2(a, b) a##b
+#define BRAWL3DS_GXDL_CAT(a, b) BRAWL3DS_GXDL_CAT2(a, b)
+#define BRAWL3DS_GXDL_SCOPE(part) Brawl3dsGxdlScope BRAWL3DS_GXDL_CAT(brawl3dsGxdl, __LINE__)(part)
+#define BRAWL3DS_GXDL_BEGIN(n) const unsigned long long brawl3dsGxdlT##n = Brawl3dsGxTick()
+#define BRAWL3DS_GXDL_END(n) Brawl3dsGxdlZone(n, Brawl3dsGxTick() - brawl3dsGxdlT##n)
+#else
+#define BRAWL3DS_GXDL_SCOPE(part) ((void)0)
+#define BRAWL3DS_GXDL_BEGIN(n) ((void)0)
+#define BRAWL3DS_GXDL_END(n) ((void)0)
+#endif
+"""
+
+
+def patch_gx_zones(gxdir: Path):
+    """Timers in the runtime's display-list call (gx_dl.cpp) and a counter on its gather-pipe writes (gx_fifo.cpp):
+    parts 0 whole call, 1 classify (cache probe), 2 scan on a cache miss, 3 apply arrays and formats, 4 republish
+    the applied state, 5 interpreter fallback, 6 burst gather-pipe writes (port aurora3ds/backend_3ds.cpp prints
+    them)."""
+    edit_tagged(gxdir / "gx_dl.cpp", ZONES_TAG, [
+        ("extern \"C\" void aurora_spm_vtx_state(uint8_t* desc26, uint8_t* fmt8x26x3);\n",
+         "extern \"C\" void aurora_spm_vtx_state(uint8_t* desc26, uint8_t* fmt8x26x3);\n" + ZONES_HELPERS, 1),
+        ("extern \"C\" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes) {\n"
+         "    if (nbytes == 0 || listAddr == 0) return;\n",
+         "extern \"C\" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes) {\n"
+         "    if (nbytes == 0 || listAddr == 0) return;\n"
+         f"    BRAWL3DS_GXDL_SCOPE(0);  // {ZONES_TAG}\n    BRAWL3DS_GXDL_BEGIN(1);\n", 1),
+        ("            : (cached != nullptr) ? cached->mayContainDraw : DisplayListMayContainDraw(list, nbytes);\n",
+         "            : (cached != nullptr) ? cached->mayContainDraw : DisplayListMayContainDraw(list, nbytes);\n"
+         "        BRAWL3DS_GXDL_END(1);\n", 1),
+        ("            stateBeforeScan = CaptureGxVertexState();\n            scanOk = ScanDisplayListMaxIndices(",
+         "            BRAWL3DS_GXDL_BEGIN(2);\n"
+         "            stateBeforeScan = CaptureGxVertexState();\n            scanOk = ScanDisplayListMaxIndices(", 1),
+        ("            // Nested lists stay uncached:",
+         "            BRAWL3DS_GXDL_END(2);\n            // Nested lists stay uncached:", 1),
+        ("            if (flattenApplyOk) {\n                ApplyAuroraVtxDesc();\n",
+         "            if (flattenApplyOk) {\n                BRAWL3DS_GXDL_SCOPE(3);\n                ApplyAuroraVtxDesc();\n", 1),
+        ("            if (scanOk) {\n                ApplyAuroraVtxDesc();\n",
+         "            if (scanOk) {\n                BRAWL3DS_GXDL_SCOPE(3);\n                ApplyAuroraVtxDesc();\n", 1),
+        ("\n            SyncAppliedVtxStateFromHleReal();\n",
+         "\n            { BRAWL3DS_GXDL_SCOPE(4); SyncAppliedVtxStateFromHleReal(); }\n", None),
+        ("\n                SyncAppliedVtxStateFromHleReal();\n",
+         "\n                { BRAWL3DS_GXDL_SCOPE(4); SyncAppliedVtxStateFromHleReal(); }\n", None),
+        ("        ParseDisplayList(list, nbytes);\n",
+         "        { BRAWL3DS_GXDL_SCOPE(5); ParseDisplayList(list, nbytes); }\n", 1),
+    ])
+    edit_tagged(gxdir / "gx_fifo.cpp", ZONES_TAG, [
+        ("#include \"gx_internal.h\"\n", "#include \"gx_internal.h\"\n" + ZONES_HELPERS, 1),
+        ("void HleFifoWrite(u32 val, uint32_t sizeBytes) {\n",
+         "void HleFifoWrite(u32 val, uint32_t sizeBytes) {\n"
+         f"#if defined(__3DS__)  // {ZONES_TAG}\n    Brawl3dsGxCountFifoWrite(sizeBytes);\n#endif\n", 1),
+        ("extern \"C\" void GX_HLE_FIFO_WriteBurst(const uint8_t* data, uint32_t sizeBytes) {\n",
+         "extern \"C\" void GX_HLE_FIFO_WriteBurst(const uint8_t* data, uint32_t sizeBytes) {\n"
+         "    BRAWL3DS_GXDL_SCOPE(6);\n", 1),
+    ])
+
+
+SYNC_TAG = "brawl3ds-cp-sync-site"
+
+
+def patch_cp_sync_sites(lib: Path):
+    """After patch_cp_worker: every catch-up wait names its function (headless.log counts them), and
+    GXSetDispCopyYScale, which Brawl calls every frame, no longer waits: the copy height it returns comes from the
+    game thread's own record of GXSetDispCopySrc."""
+    gx = lib / "dolphin" / "gx"
+    scope = "  Brawl3dsCpInlineScope brawl3dsInline;\n"
+    named = f"  Brawl3dsCpInlineScope brawl3dsInline(true, __func__);  // {SYNC_TAG}\n"
+    for name in ("GXAurora.cpp", "GXCpu2Efb.cpp"):
+        edit_tagged(gx / name, SYNC_TAG, [(scope, named, None)])
+    edit_tagged(lib / "gx" / "command_processor.cpp", SYNC_TAG, [
+        ("  Brawl3dsCpInlineScope brawl3dsInline;  // while a display list is recorded: at once\n",
+         f"  Brawl3dsCpInlineScope brawl3dsInline(true, __func__);  // {SYNC_TAG}: while a display list is recorded\n",
+         1),
+    ])
+    edit_tagged(gx / "GXFrameBuffer.cpp", SYNC_TAG, [
+        ("#include <cstdlib>\n#include <cstring>\n",
+         "#include <cstdlib>\n#include <cstring>\n"
+         f"#if defined(__3DS__)  // {SYNC_TAG}: GXSetDispCopySrc's height, as the game thread last set it\n"
+         "static int s_brawl3dsDispCopySrcHeight = -1;\n#endif\n", 1),
+        ("void GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht) {\n",
+         "void GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht) {\n"
+         f"#if defined(__3DS__)  // {SYNC_TAG}\n"
+         "  if (!brawl3ds_cp_on_worker()) s_brawl3dsDispCopySrcHeight = ht;\n#endif\n", 1),
+        ("u32 GXSetDispCopyYScale(f32 vscale) {\n"
+         "#if defined(__3DS__)  // brawl3ds-cp-worker: reads g_gxState back: the worker catches up first\n" + scope,
+         "u32 GXSetDispCopyYScale(f32 vscale) {\n"
+         f"#if defined(__3DS__)  // {SYNC_TAG}: the source height from the game thread's record, no catch-up wait\n"
+         "  if (brawl3ds_cp_deferred() && s_brawl3dsDispCopySrcHeight >= 0) {\n"
+         "    const u32 iScale = y_scale_to_integer(vscale);\n"
+         "    brawl3ds_cp_defer_now([=] { g_gxState.dispCopyYScale = vscale; });\n"
+         "    GX_WRITE_RAS_REG(0x4e000000u | iScale);\n"
+         "    __gx->bpSent = 0;\n"
+         "    return get_num_xfb_lines_internal(static_cast<u16>(s_brawl3dsDispCopySrcHeight), iScale);\n"
+         "  }\n" + named, 1),
+        (scope, named, None),
+    ])
+
+
+CP_TAG = "brawl3ds-cp-worker"
+CP_INCLUDE = "#if defined(__3DS__)  // brawl3ds-cp-worker\n#include \"brawl3ds_cp_hooks.h\"\n#endif\n"
+
+
+def cp_defer(call, producer="(void)0"):
+    """A function's first statement: on the game thread with deferral on, queue the call for the worker."""
+    return (f"#if defined(__3DS__)  // {CP_TAG}: g_gxState is the worker's\n"
+            f"  BRAWL3DS_CP_DEFER_CALL({producer}, {call});\n#endif\n")
+
+
+CP_INLINE = (f"#if defined(__3DS__)  // {CP_TAG}: reads g_gxState back: the worker catches up first\n"
+             "  Brawl3dsCpInlineScope brawl3dsInline;\n#endif\n")
+
+
+def patch_cp_worker(lib: Path):
+    """Aurora's GX front end with its command processor on the worker (port/wiicompiled_arm32/aurora3ds/
+    brawl3ds_cp_hooks.h, pica_renderer_3ds.cpp). The FIFO is per thread, so a GX call queued for the worker writes
+    its own commands; producers hand over FIFO bytes, display lists and raw draws; the functions that touch
+    g_gxState directly run on the worker (or, when they return what they read, after it caught up)."""
+    gx = lib / "dolphin" / "gx"
+    edit_tagged(lib / "gx" / "fifo.hpp", CP_TAG, [
+        ("namespace aurora::gx::fifo {\n\nnamespace detail {\n",
+         f"#if defined(__3DS__)  // {CP_TAG}: one FIFO per thread (the core-2 worker writes its own)\n"
+         "#define BRAWL3DS_FIFO_TLS thread_local\n#else\n#define BRAWL3DS_FIFO_TLS\n#endif\n\n"
+         "namespace aurora::gx::fifo {\n\nnamespace detail {\n", 1),
+        ("extern uint8_t* sBufferData;\nextern uint32_t sBufferSize;\nextern uint32_t sBufferCapacity;\n"
+         "extern bool sInDisplayList;\nextern uint8_t* sDlBuffer;\nextern uint32_t sDlSize;\nextern uint32_t sDlWritePos;\n",
+         "extern BRAWL3DS_FIFO_TLS uint8_t* sBufferData;\nextern BRAWL3DS_FIFO_TLS uint32_t sBufferSize;\n"
+         "extern BRAWL3DS_FIFO_TLS uint32_t sBufferCapacity;\nextern BRAWL3DS_FIFO_TLS bool sInDisplayList;\n"
+         "extern BRAWL3DS_FIFO_TLS uint8_t* sDlBuffer;\nextern BRAWL3DS_FIFO_TLS uint32_t sDlSize;\n"
+         "extern BRAWL3DS_FIFO_TLS uint32_t sDlWritePos;\n", 1),
+    ])
+    edit_tagged(lib / "gx" / "fifo.cpp", CP_TAG, [
+        ("#include \"../internal.hpp\"\n", "#include \"../internal.hpp\"\n" + CP_INCLUDE, 1),
+        ("uint8_t* sBufferData = nullptr;\nuint32_t sBufferSize = 0;\nuint32_t sBufferCapacity = 0;\n"
+         "bool sInDisplayList = false;\nuint8_t* sDlBuffer = nullptr;\nuint32_t sDlSize = 0;\nuint32_t sDlWritePos = 0;\n",
+         "BRAWL3DS_FIFO_TLS uint8_t* sBufferData = nullptr;\nBRAWL3DS_FIFO_TLS uint32_t sBufferSize = 0;\n"
+         "BRAWL3DS_FIFO_TLS uint32_t sBufferCapacity = 0;\nBRAWL3DS_FIFO_TLS bool sInDisplayList = false;\n"
+         "BRAWL3DS_FIFO_TLS uint8_t* sDlBuffer = nullptr;\nBRAWL3DS_FIFO_TLS uint32_t sDlSize = 0;\n"
+         "BRAWL3DS_FIFO_TLS uint32_t sDlWritePos = 0;\n", 1),
+        ("void drain() {\n",
+         "void drain() {\n"
+         f"#if defined(__3DS__)  // {CP_TAG}: the game thread's commands go to the worker\n"
+         "  if (detail::sBufferSize != 0 && !brawl3ds_cp_on_worker() &&\n"
+         "      brawl3ds_cp_defer_fifo(detail::sBufferData, detail::sBufferSize)) {\n"
+         "    detail::sBufferSize = 0;\n    return;\n  }\n#endif\n", 1),
+    ])
+    edit_tagged(gx / "GXDispList.cpp", CP_TAG, [
+        ("#include <cstring>\n", "#include <cstring>\n" + CP_INCLUDE, 1),
+        ("static void process_display_list(const u8* data, u32 nbytes, bool bigEndian) {\n",
+         "static void process_display_list(const u8* data, u32 nbytes, bool bigEndian) {\n"
+         f"#if defined(__3DS__)  // {CP_TAG}: copied and decoded on the worker\n"
+         "  if (brawl3ds_cp_defer_list(data, nbytes, bigEndian)) return;\n#endif\n", 1),
+        ("  process_display_list(static_cast<const u8*>(data), nbytes, false);\n}\n}\n",
+         "  process_display_list(static_cast<const u8*>(data), nbytes, false);\n}\n}\n\n"
+         f"#if defined(__3DS__)  // {CP_TAG}\n"
+         "extern \"C\" void brawl3ds_cp_process_display_list(const uint8_t* data, uint32_t size, bool bigEndian) {\n"
+         "  process_display_list(data, size, bigEndian);\n}\n#endif\n", 1),
+    ])
+    edit_tagged(lib / "gx" / "command_processor.cpp", CP_TAG, [
+        ("#include \"command_processor.hpp\"\n",
+         "#include \"command_processor.hpp\"\n#include \"fifo.hpp\"\n" + CP_INCLUDE, 1),
+        ("bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,\n"
+         "                     uint32_t vertexBytes) {\n  ZoneScoped;\n",
+         "bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, uint16_t vtxCount,\n"
+         "                     uint32_t vertexBytes) {\n  ZoneScoped;\n"
+         f"#if defined(__3DS__)  // {CP_TAG}: decoded on the worker; the SDK state is flushed here first\n"
+         "  if (brawl3ds_cp_deferred()) {\n"
+         "    if (vertices == nullptr || vtxCount == 0 || vertexBytes == 0) return false;\n"
+         "    if (__gx->dirtyState != 0) __GXSetDirtyState();\n"
+         "    brawl3ds_cp_defer_raw_draw(prim, fmt, vertices, vtxCount, vertexBytes);\n"
+         "    return true;\n  }\n#endif\n", 1),
+        ("  if (__gx->dirtyState != 0) UNLIKELY {\n    __GXSetDirtyState();\n  }\n\n"
+         "  // Raw bridge draws consume live decoded GX state",
+         f"#if defined(__3DS__)  // {CP_TAG}: the worker never touches the game thread's SDK state\n"
+         "  if (!brawl3ds_cp_on_worker() && __gx->dirtyState != 0) UNLIKELY {\n#else\n"
+         "  if (__gx->dirtyState != 0) UNLIKELY {\n#endif\n    __GXSetDirtyState();\n  }\n\n"
+         "  // Raw bridge draws consume live decoded GX state", 1),
+        ("extern \"C\" void GXApplyBPReg(u8 reg, u32 value) {\n",
+         "extern \"C\" void GXApplyBPReg(u8 reg, u32 value) {\n"
+         f"#if defined(__3DS__)  // {CP_TAG}: into the FIFO, decoded in order on the worker\n"
+         "  if (brawl3ds_cp_deferred() && !aurora::gx::fifo::in_display_list()) {\n"
+         "    aurora::gx::fifo::write_u8(0x61);\n"
+         "    aurora::gx::fifo::write_u32((static_cast<u32>(reg) << 24) | (value & 0x00FFFFFFu));\n"
+         "    return;\n  }\n"
+         "  Brawl3dsCpInlineScope brawl3dsInline;  // while a display list is recorded: at once\n#endif\n", 1),
+    ])
+    edit_tagged(gx / "GXGeometry.cpp", CP_TAG, [
+        ("#include \"../../gx/fifo.hpp\"\n", "#include \"../../gx/fifo.hpp\"\n" + CP_INCLUDE, 1),
+        ("static inline bool AuroraVtxDescDiffers(GXAttr attr, GXAttrType type) {\n",
+         "static inline bool AuroraVtxDescDiffers(GXAttr attr, GXAttrType type) {\n"
+         f"#if defined(__3DS__)  // {CP_TAG}: g_gxState is the worker's: always send\n"
+         "  if (brawl3ds_cp_deferred()) return true;\n#endif\n", 1),
+        ("static inline bool AuroraVtxAttrFmtDiffers(GXVtxFmt vtxfmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {\n",
+         "static inline bool AuroraVtxAttrFmtDiffers(GXVtxFmt vtxfmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {\n"
+         f"#if defined(__3DS__)  // {CP_TAG}: g_gxState is the worker's: always send\n"
+         "  if (brawl3ds_cp_deferred()) return true;\n#endif\n", 1),
+        ("void GXSetSourceVtxDesc(GXAttr attr, GXAttrType type) {\n",
+         "void GXSetSourceVtxDesc(GXAttr attr, GXAttrType type) {\n" + cp_defer("GXSetSourceVtxDesc(attr, type)"), 1),
+    ])
+    edit_tagged(gx / "GXTransform.cpp", CP_TAG, [
+        ("#include \"dolphin/mtx/GeoTypes.h\"\n", "#include \"dolphin/mtx/GeoTypes.h\"\n" + CP_INCLUDE, 1),
+        ("void GXSetZScaleOffset(f32 scale, f32 offset) {\n",
+         "void GXSetZScaleOffset(f32 scale, f32 offset) {\n" + cp_defer("GXSetZScaleOffset(scale, offset)"), 1),
+        ("void GXSetScissorBoxOffset(s32 x_off, s32 y_off) {\n",
+         "void GXSetScissorBoxOffset(s32 x_off, s32 y_off) {\n" + cp_defer("GXSetScissorBoxOffset(x_off, y_off)"), 1),
+    ])
+    aurora_inline = ["void AuroraSetViewportPolicy(AuroraViewportPolicy policy) {\n",
+                     "void GXSetViewportScissorRenderSafeArea(f32 aspect) {\n",
+                     "void GXRestoreViewportScissorRender() {\n",
+                     "void GXSetTexCopySrcRender(u16 left, u16 top, u16 wd, u16 ht) {\n",
+                     "void GXCreateFrameBuffer(u32 width, u32 height) {\n",
+                     "void GXRestoreFrameBuffer() {\n"]
+    edit_tagged(gx / "GXAurora.cpp", CP_TAG,
+                [("#include \"../../gx/fifo.hpp\"\n", "#include \"../../gx/fifo.hpp\"\n" + CP_INCLUDE, 1)] +
+                [(sig, sig + CP_INLINE, 1) for sig in aurora_inline])
+    edit_tagged(gx / "GXCpu2Efb.cpp", CP_TAG, [
+        ("#include <dolphin/gx/GXCpu2Efb.h>\n", "#include <dolphin/gx/GXCpu2Efb.h>\n" + CP_INCLUDE, 1),
+        ("void GXPeekZ(u16 x, u16 y, u32* z) {\n", "void GXPeekZ(u16 x, u16 y, u32* z) {\n" + CP_INLINE, 1),
+    ])
+    fb_defer = [
+        ("void GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht) {\n", "GXSetDispCopySrc(left, top, wd, ht)"),
+        ("void GXSetTexCopySrc(u16 left, u16 top, u16 wd, u16 ht) {\n", "GXSetTexCopySrc(left, top, wd, ht)"),
+        ("void GXSetDispCopyDst(u16 wd, u16 ht) {\n", "GXSetDispCopyDst(wd, ht)"),
+        ("void GXSetTexCopyDst(u16 wd, u16 ht, GXTexFmt fmt, GXBool mipmap) {\n", "GXSetTexCopyDst(wd, ht, fmt, mipmap)"),
+        ("void GXSetDispCopyFrame2Field(u32 mode) {\n", "GXSetDispCopyFrame2Field(mode)"),
+        ("void GXSetCopyClamp(GXFBClamp clamp) {\n", "GXSetCopyClamp(clamp)"),
+        ("void GXSetDispCopyGamma(GXGamma gamma) {\n", "GXSetDispCopyGamma(gamma)"),
+        ("void GXCopyDisp(void* dest, GXBool clear) {\n", "GXCopyDisp(dest, clear)"),
+        ("void GXCopyTex(void* dest, GXBool clear) {\n", "GXCopyTex(dest, clear)"),
+        ("void GXClearBoundingBox() {\n", "GXClearBoundingBox()"),
+    ]
+    copy_filter = (
+        f"#if defined(__3DS__)  // {CP_TAG}: g_gxState is the worker's; the patterns are copied\n"
+        "  if (brawl3ds_cp_deferred()) {\n"
+        "    struct Args {\n      u8 sp[12][2];\n      u8 vfl[7];\n      GXBool aa, vf;\n      bool hasSp, hasVf;\n    } a{};\n"
+        "    a.aa = aa;\n    a.vf = vf;\n    a.hasSp = sample_pattern != nullptr;\n    a.hasVf = vfilter != nullptr;\n"
+        "    if (a.hasSp) std::memcpy(a.sp, sample_pattern, sizeof(a.sp));\n"
+        "    if (a.hasVf) std::memcpy(a.vfl, vfilter, sizeof(a.vfl));\n"
+        "    brawl3ds_cp_defer_now([a] {\n      Args b = a;\n"
+        "      GXSetCopyFilter(b.aa, b.hasSp ? b.sp : nullptr, b.vf, b.hasVf ? b.vfl : nullptr);\n    });\n"
+        "    return;\n  }\n#endif\n")
+    edit_tagged(gx / "GXFrameBuffer.cpp", CP_TAG,
+                [("#include <cstdlib>\n", "#include <cstdlib>\n#include <cstring>\n" + CP_INCLUDE, 1)] +
+                [(sig, sig + cp_defer(call), 1) for sig, call in fb_defer] +
+                [("void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[7]) {\n",
+                  "void GXSetCopyFilter(GXBool aa, u8 sample_pattern[12][2], GXBool vf, u8 vfilter[7]) {\n" +
+                  copy_filter, 1),
+                 ("u32 GXSetDispCopyYScale(f32 vscale) {\n", "u32 GXSetDispCopyYScale(f32 vscale) {\n" + CP_INLINE, 1),
+                 ("void GXReadBoundingBox(u16* left, u16* right, u16* top, u16* bottom) {\n",
+                  "void GXReadBoundingBox(u16* left, u16* right, u16* top, u16* bottom) {\n" + CP_INLINE, 1)])
+
+
+# A std::thread stand-in for the mix worker: the same joinable()/join()/move, but created on core 2 one priority step
+# above the game thread, so it preempts the GPU worker there (which runs at the game thread's priority and spins
+# while a frame is recorded) and never waits behind it. Without core 2 it falls back to the game thread's core.
+# Off since 2026-11-24: with it the console hung at the title screen's opening movie (its audio decoder thread
+# waits on AX), and the match frame time did not change measurably. Kept for a later, audited attempt.
+ENABLE_AX_MIX_CORE2 = False
+
+AX_MIX_THREAD_3DS = r'''
+#if defined(__3DS__)
+#include <functional>
+#include <system_error>
+extern "C" {
+#include <3ds/types.h>
+#include <3ds/svc.h>
+#include <3ds/thread.h>
+}
+
+class Brawl3dsMixThread {
+public:
+    Brawl3dsMixThread() = default;
+    template <class F>
+    explicit Brawl3dsMixThread(F&& body)
+    {
+        auto* fn = new std::function<void()>(std::forward<F>(body));
+        s32 priority = 0x30;
+        svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
+        if (priority > 0x18) --priority;
+        m_thread = threadCreate(&Entry, fn, 64 * 1024, priority, 2, false);
+        m_onCore2 = m_thread != nullptr;
+        if (!m_thread) m_thread = threadCreate(&Entry, fn, 64 * 1024, priority + 1, -2, false);
+        if (!m_thread) {
+            delete fn;
+            throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+        }
+        std::fprintf(stderr, "[audio] mix worker on %s\n", m_onCore2 ? "core 2" : "the game thread's core");
+    }
+    Brawl3dsMixThread(const Brawl3dsMixThread&) = delete;
+    Brawl3dsMixThread& operator=(const Brawl3dsMixThread&) = delete;
+    Brawl3dsMixThread& operator=(Brawl3dsMixThread&& other) noexcept
+    {
+        m_thread = other.m_thread;
+        m_onCore2 = other.m_onCore2;
+        other.m_thread = nullptr;
+        return *this;
+    }
+    bool joinable() const { return m_thread != nullptr; }
+    void join()
+    {
+        if (!m_thread) return;
+        threadJoin(m_thread, U64_MAX);
+        threadFree(m_thread);
+        m_thread = nullptr;
+    }
+
+private:
+    static void Entry(void* arg)
+    {
+        auto* fn = static_cast<std::function<void()>*>(arg);
+        (*fn)();
+        delete fn;
+    }
+    Thread m_thread = nullptr;
+    bool m_onCore2 = false;
+};
+#endif
+'''
 
 
 if __name__ == "__main__":
